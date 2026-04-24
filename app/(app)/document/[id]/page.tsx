@@ -8,6 +8,7 @@ import {
   formatBytes,
 } from "@/lib/utils/format";
 import { Badge } from "@/components/ui/badge";
+import { LineItemsSection, type LineItem } from "@/components/inbox/line-items";
 import type { DocumentRow, ProfileRow, ActionRow } from "@/types/document";
 import {
   ArrowLeft,
@@ -95,9 +96,11 @@ export default async function DocumentDetail({
           <div className="flex items-center justify-between mb-3">
             <h2 className="font-bold text-sm">Source Document</h2>
           </div>
-          <div className="rounded-2xl bg-muted aspect-[4/3] flex items-center justify-center text-muted-foreground text-xs">
-            Document preview
-          </div>
+          <DocumentPreview
+            id={doc.id}
+            fileName={doc.file_name}
+            fileType={doc.file_type}
+          />
           <div className="mt-3 flex items-center justify-between">
             <div className="text-xs">
               <div className="font-semibold">{doc.file_name}</div>
@@ -105,17 +108,15 @@ export default async function DocumentDetail({
                 {formatBytes(doc.file_size_bytes)}
               </div>
             </div>
-            {doc.dropbox_shared_link && (
-              <a
-                href={doc.dropbox_shared_link}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="btn-secondary text-xs !py-2"
-              >
-                <ExternalLink className="h-3.5 w-3.5" />
-                Open
-              </a>
-            )}
+            <a
+              href={`/api/documents/${doc.id}/preview`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="btn-secondary text-xs !py-2"
+            >
+              <ExternalLink className="h-3.5 w-3.5" />
+              Open full
+            </a>
           </div>
         </div>
 
@@ -196,6 +197,20 @@ export default async function DocumentDetail({
         </div>
       )}
 
+      {/* Line items table — only present for receipts/invoices/etc with itemised charges */}
+      {(() => {
+        const items = (doc.extracted_fields as Record<string, unknown> | null)?.[
+          "line_items"
+        ];
+        if (!Array.isArray(items) || items.length === 0) return null;
+        return (
+          <LineItemsSection
+            items={items as LineItem[]}
+            currency={doc.currency}
+          />
+        );
+      })()}
+
       <div className="grid md:grid-cols-2 gap-5 mb-5">
         <div className="surface p-5">
           <h2 className="section-label mb-3">Extracted</h2>
@@ -230,13 +245,24 @@ export default async function DocumentDetail({
       </div>
 
       {doc.extracted_fields &&
-        Object.keys(doc.extracted_fields).length > 0 && (
+        Object.keys(doc.extracted_fields).filter((k) => k !== "line_items")
+          .length > 0 && (
           <div className="surface p-5 mb-5">
             <h2 className="section-label mb-3">Fields</h2>
             <dl className="space-y-2 text-sm">
-              {Object.entries(doc.extracted_fields).map(([k, v]) => (
-                <Row key={k} label={titleCase(k)} value={String(v ?? "")} />
-              ))}
+              {Object.entries(doc.extracted_fields)
+                .filter(([k]) => k !== "line_items")
+                .map(([k, v]) => (
+                  <Row
+                    key={k}
+                    label={titleCase(k)}
+                    value={
+                      typeof v === "object" && v !== null
+                        ? JSON.stringify(v)
+                        : String(v ?? "")
+                    }
+                  />
+                ))}
             </dl>
           </div>
         )}
@@ -292,6 +318,58 @@ function Row({
       >
         {value}
       </dd>
+    </div>
+  );
+}
+
+/**
+ * Renders the actual file inline. Streams via /api/documents/{id}/preview
+ * (server-side download from the storage adapter) so we don't depend on
+ * Dropbox shared-link state and works for any future storage backend.
+ *
+ * - PDFs render in an <iframe> (browser PDF viewer).
+ * - Images render in an <img> tag.
+ * - Anything else (e.g. unknown binary) shows a fallback placeholder.
+ */
+function DocumentPreview({
+  id,
+  fileName,
+  fileType,
+}: {
+  id: string;
+  fileName: string | null;
+  fileType: string | null;
+}) {
+  const url = `/api/documents/${id}/preview`;
+  const ext = (fileName || "").toLowerCase();
+  const mime = (fileType || "").toLowerCase();
+  const isPdf = mime.includes("pdf") || ext.endsWith(".pdf");
+  const isImage =
+    mime.startsWith("image/") ||
+    /\.(jpe?g|png|gif|webp|heic|heif)$/i.test(ext);
+
+  if (isPdf) {
+    return (
+      <iframe
+        src={url}
+        title={fileName || "Document preview"}
+        className="rounded-2xl bg-muted w-full h-[480px] border border-border"
+      />
+    );
+  }
+  if (isImage) {
+    return (
+      // eslint-disable-next-line @next/next/no-img-element
+      <img
+        src={url}
+        alt={fileName || "Document preview"}
+        className="rounded-2xl bg-muted w-full max-h-[600px] object-contain border border-border"
+      />
+    );
+  }
+  return (
+    <div className="rounded-2xl bg-muted aspect-[4/3] flex items-center justify-center text-muted-foreground text-xs">
+      Preview not available — open the file to view.
     </div>
   );
 }

@@ -1,0 +1,95 @@
+import { NextRequest, NextResponse } from "next/server";
+import { createClient, createServiceClient } from "@/lib/supabase/server";
+import { getStorage } from "@/lib/storage";
+
+export const runtime = "nodejs";
+export const maxDuration = 60;
+
+/**
+ * Streams a document file inline for the document detail page preview pane.
+ *
+ *   - Auth: caller must be the owner of the row (RLS-style check via
+ *     service-role lookup so we never leak rows we shouldn't).
+ *   - Body: raw file bytes from whichever storage adapter the row uses.
+ *   - Headers: Content-Type from the row (or sniffed from extension), and
+ *     Content-Disposition: inline so browsers render rather than download.
+ *
+ * Used by the document detail page like:
+ *   <img src="/api/documents/{id}/preview" />          for images
+ *   <iframe src="/api/documents/{id}/preview" />       for PDFs
+ */
+export async function GET(
+  _request: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const { id } = await params;
+
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  // Look up the document via service role then verify ownership ourselves.
+  const admin = await createServiceClient();
+  const { data: doc, error } = await admin
+    .from("documents")
+    .select(
+      "id, user_id, dropbox_path, storage_provider, file_name, file_type"
+    )
+    .eq("id", id)
+    .maybeSingle();
+
+  if (error || !doc) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
+  if (doc.user_id !== user.id) {
+    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+  }
+
+  try {
+    const storage = getStorage(doc.storage_provider);
+    const buffer = await storage.downloadFile(doc.dropbox_path);
+
+    const contentType =
+      doc.file_type && doc.file_type.length > 0
+        ? doc.file_type
+        : sniffMime(doc.file_name || "");
+
+    const filename = doc.file_name || "document";
+
+    return new NextResponse(new Uint8Array(buffer), {
+      status: 200,
+      headers: {
+        "Content-Type": contentType,
+        "Content-Length": String(buffer.byteLength),
+        "Content-Disposition": `inline; filename="${escapeFilename(filename)}"`,
+        // Brief private cache — file rarely changes once analysed but the URL
+        // is per-doc so a new doc-id always re-fetches.
+        "Cache-Control": "private, max-age=300",
+      },
+    });
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : "preview failed";
+    console.error("[api/documents/[id]/preview] error:", msg);
+    return NextResponse.json({ error: msg }, { status: 500 });
+  }
+}
+
+function sniffMime(name: string): string {
+  const lower = name.toLowerCase();
+  if (lower.endsWith(".pdf")) return "application/pdf";
+  if (lower.endsWith(".png")) return "image/png";
+  if (lower.endsWith(".gif")) return "image/gif";
+  if (lower.endsWith(".webp")) return "image/webp";
+  if (lower.endsWith(".heic")) return "image/heic";
+  if (lower.endsWith(".heif")) return "image/heif";
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
+  return "application/octet-stream";
+}
+
+function escapeFilename(name: string): string {
+  return name.replace(/[\\"]/g, "_");
+}

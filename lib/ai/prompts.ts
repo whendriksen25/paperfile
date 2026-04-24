@@ -47,6 +47,7 @@ Rules:
   [
     {
       "description": "<what the item is — keep the product/service name verbatim from the doc>",
+      "category": "<one of the line_item_category values below — pick the closest fit; use 'other' only as last resort>",
       "quantity": <number or null>,
       "unit_price": <number or null>,
       "vat_rate": <number or null>,
@@ -57,6 +58,41 @@ Rules:
     }
   ]
   If there's only one line, include it anyway — a single-element array. Omit line_items entirely if the doc has no itemised breakdown (e.g. a letter, a simple payment confirmation with only a total).
+
+- line_item_category — one of:
+  groceries        (bread, milk, fruit, veg, meat, supermarket food in general)
+  alcohol          (beer, wine, spirits)
+  beverages        (soft drinks, coffee, tea, water — non-alcoholic)
+  restaurant       (eat-in/take-out meals, café, bar tab, delivery)
+  household        (cleaning supplies, paper goods, kitchenware)
+  toiletries       (shampoo, soap, dental, cosmetics, personal care)
+  pharmacy         (medicine, prescriptions, plasters, supplements)
+  health_service   (doctor visit, physio, dentist consultation, lab fee)
+  clothing         (clothes, shoes, accessories)
+  electronics      (devices, cables, batteries)
+  appliances       (washing machine, kettle, vacuum)
+  baby_kids        (diapers, toys, kids clothing — only if clearly for child)
+  pet              (pet food, vet supplies, accessories)
+  fuel             (petrol, diesel, EV charging)
+  transport        (public transport, taxi, parking, tolls)
+  travel           (hotel, flight, train tickets, holiday)
+  entertainment    (movie, game, books, hobby, gym entry)
+  subscription     (Netflix, Spotify, software, magazine, recurring service)
+  utilities        (electricity, gas, water, internet, phone bill line)
+  housing          (rent, mortgage, repairs, furniture)
+  diy_garden       (hardware store items, plants, tools)
+  office_supplies  (stationery, printer ink, postage)
+  professional_service (lawyer, accountant, consultant, repair labor)
+  insurance        (premium line on a policy or invoice)
+  tax_fee          (VAT-only line, government fees, surcharges)
+  gift             (clearly a present — flowers, gift cards)
+  donation         (charity contribution)
+  discount         (negative line, coupon, promo — total should be negative)
+  deposit_return   (statiegeld / bottle return — usually negative)
+  shipping         (delivery, postage line on an order)
+  other            (genuinely doesn't fit anything above)
+
+  Pick categories from the BUYER's perspective. A wine bottle on a supermarket receipt is "alcohol", not "groceries". A line that says "Korting" / "Discount" / negative amount is "discount". Statiegeld / bottle return is "deposit_return".
 
 - Identifying facts that help match a document to a person — ALWAYS put these in extracted_fields when visible, with these exact keys:
   birth_date (YYYY-MM-DD or DD-MM-YYYY as written), bsn, national_id, patient_number, patient_code, policy_number, iban, customer_number, employee_number, address, postal_code, city.
