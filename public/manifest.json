@@ -1,0 +1,21 @@
+{
+  "name": "Paperfile",
+  "short_name": "Paperfile",
+  "description": "Scan it. File it. Act on it. Personal document archiver with Claude AI.",
+  "start_url": "/upload",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#F8F9FB",
+  "theme_color": "#7B6CF6",
+  "categories": ["productivity", "utilities"],
+  "icons": [
+    { "src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ],
+  "shortcuts": [
+    { "name": "Scan it", "url": "/upload", "description": "Capture a new document" },
+    { "name": "Act on it", "url": "/actions", "description": "Open the action center" }
+  ]
+}

@@ -1,0 +1,135 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: light;
+
+    /* Paperfile light theme */
+    --background: 220 20% 98%;       /* near-white with a hint of cool */
+    --foreground: 0 0% 18%;          /* charcoal #2D2D2D */
+    --card: 0 0% 100%;
+    --card-foreground: 0 0% 18%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 0 0% 18%;
+
+    /* Brand purple as primary action color */
+    --primary: 247 88% 70%;          /* #7B6CF6 */
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 220 14% 96%;
+    --secondary-foreground: 0 0% 22%;
+
+    --muted: 220 14% 96%;
+    --muted-foreground: 220 9% 46%;
+
+    --accent: 173 47% 52%;           /* teal #4BBFB0 */
+    --accent-foreground: 0 0% 100%;
+
+    --destructive: 0 72% 56%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 220 13% 91%;
+    --input: 220 13% 91%;
+    --ring: 247 88% 70%;
+    --radius: 1.25rem;               /* generous rounding for the soft brand */
+
+    /* Charcoal sidebar */
+    --sidebar: 0 0% 14%;             /* near #232323 */
+    --sidebar-foreground: 0 0% 96%;
+    --sidebar-muted: 220 5% 60%;
+    --sidebar-accent: 247 88% 70%;
+    --sidebar-accent-foreground: 0 0% 100%;
+    --sidebar-border: 0 0% 22%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html,
+  body {
+    @apply bg-background text-foreground antialiased;
+    min-height: 100%;
+    font-family: var(--font-nunito), -apple-system, BlinkMacSystemFont,
+      "Segoe UI", "Roboto", "Helvetica Neue", Arial, sans-serif;
+    font-feature-settings: "ss01", "cv11";
+  }
+
+  body {
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+}
+
+@layer components {
+  /* Surfaces */
+  .surface {
+    @apply bg-card border border-border rounded-2xl shadow-soft;
+  }
+  .surface-elevated {
+    @apply bg-card border border-border rounded-2xl shadow-card;
+  }
+
+  /* Buttons (rounded pill) */
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-2 bg-brand-charcoal text-white font-semibold px-5 py-3 rounded-full transition-all hover:bg-black disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .btn-cta {
+    @apply inline-flex items-center justify-center gap-2 bg-white text-brand-teal font-bold px-6 py-4 rounded-full border border-brand-teal/30 shadow-soft transition-all hover:shadow-card disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .btn-secondary {
+    @apply inline-flex items-center justify-center gap-2 bg-white text-foreground border border-border font-semibold px-5 py-3 rounded-full shadow-soft transition-all hover:bg-muted disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .btn-ghost {
+    @apply inline-flex items-center justify-center gap-2 text-muted-foreground font-medium px-4 py-2 rounded-full transition-colors hover:bg-muted hover:text-foreground;
+  }
+
+  /* Inputs */
+  .input {
+    @apply w-full bg-card border border-border rounded-2xl px-4 py-3 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring/40 focus:border-ring transition;
+  }
+  .input-pill {
+    @apply w-full bg-card border border-border rounded-full px-5 py-3 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring/40 focus:border-ring transition shadow-soft;
+  }
+
+  /* Pill chips */
+  .chip {
+    @apply inline-flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider px-3 py-1 rounded-full;
+  }
+  .chip-purple { @apply chip bg-brand-purple/12 text-brand-purple; }
+  .chip-blue   { @apply chip bg-brand-blue/12   text-brand-blue;   }
+  .chip-teal   { @apply chip bg-brand-teal/12   text-brand-teal;   }
+  .chip-green  { @apply chip bg-brand-green/12  text-brand-green;  }
+  .chip-muted  { @apply chip bg-muted          text-muted-foreground; }
+
+  /* Soft pill (mixed-case label, non-uppercase) */
+  .pill {
+    @apply inline-flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-full;
+  }
+
+  /* Section labels (uppercase tiny) */
+  .section-label {
+    @apply text-[10px] font-bold uppercase tracking-[0.12em] text-muted-foreground;
+  }
+
+  /* Brand gradient text */
+  .text-brand-gradient {
+    background: linear-gradient(135deg, #7B6CF6 0%, #4BBFB0 50%, #4CAF7D 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  /* Sidebar nav item */
+  .side-link {
+    @apply flex items-center gap-3 rounded-full px-4 py-2.5 text-sm font-semibold transition-colors;
+  }
+  .side-link-inactive {
+    @apply text-sidebar-muted hover:bg-white/5 hover:text-sidebar-foreground;
+  }
+  .side-link-active {
+    @apply bg-white/10 text-sidebar-foreground;
+  }
+}

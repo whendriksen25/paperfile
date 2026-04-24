@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="none">
+  <defs>
+    <linearGradient id="pf" x1="32" y1="40" x2="232" y2="240" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#7B6CF6"/>
+      <stop offset="1" stop-color="#4BBFB0"/>
+    </linearGradient>
+  </defs>
+  <!-- folder body (rounded, outline only) -->
+  <path d="M28 92c0-9.4 7.6-17 17-17h54l16 18h83c9.4 0 17 7.6 17 17v76c0 9.4-7.6 17-17 17H45c-9.4 0-17-7.6-17-17V92z"
+        stroke="url(#pf)" stroke-width="11" stroke-linejoin="round" fill="none"/>
+  <!-- document inside folder, peeking up -->
+  <path d="M88 56h54l16 16v44c0 5-4 9-9 9H88c-5 0-9-4-9-9V65c0-5 4-9 9-9z"
+        stroke="url(#pf)" stroke-width="9" stroke-linejoin="round" fill="#fff"/>
+  <line x1="98" y1="80" x2="138" y2="80" stroke="url(#pf)" stroke-width="8" stroke-linecap="round"/>
+  <line x1="98" y1="98" x2="130" y2="98" stroke="url(#pf)" stroke-width="8" stroke-linecap="round"/>
+  <!-- green check badge bottom right -->
+  <circle cx="196" cy="196" r="36" fill="#4CAF7D"/>
+  <path d="M180 196l11 11 21-21" stroke="#fff" stroke-width="9" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+</svg>
