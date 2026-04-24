@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { Badge } from "@/components/ui/badge";
+import { Spinner } from "@/components/ui/spinner";
 import { formatDate, formatMoney, titleCase } from "@/lib/utils/format";
 import {
   FileText,
@@ -7,6 +8,7 @@ import {
   Mail,
   Receipt,
   CircleDot,
+  AlertTriangle,
 } from "lucide-react";
 import type { DocumentRow, ProfileRow } from "@/types/document";
 
@@ -30,6 +32,13 @@ function categoryVariant(type: string | null): "purple" | "teal" | "blue" | "gre
   return "default";
 }
 
+function progressLabel(status: string): string {
+  if (status === "pending") return "Queued for AI";
+  if (status === "processing") return "Reading & extracting…";
+  if (status === "failed") return "Something went wrong";
+  return "";
+}
+
 export function DocumentCard({
   doc,
   profile,
@@ -38,14 +47,39 @@ export function DocumentCard({
   profile?: ProfileRow | null;
 }) {
   const Icon = iconFor(doc.document_type);
+  const isWorking = doc.status === "pending" || doc.status === "processing";
+  const isFailed = doc.status === "failed";
+
   return (
     <Link
       href={`/document/${doc.id}`}
-      className="surface block p-5 hover:shadow-card transition-all animate-fade-in"
+      className={`surface block p-5 hover:shadow-card transition-all animate-fade-in relative overflow-hidden ${
+        isWorking ? "ring-1 ring-brand-purple/30" : ""
+      }`}
     >
+      {/* Top progress bar shown while AI is working */}
+      {isWorking && (
+        <div className="absolute top-0 left-0 right-0 h-0.5 overflow-hidden">
+          <div className="h-full w-1/3 bg-brand-purple animate-progress-slide" />
+        </div>
+      )}
       <div className="flex items-start gap-4">
-        <div className="h-12 w-12 shrink-0 rounded-2xl bg-brand-gradient-soft flex items-center justify-center">
-          <Icon className="h-5 w-5 text-brand-purple" />
+        <div
+          className={`h-12 w-12 shrink-0 rounded-2xl flex items-center justify-center ${
+            isWorking
+              ? "bg-brand-purple/10"
+              : isFailed
+                ? "bg-destructive/10"
+                : "bg-brand-gradient-soft"
+          }`}
+        >
+          {isWorking ? (
+            <Spinner className="h-5 w-5 text-brand-purple" />
+          ) : isFailed ? (
+            <AlertTriangle className="h-5 w-5 text-destructive" />
+          ) : (
+            <Icon className="h-5 w-5 text-brand-purple" />
+          )}
         </div>
         <div className="min-w-0 flex-1">
           <div className="flex items-start justify-between gap-3">
@@ -53,42 +87,62 @@ export function DocumentCard({
               <h3 className="text-sm font-bold text-foreground truncate">
                 {doc.title || doc.file_name || "Untitled document"}
               </h3>
-              <p className="text-xs text-muted-foreground truncate mt-0.5">
-                {doc.sender || titleCase(doc.document_type) || "Unknown sender"}
-                {doc.document_date ? ` · ${formatDate(doc.document_date)}` : ""}
+              <p
+                className={`text-xs truncate mt-0.5 ${
+                  isWorking
+                    ? "text-brand-purple font-semibold"
+                    : isFailed
+                      ? "text-destructive"
+                      : "text-muted-foreground"
+                }`}
+              >
+                {isWorking
+                  ? progressLabel(doc.status)
+                  : isFailed
+                    ? doc.review_notes || progressLabel(doc.status)
+                    : (doc.sender ||
+                        titleCase(doc.document_type) ||
+                        "Unknown sender") +
+                      (doc.document_date
+                        ? ` · ${formatDate(doc.document_date)}`
+                        : "")}
               </p>
             </div>
-            {doc.amount != null && (
+            {doc.amount != null && !isWorking && (
               <span className="text-sm font-bold text-foreground shrink-0">
                 {formatMoney(doc.amount, doc.currency)}
               </span>
             )}
           </div>
           <div className="mt-3 flex flex-wrap items-center gap-1.5">
-            {doc.document_type && (
-              <Badge variant={categoryVariant(doc.document_type)}>
-                {titleCase(doc.document_type)}
+            {isWorking ? (
+              <Badge variant="purple">
+                <Spinner className="h-3 w-3" /> AI working
               </Badge>
-            )}
-            {profile && <Badge variant="purple">{profile.name}</Badge>}
-            {doc.purchase_category && (
-              <Badge variant="teal">{titleCase(doc.purchase_category)}</Badge>
-            )}
-            {doc.needs_action && (
-              <Badge variant="green">
-                <CircleDot className="h-3 w-3" /> Action
-              </Badge>
-            )}
-            {doc.batch && <Badge>{doc.batch}</Badge>}
-            {(doc.tags || []).slice(0, 2).map((t) => (
-              <Badge key={t}>{t}</Badge>
-            ))}
-            {doc.status !== "processed" && (
-              <Badge
-                variant={doc.status === "failed" ? "destructive" : "warning"}
-              >
-                {doc.status}
-              </Badge>
+            ) : (
+              <>
+                {doc.document_type && (
+                  <Badge variant={categoryVariant(doc.document_type)}>
+                    {titleCase(doc.document_type)}
+                  </Badge>
+                )}
+                {profile && <Badge variant="purple">{profile.name}</Badge>}
+                {doc.purchase_category && (
+                  <Badge variant="teal">
+                    {titleCase(doc.purchase_category)}
+                  </Badge>
+                )}
+                {doc.needs_action && (
+                  <Badge variant="green">
+                    <CircleDot className="h-3 w-3" /> Action
+                  </Badge>
+                )}
+                {doc.batch && <Badge>{doc.batch}</Badge>}
+                {(doc.tags || []).slice(0, 2).map((t) => (
+                  <Badge key={t}>{t}</Badge>
+                ))}
+                {isFailed && <Badge variant="destructive">failed</Badge>}
+              </>
             )}
           </div>
         </div>

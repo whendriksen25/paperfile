@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { createClient } from "@/lib/supabase/server";
 import { DocumentCard } from "@/components/inbox/document-card";
+import { ProcessingBanner } from "@/components/inbox/processing-banner";
 import { ProfileSelector } from "@/components/layout/profile-selector";
 import { ExportToDropboxButton } from "@/components/inbox/export-button";
 import { Search } from "lucide-react";
@@ -74,6 +75,9 @@ export default async function InboxPage({
           <ProfileSelector />
         </div>
       </div>
+
+      {/* Live AI processing banner (auto-refreshes inbox when work completes) */}
+      <ProcessingBanner />
 
       {/* Categories filter row */}
       {categories.length > 0 && (

@@ -37,13 +37,33 @@ Return STRICT JSON only — no prose, no markdown code fences, no commentary. Th
 
 Rules:
 - "extracted_fields" should contain type-specific fields that don't fit the flat schema. Examples:
-  - medical_bill: provider, service_date, diagnosis_code, patient_reference, policy_number, reimbursable_amount
-  - insurance_declaration: declaration_number, claim_period, insurer, insured_person
-  - bank_statement: account_iban, period_start, period_end, opening_balance, closing_balance
-  - contract: parties, effective_date, end_date, contract_reference
-  - invoice: invoice_number, due_date, vat_breakdown, total_excl, total_vat, total_incl
+  - medical_bill: provider, service_date, diagnosis_code, patient_number, patient_code, patient_reference, policy_number, insurer, bsn, birth_date, reimbursable_amount, total_excl, total_vat, total_incl, payment_iban, payment_reference, invoice_number
+  - insurance_declaration: declaration_number, claim_period, insurer, insured_person, birth_date, policy_number
+  - bank_statement: account_iban, period_start, period_end, opening_balance, closing_balance, account_holder
+  - contract: parties, effective_date, end_date, contract_reference, national_id
+  - invoice: invoice_number, due_date, vat_breakdown, total_excl, total_vat, total_incl, payment_iban, payment_reference, customer_reference
+
+- "extracted_fields.line_items" — for ANY document with itemised charges (bills, invoices, receipts, prescriptions with multiple products, service quotes) include an array of objects, one per line:
+  [
+    {
+      "description": "<what the item is — keep the product/service name verbatim from the doc>",
+      "quantity": <number or null>,
+      "unit_price": <number or null>,
+      "vat_rate": <number or null>,
+      "vat_amount": <number or null>,
+      "total": <number or null — this line's total incl VAT if shown, else excl>,
+      "currency": "<ISO code if different from top-level currency>",
+      "reference": "<product code / SKU / dosage / article number, or null>"
+    }
+  ]
+  If there's only one line, include it anyway — a single-element array. Omit line_items entirely if the doc has no itemised breakdown (e.g. a letter, a simple payment confirmation with only a total).
+
+- Identifying facts that help match a document to a person — ALWAYS put these in extracted_fields when visible, with these exact keys:
+  birth_date (YYYY-MM-DD or DD-MM-YYYY as written), bsn, national_id, patient_number, patient_code, policy_number, iban, customer_number, employee_number, address, postal_code, city.
+  These are signals the profile matcher will cross-reference against profile attributes.
+
 - If a field is not present on the document, use null (or omit from extracted_fields). Never invent data.
-- For languages other than English, translate "title", "summary", and "tags" into English but keep "ocr_text" in the original language.
+- For languages other than English, translate "title", "summary", and "tags" into English but keep "ocr_text" AND line_items descriptions in the original language.
 - "needs_action" should be true ONLY for documents that imply concrete action by the recipient. Routine confirmations, archived statements, and informational letters should be false.
 - For "purchase_category": pick the closest match from the list. Use null if the document is not a purchase.
 - "profile_hint" should be the actual name as written on the doc — the server will fuzzy-match it to existing profiles.
@@ -106,8 +126,28 @@ Return STRICT JSON only — no prose, no markdown fences. Match this shape:
 Rules:
 - Score every profile in the input.
 - "best.profileId" should be null if no profile is a confident match (confidence < 0.5).
-- Match using ALL signals together — name on document, aliases, attribute values like an insurer name or an IBAN appearing in the document, address overlap, etc.
-- If two profiles share signals (e.g. spouses share an address), prefer the one whose name actually appears on the doc.
-- Reasons should cite the specific signal that matched (e.g. "Document mentions IBAN BE68... which is in this profile's attributes").
+
+Matching priority — LOGICAL / IDENTIFYING FACTS beat name similarity. In order:
+
+1. **HARD identifiers** — if the document has an extracted_field that uniquely identifies a person, and that exact value appears in a profile's attributes or description, it's a near-certain match (confidence 0.95+):
+   - birth_date / year of birth (document birth_date vs profile description "born 1936" or attribute birth_date)
+   - national ID / bsn / RRN (exact digit match)
+   - patient_number, policy_number, customer_number
+   - IBAN (exact match)
+   - address / postal_code
+   - employee_number
+   - insurer name (if profile lists an insurer attribute and doc mentions same insurer)
+
+2. **Alias / name match** — if the profile_hint or recipient name on the document matches the profile name or an alias (full or partial), that's a strong signal (0.7–0.9).
+
+3. **Soft signals** — overlapping tokens, country, language.
+
+When a hard identifier (category 1) matches, it OVERRIDES a weaker name match on another profile. Example: a bill addressed to "W. Hendriksen" where the birth_date on the document is 1936, and there's a "Father" profile with description "Born 1936, lives in Dieren", should match Father (not "Me"), because the birth_date is a specific logical fact that uniquely identifies Father among the profiles.
+
+- If two profiles share signals (e.g. spouses share an address), prefer the one whose HARD identifier matches.
+- Reasons must cite the SPECIFIC signal that matched, including the value. Examples:
+  - "Document birth_date 27-07-1936 matches profile 'Father' description 'Born 1936, lives in Dieren'."
+  - "Document mentions IBAN NL63RABO0315037474 which is in profile 'Father' attributes."
+  - "Recipient 'W. Hendriksen' and profile 'Father' alias 'W.G. Hendriksen' share both tokens; no hard identifier conflicts."
 
 Return ONLY the JSON object.`;

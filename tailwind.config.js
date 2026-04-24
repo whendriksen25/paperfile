@@ -93,10 +93,15 @@ module.exports = {
           from: { opacity: "0", transform: "scale(0.96)" },
           to: { opacity: "1", transform: "scale(1)" },
         },
+        "progress-slide": {
+          "0%": { transform: "translateX(-100%)" },
+          "100%": { transform: "translateX(400%)" },
+        },
       },
       animation: {
         "fade-in": "fade-in 200ms ease-out",
         "scale-in": "scale-in 220ms cubic-bezier(0.16,1,0.3,1)",
+        "progress-slide": "progress-slide 1.4s ease-in-out infinite",
       },
     },
   },
