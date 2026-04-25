@@ -29,9 +29,11 @@ export function UploadForm() {
   const [pending, setPending] = useState<PendingFile[]>([]);
   const [submitting, setSubmitting] = useState(false);
 
-  useEffect(() => {
-    if (profileId === "" && active) setProfileId(active.id);
-  }, [active, profileId]);
+  // NOTE: deliberately NOT pre-filling profileId from `active`. If we did,
+  // every upload would be locked to the currently-selected profile and the AI
+  // would never get to match it (analyze route honours pre-set profile_id as
+  // "user choice"). Empty default = "Auto-detect with AI".
+  // The user can still override by picking a profile in the dropdown.
 
   function addFiles(files: FileList | null) {
     if (!files) return;

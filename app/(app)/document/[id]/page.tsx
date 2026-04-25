@@ -9,6 +9,11 @@ import {
 } from "@/lib/utils/format";
 import { Badge } from "@/components/ui/badge";
 import { LineItemsSection, type LineItem } from "@/components/inbox/line-items";
+import { RefileWidget } from "@/components/inbox/refile-widget";
+import {
+  ProfileMatchPanel,
+  type ProfileMatchInfo,
+} from "@/components/inbox/profile-match-panel";
 import { parseStoragePath } from "@/lib/utils/storage-path";
 import type { DocumentRow, ProfileRow, ActionRow } from "@/types/document";
 import {
@@ -78,6 +83,37 @@ export default async function DocumentDetail({
           {doc.sender || titleCase(doc.document_type) || "Unknown sender"}
           {doc.document_date ? ` · ${formatDate(doc.document_date)}` : ""}
         </p>
+        {/* Payment status — surfaces handwritten "PAID" annotations */}
+        {(() => {
+          const ef = doc.extracted_fields as Record<string, unknown> | null;
+          const status = String(ef?.["payment_status"] || "").toLowerCase();
+          const paidDate = (ef?.["paid_date"] as string | undefined) || null;
+          const note = (ef?.["paid_note"] as string | undefined) || null;
+          if (!status || status === "unknown") return null;
+          if (status === "paid") {
+            return (
+              <div className="mt-3 inline-flex items-center gap-2 rounded-2xl bg-brand-green/10 border border-brand-green/30 px-3 py-2 text-sm">
+                <CircleDot className="h-4 w-4 text-brand-green" />
+                <span className="font-bold text-brand-green">
+                  Paid
+                  {paidDate ? ` on ${formatDate(paidDate)}` : ""}
+                </span>
+                {note && (
+                  <span className="text-xs text-brand-green/80">· {note}</span>
+                )}
+              </div>
+            );
+          }
+          if (status === "partial") {
+            return (
+              <div className="mt-3 inline-flex items-center gap-2 rounded-2xl bg-amber-100 border border-amber-300 px-3 py-2 text-sm font-bold text-amber-800">
+                Partially paid
+                {paidDate ? ` (last payment ${formatDate(paidDate)})` : ""}
+              </div>
+            );
+          }
+          return null;
+        })()}
       </header>
 
       {isPending && (
@@ -200,6 +236,20 @@ export default async function DocumentDetail({
         </div>
       )}
 
+      {/* Profile match reasoning — visible only when the analyzer has captured it */}
+      {(() => {
+        const m = (doc.extracted_fields as Record<string, unknown> | null)?.[
+          "_profile_match"
+        ];
+        if (!m || typeof m !== "object") return null;
+        return (
+          <ProfileMatchPanel
+            match={m as ProfileMatchInfo}
+            currentProfileName={profile?.name || null}
+          />
+        );
+      })()}
+
       {/* Line items table — only present for receipts/invoices/etc with itemised charges */}
       {(() => {
         const items = (doc.extracted_fields as Record<string, unknown> | null)?.[
@@ -270,17 +320,23 @@ export default async function DocumentDetail({
           <p className="mt-2 text-[11px] text-muted-foreground font-mono break-all">
             {doc.dropbox_path}
           </p>
+          <RefileWidget
+            documentId={doc.id}
+            currentProfileId={doc.primary_profile_id}
+            currentDocumentType={doc.document_type}
+          />
         </div>
       )}
 
       {doc.extracted_fields &&
-        Object.keys(doc.extracted_fields).filter((k) => k !== "line_items")
-          .length > 0 && (
+        Object.keys(doc.extracted_fields).filter(
+          (k) => k !== "line_items" && k !== "_profile_match"
+        ).length > 0 && (
           <div className="surface p-5 mb-5">
             <h2 className="section-label mb-3">Fields</h2>
             <dl className="space-y-2 text-sm">
               {Object.entries(doc.extracted_fields)
-                .filter(([k]) => k !== "line_items")
+                .filter(([k]) => k !== "line_items" && k !== "_profile_match")
                 .map(([k, v]) => (
                   <Row
                     key={k}

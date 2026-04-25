@@ -1,5 +1,6 @@
 import { createClient } from "@/lib/supabase/server";
 import { Card } from "@/components/ui/card";
+import { BookkeepingSettings } from "@/components/settings/bookkeeping-settings";
 
 export const dynamic = "force-dynamic";
 
@@ -45,6 +46,17 @@ export default async function SettingsPage() {
             active={anthropicConfigured}
           />
         </div>
+      </Card>
+
+      <Card>
+        <div className="section-label mb-3">Bookkeeping handoff</div>
+        <p className="text-xs text-muted-foreground mb-4">
+          When Paperfile recognises a doc as an invoice, receipt, or bill, an
+          action appears in your Action Center to send it to your bookkeeping
+          app. Paste the URL below and the &quot;Send&quot; button on those
+          actions will start working.
+        </p>
+        <BookkeepingSettings />
       </Card>
     </div>
   );

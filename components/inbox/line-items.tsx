@@ -1,4 +1,11 @@
 import { formatMoney, titleCase } from "@/lib/utils/format";
+import { LINE_ITEM_CATEGORY_MAP } from "@/lib/categories";
+
+/** Canonical English label from the shared categories file (falls back to titleCase). */
+function categoryLabel(key: string | null | undefined): string {
+  if (!key) return "";
+  return LINE_ITEM_CATEGORY_MAP[key]?.en_label || titleCase(key);
+}
 
 /**
  * Each item Claude extracts may carry:
@@ -113,7 +120,7 @@ export function LineItemsSection({
               key={b.category}
               className={`pill ${categoryChipClass(b.category)}`}
             >
-              {titleCase(b.category)}
+              {categoryLabel(b.category)}
               <span className="opacity-70 font-bold">
                 {formatMoney(b.total, currency || null)}
               </span>
@@ -164,14 +171,14 @@ export function LineItemsSection({
                           it.category
                         )}`}
                       >
-                        {titleCase(it.category)}
+                        {categoryLabel(it.category)}
                       </span>
                     )}
                   </td>
                   <td className="py-2 px-2 hidden sm:table-cell">
                     {it.category && (
                       <span className={`pill ${categoryChipClass(it.category)}`}>
-                        {titleCase(it.category)}
+                        {categoryLabel(it.category)}
                       </span>
                     )}
                   </td>

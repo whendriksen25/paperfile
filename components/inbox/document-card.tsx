@@ -11,8 +11,19 @@ import {
   CircleDot,
   AlertTriangle,
   FolderOpen,
+  CheckCircle2,
+  Send,
 } from "lucide-react";
 import type { DocumentRow, ProfileRow } from "@/types/document";
+
+/** Pull the payment_status helper out of extracted_fields if Claude set it. */
+function paymentStatus(doc: DocumentRow): "paid" | "unpaid" | null {
+  const ef = doc.extracted_fields as Record<string, unknown> | null;
+  const v = String(ef?.["payment_status"] || "").toLowerCase();
+  if (v === "paid") return "paid";
+  if (v === "unpaid" || v === "partial") return "unpaid";
+  return null;
+}
 
 function iconFor(type: string | null) {
   if (!type) return FileText;
@@ -134,10 +145,33 @@ export function DocumentCard({
                     {titleCase(doc.purchase_category)}
                   </Badge>
                 )}
-                {doc.needs_action && (
+                {paymentStatus(doc) === "paid" && (
+                  <Badge variant="green">
+                    <CheckCircle2 className="h-3 w-3" /> Paid
+                  </Badge>
+                )}
+                {paymentStatus(doc) === "unpaid" && (
+                  <Badge variant="warning">
+                    <CircleDot className="h-3 w-3" /> Unpaid
+                  </Badge>
+                )}
+                {doc.needs_action && paymentStatus(doc) !== "paid" && (
                   <Badge variant="green">
                     <CircleDot className="h-3 w-3" /> Action
                   </Badge>
+                )}
+                {doc.sent_to_bookkeeping_at ? (
+                  <Badge variant="teal">
+                    <CheckCircle2 className="h-3 w-3" /> Sent to bookkeeping
+                  </Badge>
+                ) : (
+                  ["invoice", "receipt", "bill", "utility_bill"].includes(
+                    doc.document_type || ""
+                  ) && (
+                    <Badge variant="warning">
+                      <Send className="h-3 w-3" /> Send to bookkeeping
+                    </Badge>
+                  )
                 )}
                 {doc.batch && <Badge>{doc.batch}</Badge>}
                 {(doc.tags || []).slice(0, 2).map((t) => (

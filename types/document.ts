@@ -12,6 +12,7 @@ export type ActionType =
   | "respond"
   | "sign"
   | "file_with_authority"
+  | "send_to_bookkeeping"
   | "other";
 
 export type ActionStatus = "open" | "done" | "dismissed" | "snoozed";
@@ -69,6 +70,11 @@ export interface DocumentRow {
   status: DocumentStatus;
   needs_review: boolean;
   review_notes: string | null;
+
+  // Bookkeeping handoff (one-way push to a separate bookkeeping app)
+  sent_to_bookkeeping_at: string | null;
+  bookkeeping_doc_id: string | null;
+  bookkeeping_url: string | null;
 
   uploaded_by: string | null;
   created_at: string;

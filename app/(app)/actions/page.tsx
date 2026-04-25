@@ -11,6 +11,7 @@ import {
   Calendar,
   Trello,
   Download,
+  Send,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Spinner } from "@/components/ui/spinner";
@@ -235,6 +236,7 @@ export default function ActionsPage() {
             onMarkDone={() => update(focused.id, { status: "done" })}
             onDismiss={() => update(focused.id, { status: "dismissed" })}
             onReopen={() => update(focused.id, { status: "open" })}
+            onActionRefresh={load}
           />
         ) : (
           <div className="surface p-10 text-center text-sm text-muted-foreground">
@@ -307,13 +309,45 @@ function FocusedAction({
   onMarkDone,
   onDismiss,
   onReopen,
+  onActionRefresh,
 }: {
   action: ActionWithDoc;
   onMarkDone: () => void;
   onDismiss: () => void;
   onReopen: () => void;
+  onActionRefresh: () => void;
 }) {
   const isPay = action.action_type === "pay";
+  const isSend = action.action_type === "send_to_bookkeeping";
+
+  const [sending, setSending] = useState(false);
+  const [sendError, setSendError] = useState<string | null>(null);
+  const [sendDone, setSendDone] = useState<string | null>(null);
+
+  async function sendToBookkeeping() {
+    if (!action.document) return;
+    setSending(true);
+    setSendError(null);
+    setSendDone(null);
+    try {
+      const res = await fetch(
+        `/api/documents/${action.document.id}/send-to-bookkeeping`,
+        { method: "POST" }
+      );
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
+      setSendDone(
+        json.bookkeeping_doc_id
+          ? `Sent — bookkeeping ID ${json.bookkeeping_doc_id}.`
+          : "Sent."
+      );
+      onActionRefresh();
+    } catch (e: unknown) {
+      setSendError(e instanceof Error ? e.message : "Send failed");
+    } finally {
+      setSending(false);
+    }
+  }
 
   return (
     <div className="space-y-5">
@@ -324,7 +358,9 @@ function FocusedAction({
             {titleCase(action.document.document_type)}
           </Badge>
         )}
-        <Badge variant="green">{titleCase(action.action_type)}</Badge>
+        <Badge variant={isSend ? "teal" : "green"}>
+          {titleCase(action.action_type)}
+        </Badge>
         <div className="flex-1" />
         {action.document && (
           <Link
@@ -339,23 +375,64 @@ function FocusedAction({
       {/* Hero */}
       <div className="surface p-8 text-center">
         <h2 className="text-2xl font-extrabold mb-2">
-          {isPay ? "Ready to pay?" : action.summary}
+          {isPay
+            ? "Ready to pay?"
+            : isSend
+              ? "Send to bookkeeping?"
+              : action.summary}
         </h2>
         <p className="text-sm text-muted-foreground max-w-sm mx-auto">
           {isPay
             ? "Open the source document to find the payee details, then mark this action done."
-            : action.summary}
+            : isSend
+              ? "Pushes the file + structured metadata to your bookkeeping app. Each push is one-time — re-run this action later if you correct the doc in Paperfile."
+              : action.summary}
         </p>
       </div>
 
       {/* CTA + planning */}
       <div className="surface p-6 space-y-4">
-        <button
-          onClick={onMarkDone}
-          className="btn-cta w-full"
-        >
-          {isPay ? "Pay online now" : "Mark as done"}
-        </button>
+        {isSend ? (
+          <>
+            <button
+              onClick={sendToBookkeeping}
+              disabled={sending}
+              className="btn-cta w-full"
+            >
+              {sending ? (
+                <>
+                  <Spinner className="h-4 w-4" /> Sending…
+                </>
+              ) : (
+                <>
+                  <Send className="h-4 w-4" /> Send to bookkeeping now
+                </>
+              )}
+            </button>
+            {sendError && (
+              <p className="text-xs text-destructive font-semibold text-center">
+                {sendError}{" "}
+                {sendError.toLowerCase().includes("not set") && (
+                  <Link
+                    href="/settings"
+                    className="underline text-brand-purple"
+                  >
+                    Open settings
+                  </Link>
+                )}
+              </p>
+            )}
+            {sendDone && (
+              <p className="text-xs text-brand-green font-semibold text-center">
+                {sendDone}
+              </p>
+            )}
+          </>
+        ) : (
+          <button onClick={onMarkDone} className="btn-cta w-full">
+            {isPay ? "Pay online now" : "Mark as done"}
+          </button>
+        )}
 
         <div className="flex flex-wrap items-center justify-center gap-2">
           <button onClick={onMarkDone} className="btn-secondary text-xs">

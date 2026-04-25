@@ -1,14 +1,50 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
+import { useRouter, usePathname, useSearchParams } from "next/navigation";
 import { ChevronDown, User, Building2, Plus } from "lucide-react";
 import { useProfiles } from "@/hooks/useProfiles";
 import { cn } from "@/lib/utils/cn";
 
+/**
+ * Top-right profile picker. Two responsibilities:
+ *
+ *  1. Stores the user's chosen profile in localStorage (via useProfiles).
+ *  2. On pages that filter by profile (today: /inbox), keeps the URL's
+ *     ?profile_id= query in sync with the active profile, so the
+ *     server-rendered list reloads to show only that profile's documents.
+ *
+ * On other pages, picking a profile only updates the stored selection — the
+ * filter kicks in next time the user lands on /inbox.
+ */
 export function ProfileSelector() {
-  const { profiles, active, setActiveId, loading } = useProfiles();
+  const { profiles, active, activeId, setActiveId, loading } = useProfiles();
   const [open, setOpen] = useState(false);
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+
+  /** Pages where the profile selector should drive the URL filter. */
+  const filtersUrl = pathname === "/inbox";
+
+  /**
+   * Whenever the active profile changes (or we land on /inbox), make sure the
+   * URL's ?profile_id matches. We only rewrite the URL if the value would
+   * actually change — avoids an infinite loop.
+   */
+  useEffect(() => {
+    if (!filtersUrl || loading) return;
+    const current = searchParams.get("profile_id");
+    const desired = activeId ? String(activeId) : null;
+    if (current === desired) return;
+
+    const params = new URLSearchParams(searchParams.toString());
+    if (desired) params.set("profile_id", desired);
+    else params.delete("profile_id");
+    const qs = params.toString();
+    router.replace(qs ? `${pathname}?${qs}` : pathname);
+  }, [filtersUrl, activeId, loading, pathname, router, searchParams]);
 
   if (loading) {
     return (

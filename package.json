@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start -p 3002",
     "lint": "next lint",
-    "migrate": "node scripts/apply-migrations.mjs"
+    "migrate": "node scripts/apply-migrations.mjs",
+    "check:categories": "node scripts/check-categories-sync.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",

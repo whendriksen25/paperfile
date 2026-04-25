@@ -1,3 +1,5 @@
+import { buildLineItemCategoryBlock } from "@/lib/categories";
+
 export const DOCUMENT_EXTRACTION_PROMPT = `You are a document intake assistant. A user will send you ONE scanned document (image or PDF). Extract its contents and return a single JSON object.
 
 Return STRICT JSON only — no prose, no markdown code fences, no commentary. The object must match this shape:
@@ -59,44 +61,28 @@ Rules:
   ]
   If there's only one line, include it anyway — a single-element array. Omit line_items entirely if the doc has no itemised breakdown (e.g. a letter, a simple payment confirmation with only a total).
 
-- line_item_category — one of:
-  groceries        (bread, milk, fruit, veg, meat, supermarket food in general)
-  alcohol          (beer, wine, spirits)
-  beverages        (soft drinks, coffee, tea, water — non-alcoholic)
-  restaurant       (eat-in/take-out meals, café, bar tab, delivery)
-  household        (cleaning supplies, paper goods, kitchenware)
-  toiletries       (shampoo, soap, dental, cosmetics, personal care)
-  pharmacy         (medicine, prescriptions, plasters, supplements)
-  health_service   (doctor visit, physio, dentist consultation, lab fee)
-  clothing         (clothes, shoes, accessories)
-  electronics      (devices, cables, batteries)
-  appliances       (washing machine, kettle, vacuum)
-  baby_kids        (diapers, toys, kids clothing — only if clearly for child)
-  pet              (pet food, vet supplies, accessories)
-  fuel             (petrol, diesel, EV charging)
-  transport        (public transport, taxi, parking, tolls)
-  travel           (hotel, flight, train tickets, holiday)
-  entertainment    (movie, game, books, hobby, gym entry)
-  subscription     (Netflix, Spotify, software, magazine, recurring service)
-  utilities        (electricity, gas, water, internet, phone bill line)
-  housing          (rent, mortgage, repairs, furniture)
-  diy_garden       (hardware store items, plants, tools)
-  office_supplies  (stationery, printer ink, postage)
-  professional_service (lawyer, accountant, consultant, repair labor)
-  insurance        (premium line on a policy or invoice)
-  tax_fee          (VAT-only line, government fees, surcharges)
-  gift             (clearly a present — flowers, gift cards)
-  donation         (charity contribution)
-  discount         (negative line, coupon, promo — total should be negative)
-  deposit_return   (statiegeld / bottle return — usually negative)
-  shipping         (delivery, postage line on an order)
-  other            (genuinely doesn't fit anything above)
+- line_item_category — pick the best-matching key from this canonical list (Dutch label in parentheses for ambiguity, then short description). Use the ENGLISH key as the value of "category" — never the Dutch label or description:
+${buildLineItemCategoryBlock()}
 
   Pick categories from the BUYER's perspective. A wine bottle on a supermarket receipt is "alcohol", not "groceries". A line that says "Korting" / "Discount" / negative amount is "discount". Statiegeld / bottle return is "deposit_return".
 
 - Identifying facts that help match a document to a person — ALWAYS put these in extracted_fields when visible, with these exact keys:
   birth_date (YYYY-MM-DD or DD-MM-YYYY as written), bsn, national_id, patient_number, patient_code, policy_number, iban, customer_number, employee_number, address, postal_code, city.
   These are signals the profile matcher will cross-reference against profile attributes.
+
+- PAYMENT STATUS — for any bill / invoice / payable document, look HARD for evidence the document has already been paid, including:
+  * Printed labels: "PAID", "BETAALD", "VOLDAAN", "PAGATO", "BEZAHLT", "settled", "no balance due", "balance: 0,00".
+  * Bank/payment stamps in any colour.
+  * HANDWRITTEN annotations on top of the document — e.g. someone scribbled "betaald 27-11-2025" or "paid 12/3" in pen across the page. Handwriting is COMMON on paper bills the user has already settled — do not miss it. Read it carefully.
+  * A zero outstanding balance combined with a payment date.
+  Put the result in extracted_fields with these exact keys:
+    payment_status: "paid" | "unpaid" | "partial" | "unknown"
+    paid_date: YYYY-MM-DD if a payment date is visible (printed OR handwritten), else null
+    paid_note: short verbatim quote of the printed/handwritten evidence, e.g. "Handwritten 'betaald 27-11-2025' across top right" — null if no evidence found
+  If payment_status is "paid", set needs_action=false and action_summary=null (the document doesn't need any further action — it's already been paid).
+  If unsure, use "unknown" — never guess "paid" without concrete evidence.
+
+- HANDWRITTEN ANNOTATIONS — capture any other handwritten text (notes, signatures, references, names) in extracted_fields.handwritten_notes as an array of short strings, verbatim. This helps the user see what was added by hand on top of the printed document.
 
 - If a field is not present on the document, use null (or omit from extracted_fields). Never invent data.
 - For languages other than English, translate "title", "summary", and "tags" into English but keep "ocr_text" AND line_items descriptions in the original language.

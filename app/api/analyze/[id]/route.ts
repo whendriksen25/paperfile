@@ -19,7 +19,12 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
-  console.log("[api/analyze] start", id);
+  // ?force_profile=1 — when re-analysing, ignore any pre-set primary_profile_id
+  // and let Claude re-evaluate from scratch. Used by the "Re-analyse with AI"
+  // button so a wrongly-pinned profile doesn't get respected forever.
+  const forceProfile =
+    request.nextUrl.searchParams.get("force_profile") === "1";
+  console.log("[api/analyze] start", id, forceProfile ? "(force_profile)" : "");
 
   try {
     const supabase = await createClient();
@@ -74,36 +79,42 @@ export async function POST(
 
     // 3. Resolve profile.
     //    Order of preference:
-    //      a) explicit profile_id supplied at upload time (user choice wins)
+    //      a) explicit profile_id supplied at upload time (user choice wins),
+    //         UNLESS force_profile=1 (manual re-analyse) — then we re-rank.
     //      b) AI ranker (suggestProfile) if confidence >= threshold
     //      c) name-token fallback against profile_hint
     //      d) default profile
-    let profileId: number | null = doc.primary_profile_id || null;
+    let profileId: number | null = forceProfile
+      ? null
+      : doc.primary_profile_id || null;
     let profileName: string | null = null;
     let profileMatchReason: string | null = null;
     let profileMatchConfidence: number | null = null;
     const profiles = await listProfilesForUser(admin, user.id);
+
+    // Always run Claude's suggestion so we can surface its ranking on the
+    // detail page, even when the user pre-pinned a profile at upload.
+    let suggestion: Awaited<ReturnType<typeof suggestProfile>> | null = null;
+    try {
+      suggestion = await suggestProfile(extraction, profiles);
+    } catch (e) {
+      console.warn("[api/analyze] suggestProfile failed", e);
+    }
 
     if (profileId) {
       profileName = profiles.find((p) => p.id === profileId)?.name || null;
       profileMatchReason = "User selected at upload";
       profileMatchConfidence = 1;
     } else {
-      try {
-        const suggestion = await suggestProfile(extraction, profiles);
-        if (
-          suggestion &&
-          suggestion.profileId != null &&
-          suggestion.confidence >= PROFILE_AUTO_ASSIGN_THRESHOLD
-        ) {
-          profileId = suggestion.profileId;
-          profileName =
-            profiles.find((p) => p.id === profileId)?.name || null;
-          profileMatchReason = suggestion.reason;
-          profileMatchConfidence = suggestion.confidence;
-        }
-      } catch (e) {
-        console.warn("[api/analyze] suggestProfile failed", e);
+      if (
+        suggestion &&
+        suggestion.profileId != null &&
+        suggestion.confidence >= PROFILE_AUTO_ASSIGN_THRESHOLD
+      ) {
+        profileId = suggestion.profileId;
+        profileName = profiles.find((p) => p.id === profileId)?.name || null;
+        profileMatchReason = suggestion.reason;
+        profileMatchConfidence = suggestion.confidence;
       }
 
       if (!profileId && extraction.profile_hint) {
@@ -150,7 +161,16 @@ export async function POST(
       )
     );
 
-    const needsAction = !!extraction.needs_action;
+    // Hard server-side override: a doc that has already been paid never
+    // needs a "pay this" action, regardless of what Claude returned. This
+    // covers the case where a handwritten "PAID 27-11-2025" annotation was
+    // captured but the model still flagged needs_action=true out of habit.
+    const ef = extraction.extracted_fields || {};
+    const paymentStatus = String(
+      (ef as Record<string, unknown>)["payment_status"] || ""
+    ).toLowerCase();
+    const isPaid = paymentStatus === "paid";
+    const needsAction = isPaid ? false : !!extraction.needs_action;
     const isFinancial = [
       "invoice",
       "receipt",
@@ -184,7 +204,17 @@ export async function POST(
         extracted_fields: {
           ...(extraction.extracted_fields || {}),
           _profile_match: profileMatchReason
-            ? { reason: profileMatchReason, confidence: profileMatchConfidence }
+            ? {
+                reason: profileMatchReason,
+                confidence: profileMatchConfidence,
+                // Claude's full ranked list (independent of which profile we
+                // actually chose) so the user can see WHY a match did or
+                // didn't happen.
+                ai_ranked: suggestion?.ranked || null,
+                ai_best_id: suggestion?.profileId ?? null,
+                ai_best_confidence: suggestion?.confidence ?? null,
+                ai_best_reason: suggestion?.reason || null,
+              }
             : undefined,
         },
         ocr_text: extraction.ocr_text || null,
@@ -202,22 +232,73 @@ export async function POST(
       return NextResponse.json({ error: updateErr.message }, { status: 500 });
     }
 
-    // 7. If actionable, upsert a row in actions
+    // 7. Action handling — a doc may now have MULTIPLE concurrent actions,
+    //    e.g. "Pay €76.60" AND "Send to bookkeeping". Each is keyed by
+    //    (document_id, action_type) thanks to migration 007.
+
+    // 7a. Pay/respond/sign/etc. action from Claude's needs_action signal.
     if (needsAction && extraction.action_summary) {
+      const payActionType = extraction.action_type || "other";
       const { error: actionErr } = await admin.from("actions").upsert(
         {
           user_id: user.id,
           document_id: id,
           profile_id: profileId,
-          action_type: extraction.action_type || "other",
+          action_type: payActionType,
           summary: extraction.action_summary,
           due_date: extraction.due_date || null,
           status: "open",
         },
-        { onConflict: "document_id" }
+        { onConflict: "document_id,action_type" }
       );
       if (actionErr) {
         console.warn("[api/analyze] action upsert failed", actionErr);
+      }
+    } else if (isPaid) {
+      // Paid bills: auto-close any open pay-style action so the user's
+      // to-do list stays accurate. Records when (and why) we closed it.
+      // Doesn't touch send_to_bookkeeping actions — those are independent.
+      const { error: closeErr } = await admin
+        .from("actions")
+        .update({
+          status: "done",
+          completed_at: new Date().toISOString(),
+          notes: "Auto-closed: document marked paid by AI re-analysis.",
+        })
+        .eq("document_id", id)
+        .eq("status", "open")
+        .in("action_type", ["pay", "respond", "sign", "file_with_authority", "other"]);
+      if (closeErr) {
+        console.warn("[api/analyze] action auto-close failed", closeErr);
+      }
+    }
+
+    // 7b. send_to_bookkeeping action for any invoice/receipt/bill that
+    //     hasn't already been pushed. Independent of payment status —
+    //     even paid invoices still need to land in the books.
+    const isBookkeepingCandidate = [
+      "invoice",
+      "receipt",
+      "bill",
+      "utility_bill",
+    ].includes(extraction.document_type || "");
+    const alreadySent = !!doc.sent_to_bookkeeping_at;
+
+    if (isBookkeepingCandidate && !alreadySent) {
+      const { error: bkErr } = await admin.from("actions").upsert(
+        {
+          user_id: user.id,
+          document_id: id,
+          profile_id: profileId,
+          action_type: "send_to_bookkeeping",
+          summary: `Send "${extraction.title || doc.file_name || "this document"}" to bookkeeping`,
+          due_date: null,
+          status: "open",
+        },
+        { onConflict: "document_id,action_type" }
+      );
+      if (bkErr) {
+        console.warn("[api/analyze] bookkeeping action upsert failed", bkErr);
       }
     }
 
