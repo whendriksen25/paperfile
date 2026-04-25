@@ -9,6 +9,7 @@ import {
 } from "@/lib/utils/format";
 import { Badge } from "@/components/ui/badge";
 import { LineItemsSection, type LineItem } from "@/components/inbox/line-items";
+import { parseStoragePath } from "@/lib/utils/storage-path";
 import type { DocumentRow, ProfileRow, ActionRow } from "@/types/document";
 import {
   ArrowLeft,
@@ -17,6 +18,8 @@ import {
   CircleDot,
   Building2,
   User,
+  FolderOpen,
+  ChevronRight,
 } from "lucide-react";
 
 export const dynamic = "force-dynamic";
@@ -239,10 +242,36 @@ export default async function DocumentDetail({
             <Row label="Type" value={doc.file_type} />
             <Row label="Size" value={formatBytes(doc.file_size_bytes)} />
             <Row label="Storage" value={titleCase(doc.storage_provider)} />
-            <Row label="Path" value={doc.dropbox_path} mono />
           </dl>
         </div>
       </div>
+
+      {/* Filed at — Dropbox storage location */}
+      {doc.dropbox_path && (
+        <div className="surface p-5 mb-5">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="section-label flex items-center gap-1.5">
+              <FolderOpen className="h-3.5 w-3.5" />
+              Filed at
+            </h2>
+            {doc.dropbox_shared_link && (
+              <a
+                href={doc.dropbox_shared_link}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-xs font-semibold text-brand-purple hover:underline inline-flex items-center gap-1"
+              >
+                Open in Dropbox
+                <ExternalLink className="h-3 w-3" />
+              </a>
+            )}
+          </div>
+          <FiledAtBreadcrumb path={doc.dropbox_path} />
+          <p className="mt-2 text-[11px] text-muted-foreground font-mono break-all">
+            {doc.dropbox_path}
+          </p>
+        </div>
+      )}
 
       {doc.extracted_fields &&
         Object.keys(doc.extracted_fields).filter((k) => k !== "line_items")
@@ -318,6 +347,54 @@ function Row({
       >
         {value}
       </dd>
+    </div>
+  );
+}
+
+/**
+ * Breadcrumb-style display of the Dropbox storage location, e.g.
+ *   Archive › Father › 2026 › Medical Bill
+ * with special states for staged (_inbox) and unsorted (_unsorted) files.
+ */
+function FiledAtBreadcrumb({ path }: { path: string }) {
+  const parsed = parseStoragePath(path);
+
+  if (parsed.inInbox) {
+    return (
+      <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+        <strong>Awaiting filing.</strong> This document is still in the inbox
+        staging folder — it will be moved to its final home once the AI
+        classification finishes.
+      </div>
+    );
+  }
+
+  if (parsed.unsorted) {
+    return (
+      <div className="rounded-2xl border border-zinc-200 bg-zinc-50 px-4 py-3 text-sm text-zinc-700">
+        <strong>Unsorted.</strong> The AI couldn&apos;t pick a confident profile
+        or category, so the file lives in the shared <code>_unsorted</code>{" "}
+        folder.
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-wrap items-center gap-1 text-sm">
+      {parsed.breadcrumb.map((seg, i) => (
+        <span key={i} className="flex items-center gap-1">
+          {i > 0 && <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />}
+          <span
+            className={
+              i === 0
+                ? "text-muted-foreground"
+                : "font-bold text-foreground"
+            }
+          >
+            {seg}
+          </span>
+        </span>
+      ))}
     </div>
   );
 }

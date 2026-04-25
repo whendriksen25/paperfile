@@ -2,6 +2,7 @@ import Link from "next/link";
 import { Badge } from "@/components/ui/badge";
 import { Spinner } from "@/components/ui/spinner";
 import { formatDate, formatMoney, titleCase } from "@/lib/utils/format";
+import { storagePathLabel, parseStoragePath } from "@/lib/utils/storage-path";
 import {
   FileText,
   Image as ImageIcon,
@@ -9,6 +10,7 @@ import {
   Receipt,
   CircleDot,
   AlertTriangle,
+  FolderOpen,
 } from "lucide-react";
 import type { DocumentRow, ProfileRow } from "@/types/document";
 
@@ -145,6 +147,17 @@ export function DocumentCard({
               </>
             )}
           </div>
+          {/* Storage location breadcrumb — where this file lives in Dropbox */}
+          {!isWorking && doc.dropbox_path && (
+            <div className="mt-2 flex items-center gap-1.5 text-[11px] text-muted-foreground">
+              <FolderOpen className="h-3 w-3" />
+              <span className="truncate">
+                {parseStoragePath(doc.dropbox_path).inInbox
+                  ? "Awaiting filing"
+                  : storagePathLabel(doc.dropbox_path)}
+              </span>
+            </div>
+          )}
         </div>
       </div>
     </Link>
