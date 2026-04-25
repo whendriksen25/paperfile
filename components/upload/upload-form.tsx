@@ -1,8 +1,8 @@
 "use client";
 
-import { useRef, useState, useEffect } from "react";
+import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Camera, Upload as UploadIcon, X, Sparkles } from "lucide-react";
+import { Camera, Upload as UploadIcon, X, Sparkles, Layers } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
@@ -28,6 +28,10 @@ export function UploadForm() {
   const [tagsInput, setTagsInput] = useState("");
   const [pending, setPending] = useState<PendingFile[]>([]);
   const [submitting, setSubmitting] = useState(false);
+  // When on, the server stitches all picked files into ONE multi-page PDF
+  // and treats them as a single Paperfile document.
+  const [combineMode, setCombineMode] = useState(false);
+  const [combinedName, setCombinedName] = useState("");
 
   // NOTE: deliberately NOT pre-filling profileId from `active`. If we did,
   // every upload would be locked to the currently-selected profile and the AI
@@ -59,13 +63,15 @@ export function UploadForm() {
 
     let lastDocId: string | null = null;
 
-    for (const item of pending) {
-      if (item.progress === "done") continue;
+    if (combineMode) {
+      // Single POST with all files; server stitches into one PDF.
       setPending((p) =>
-        p.map((f) => (f.id === item.id ? { ...f, progress: "uploading" } : f))
+        p.map((f) => ({ ...f, progress: "uploading" as const }))
       );
       const fd = new FormData();
-      fd.append("file", item.file);
+      fd.append("combine", "1");
+      if (combinedName.trim()) fd.append("combinedName", combinedName.trim());
+      for (const it of pending) fd.append("files", it.file);
       if (batch) fd.append("batch", batch);
       if (profileId) fd.append("profile_id", String(profileId));
       if (tags.length) fd.append("tags", tags.join(","));
@@ -75,24 +81,54 @@ export function UploadForm() {
         const json = await res.json();
         lastDocId = json.data?.id || null;
         setPending((p) =>
-          p.map((f) =>
-            f.id === item.id
-              ? { ...f, progress: "done", documentId: lastDocId || undefined }
-              : f
-          )
+          p.map((f) => ({
+            ...f,
+            progress: "done" as const,
+            documentId: lastDocId || undefined,
+          }))
         );
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : "Upload failed";
         setPending((p) =>
-          p.map((f) =>
-            f.id === item.id ? { ...f, progress: "failed", error: msg } : f
-          )
+          p.map((f) => ({ ...f, progress: "failed" as const, error: msg }))
         );
+      }
+    } else {
+      for (const item of pending) {
+        if (item.progress === "done") continue;
+        setPending((p) =>
+          p.map((f) => (f.id === item.id ? { ...f, progress: "uploading" } : f))
+        );
+        const fd = new FormData();
+        fd.append("file", item.file);
+        if (batch) fd.append("batch", batch);
+        if (profileId) fd.append("profile_id", String(profileId));
+        if (tags.length) fd.append("tags", tags.join(","));
+        try {
+          const res = await fetch("/api/upload", { method: "POST", body: fd });
+          if (!res.ok) throw new Error(await res.text());
+          const json = await res.json();
+          lastDocId = json.data?.id || null;
+          setPending((p) =>
+            p.map((f) =>
+              f.id === item.id
+                ? { ...f, progress: "done", documentId: lastDocId || undefined }
+                : f
+            )
+          );
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : "Upload failed";
+          setPending((p) =>
+            p.map((f) =>
+              f.id === item.id ? { ...f, progress: "failed", error: msg } : f
+            )
+          );
+        }
       }
     }
 
     setSubmitting(false);
-    if (lastDocId && pending.length === 1) {
+    if (lastDocId && (combineMode || pending.length === 1)) {
       router.push(`/document/${lastDocId}`);
     } else {
       router.push("/inbox");
@@ -146,6 +182,50 @@ export function UploadForm() {
           className="hidden"
           onChange={(e) => addFiles(e.target.files)}
         />
+      </div>
+
+      {/* Combine-pages toggle — when on, all picked files become ONE multi-page PDF */}
+      <div className="surface p-4">
+        <label className="flex items-start gap-3 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={combineMode}
+            onChange={(e) => setCombineMode(e.target.checked)}
+            className="mt-1 h-4 w-4 accent-brand-purple cursor-pointer"
+          />
+          <div className="flex-1">
+            <div className="flex items-center gap-2 text-sm font-bold">
+              <Layers className="h-3.5 w-3.5 text-brand-purple" />
+              Combine into one document
+            </div>
+            <p className="text-xs text-muted-foreground mt-0.5">
+              Treat the picked photos as pages of a single multi-page document.
+              The server stitches them into one PDF before AI analysis.
+              {pending.length > 1 && (
+                <>
+                  {" "}
+                  <span className="font-bold text-foreground">
+                    {pending.length} pages will be combined.
+                  </span>
+                </>
+              )}
+            </p>
+            {combineMode && (
+              <div className="mt-3 space-y-1.5">
+                <label className="section-label">Combined document name</label>
+                <Input
+                  placeholder="medical_bill_dec_2025"
+                  value={combinedName}
+                  onChange={(e) => setCombinedName(e.target.value)}
+                />
+                <p className="text-[11px] text-muted-foreground">
+                  Optional. Becomes the filename of the stitched PDF; the AI still
+                  extracts the real title from the document content.
+                </p>
+              </div>
+            )}
+          </div>
+        </label>
       </div>
 
       <div className="surface p-5 space-y-4">
@@ -234,6 +314,10 @@ export function UploadForm() {
       >
         {submitting ? (
           <Spinner />
+        ) : combineMode ? (
+          `Combine ${pending.length} ${
+            pending.length === 1 ? "page" : "pages"
+          } into one document`
         ) : (
           `Scan it · ${pending.length || 0} ${
             pending.length === 1 ? "file" : "files"
