@@ -26,7 +26,12 @@ export function InboxInfiniteList({
   initialDocs: DocumentRow[];
   initialNextCursor: string | null;
   pageSize: number;
-  filters: { type?: string | null; profile_id?: string | null; batch?: string | null };
+  filters: {
+    type?: string | null;
+    profile_id?: string | null;
+    batch?: string | null;
+    needs_review?: string | null;
+  };
   /** Map keyed by profile id; serialised as a plain object across the boundary. */
   profilesById: Record<number, ProfileRow>;
 }) {
@@ -53,6 +58,7 @@ export function InboxInfiniteList({
       if (filters.type) params.set("type", filters.type);
       if (filters.profile_id) params.set("profile_id", filters.profile_id);
       if (filters.batch) params.set("batch", filters.batch);
+      if (filters.needs_review) params.set("needs_review", filters.needs_review);
 
       const res = await fetch(`/api/documents?${params.toString()}`, {
         cache: "no-store",

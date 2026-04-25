@@ -40,6 +40,7 @@ export async function GET(request: NextRequest) {
   const batch = sp.get("batch");
   const profileId = sp.get("profile_id");
   const after = sp.get("after");
+  const triage = sp.get("needs_review") === "1";
   const limit = Math.min(50, Math.max(1, Number(sp.get("limit")) || INBOX_PAGE_SIZE));
 
   let query = supabase
@@ -52,7 +53,13 @@ export async function GET(request: NextRequest) {
   if (q) query = query.textSearch("fts", q, { type: "websearch", config: "simple" });
   if (type) query = query.eq("document_type", type);
   if (batch) query = query.eq("batch", batch);
-  if (profileId) query = query.eq("primary_profile_id", Number(profileId));
+  // Profile filter is intentionally suppressed in triage mode — same logic
+  // as the server-rendered inbox page (otherwise an unassigned doc gets
+  // hidden behind an active profile filter when paginating).
+  if (profileId && !triage) query = query.eq("primary_profile_id", Number(profileId));
+  if (triage) {
+    query = query.or("primary_profile_id.is.null,needs_review.eq.true");
+  }
   // Cursor: anything strictly older than `after`. Using `lt` (not `lte`) so
   // we don't return the same boundary row twice across pages.
   if (after) query = query.lt("created_at", after);

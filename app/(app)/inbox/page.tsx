@@ -242,6 +242,7 @@ export default async function InboxPage({
             type: sp.type || null,
             profile_id: sp.profile_id || null,
             batch: sp.batch || null,
+            needs_review: sp.needs_review || null,
           }}
           profilesById={Object.fromEntries(profilesById)}
         />

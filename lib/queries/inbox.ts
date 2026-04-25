@@ -13,7 +13,7 @@ export const INBOX_CARD_FIELDS =
   "purchase_category, title, summary, tags, batch, dropbox_path, " +
   "dropbox_shared_link, storage_provider, needs_action, action_type, " +
   "due_date, action_summary, sent_to_bookkeeping_at, bookkeeping_doc_id, " +
-  "review_notes, confidence, created_at, updated_at, " +
+  "needs_review, review_notes, confidence, created_at, updated_at, " +
   "extracted_fields_payment_status:extracted_fields->payment_status";
 
 /**
