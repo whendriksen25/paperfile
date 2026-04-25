@@ -29,12 +29,21 @@ export function ProfileSelector() {
   const filtersUrl = pathname === "/inbox";
 
   /**
+   * Special case: when the inbox is in triage mode (?needs_review=1), the
+   * profile filter is intentionally ignored server-side, so this selector
+   * stays out of the way — no URL rewrites, and the chip displays as
+   * "All profiles" so the UI tells the truth about what's shown.
+   */
+  const triageMode =
+    filtersUrl && searchParams.get("needs_review") === "1";
+
+  /**
    * Whenever the active profile changes (or we land on /inbox), make sure the
    * URL's ?profile_id matches. We only rewrite the URL if the value would
    * actually change — avoids an infinite loop.
    */
   useEffect(() => {
-    if (!filtersUrl || loading) return;
+    if (!filtersUrl || loading || triageMode) return;
     const current = searchParams.get("profile_id");
     const desired = activeId ? String(activeId) : null;
     if (current === desired) return;
@@ -44,7 +53,7 @@ export function ProfileSelector() {
     else params.delete("profile_id");
     const qs = params.toString();
     router.replace(qs ? `${pathname}?${qs}` : pathname);
-  }, [filtersUrl, activeId, loading, pathname, router, searchParams]);
+  }, [filtersUrl, triageMode, activeId, loading, pathname, router, searchParams]);
 
   if (loading) {
     return (
@@ -63,8 +72,8 @@ export function ProfileSelector() {
         ) : (
           <User className="h-3.5 w-3.5 text-brand-purple" />
         )}
-        <span className="font-semibold truncate max-w-[140px]">
-          {active?.name || "All profiles"}
+        <span className="font-semibold truncate max-w-[180px]">
+          {triageMode ? "All · Needs review" : active?.name || "All profiles"}
         </span>
         <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
       </button>

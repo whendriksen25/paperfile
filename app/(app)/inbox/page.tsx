@@ -2,10 +2,17 @@ import Link from "next/link";
 import { createClient } from "@/lib/supabase/server";
 import { DocumentCard } from "@/components/inbox/document-card";
 import { ProcessingBanner } from "@/components/inbox/processing-banner";
+import { NeedsReviewBanner } from "@/components/inbox/needs-review-banner";
+import { InboxInfiniteList } from "@/components/inbox/infinite-list";
 import { ProfileSelector } from "@/components/layout/profile-selector";
 import { ExportToDropboxButton } from "@/components/inbox/export-button";
 import { Search } from "lucide-react";
 import { titleCase } from "@/lib/utils/format";
+import {
+  INBOX_CARD_FIELDS,
+  INBOX_PAGE_SIZE,
+  reshapeInboxRow,
+} from "@/lib/queries/inbox";
 import type { DocumentRow, ProfileRow } from "@/types/document";
 
 export const dynamic = "force-dynamic";
@@ -20,6 +27,7 @@ export default async function InboxPage({
     profile_id?: string;
     type?: string;
     group?: string;
+    needs_review?: string;
   }>;
 }) {
   const sp = await searchParams;
@@ -31,52 +39,85 @@ export default async function InboxPage({
       : "none";
   const supabase = await createClient();
 
+  // When grouping is on, we need the full visible set to bucket correctly,
+  // so we fetch a larger batch (200 max). When grouping is off we render
+  // the first INBOX_PAGE_SIZE (10) server-side and let the client stream
+  // more via IntersectionObserver in InboxInfiniteList.
+  const initialLimit = group === "none" ? INBOX_PAGE_SIZE : 200;
+
   let q = supabase
     .from("documents")
-    .select("*")
+    .select(INBOX_CARD_FIELDS)
     .neq("status", "deleted")
     .order("created_at", { ascending: false })
-    .limit(200);
+    .limit(initialLimit);
+
+  // ?needs_review=1 is the global triage view — it MUST ignore the active
+  // profile filter, otherwise an unassigned doc (profile_id=null) is hidden
+  // by an "I'm currently looking at Father" filter and the user just sees
+  // the count without ever finding the doc.
+  const triage = sp.needs_review === "1";
 
   if (sp.batch) q = q.eq("batch", sp.batch);
-  if (sp.profile_id) q = q.eq("primary_profile_id", Number(sp.profile_id));
+  if (sp.profile_id && !triage) {
+    q = q.eq("primary_profile_id", Number(sp.profile_id));
+  }
   if (sp.type) q = q.eq("document_type", sp.type);
+  if (triage) {
+    q = q.or("primary_profile_id.is.null,needs_review.eq.true");
+  }
 
-  const [{ data, error }, { data: profileData }, { data: typeData }] =
+  // Category counts come from a server-side GROUP BY function instead of
+  // shipping N rows over the wire. RLS-scoped via SECURITY INVOKER.
+  const [{ data, error }, { data: profileData }, { data: countsData }] =
     await Promise.all([
       q,
       supabase.from("profiles").select("*"),
-      supabase
-        .from("documents")
-        .select("document_type")
-        .neq("status", "deleted")
-        .not("document_type", "is", null),
+      supabase.rpc("documents_type_counts"),
     ]);
 
-  const docs = (data || []) as DocumentRow[];
+  // Reshape so DocumentCard can keep reading doc.extracted_fields.payment_status
+  // — same shape as before, just without the heavy ocr_text/full JSONB.
+  const docs = ((data || []) as unknown as Array<Record<string, unknown>>).map(
+    reshapeInboxRow
+  );
+  // Cursor for the infinite-scroll loader. Null when this initial page already
+  // contains all matching docs (or when grouping is on — grouping fetches up
+  // to 200 in one go and doesn't paginate).
+  const initialNextCursor =
+    group === "none" && docs.length === initialLimit
+      ? docs[docs.length - 1].created_at
+      : null;
   const profilesById = new Map(
     ((profileData || []) as ProfileRow[]).map((p) => [p.id, p])
   );
 
-  // Build category counts (across ALL docs, not just the current filter)
-  const categoryMap = new Map<string, number>();
-  for (const r of (typeData || []) as { document_type: string | null }[]) {
-    if (r.document_type)
-      categoryMap.set(r.document_type, (categoryMap.get(r.document_type) || 0) + 1);
-  }
-  const categories = Array.from(categoryMap.entries()).sort(
-    (a, b) => b[1] - a[1]
-  );
+  const categories = ((countsData || []) as { document_type: string; n: number }[])
+    .map((r) => [r.document_type, Number(r.n)] as [string, number]);
 
   return (
     <div className="px-5 md:px-10 py-6 md:py-10 max-w-5xl mx-auto">
       <div className="flex items-start justify-between mb-6 gap-4">
         <header>
-          <h1 className="text-3xl font-extrabold tracking-tight">File it</h1>
+          <h1 className="text-3xl font-extrabold tracking-tight">
+            {triage ? "Needs review" : "File it"}
+          </h1>
           <p className="text-sm text-muted-foreground mt-1">
             {docs.length} {docs.length === 1 ? "document" : "documents"}
+            {triage ? " awaiting confirmation" : ""}
             {sp.type ? ` of type "${titleCase(sp.type)}"` : ""}
             {sp.batch ? ` in batch "${sp.batch}"` : ""}.
+            {triage && (
+              <>
+                {" · "}
+                <Link
+                  href="/inbox"
+                  className="text-brand-purple font-semibold hover:underline"
+                >
+                  Back to all
+                </Link>
+              </>
+            )}
           </p>
         </header>
         <div className="flex items-center gap-3">
@@ -91,6 +132,10 @@ export default async function InboxPage({
 
       {/* Live AI processing banner (auto-refreshes inbox when work completes) */}
       <ProcessingBanner />
+
+      {/* Triage banner — always visible regardless of profile filter, so
+          unassigned scans don't get hidden behind a Father/LLC/Wife filter */}
+      <NeedsReviewBanner />
 
       {/* Group-by selector (preserves the other query params) */}
       <div className="surface p-4 mb-5">
@@ -189,19 +234,17 @@ export default async function InboxPage({
           </p>
         </div>
       ) : group === "none" ? (
-        <div className="grid gap-3">
-          {docs.map((doc) => (
-            <DocumentCard
-              key={doc.id}
-              doc={doc}
-              profile={
-                doc.primary_profile_id
-                  ? profilesById.get(doc.primary_profile_id) || null
-                  : null
-              }
-            />
-          ))}
-        </div>
+        <InboxInfiniteList
+          initialDocs={docs}
+          initialNextCursor={initialNextCursor}
+          pageSize={INBOX_PAGE_SIZE}
+          filters={{
+            type: sp.type || null,
+            profile_id: sp.profile_id || null,
+            batch: sp.batch || null,
+          }}
+          profilesById={Object.fromEntries(profilesById)}
+        />
       ) : (
         <GroupedDocs docs={docs} profilesById={profilesById} group={group} />
       )}

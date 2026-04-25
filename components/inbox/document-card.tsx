@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { Badge } from "@/components/ui/badge";
 import { Spinner } from "@/components/ui/spinner";
+import { ConfirmProfileButton } from "@/components/inbox/confirm-profile-button";
 import { formatDate, formatMoney, titleCase } from "@/lib/utils/format";
 import { storagePathLabel, parseStoragePath } from "@/lib/utils/storage-path";
 import {
@@ -139,7 +140,21 @@ export function DocumentCard({
                     {titleCase(doc.document_type)}
                   </Badge>
                 )}
-                {profile && <Badge variant="purple">{profile.name}</Badge>}
+                {profile && (
+                  <Badge
+                    variant={doc.needs_review ? "warning" : "purple"}
+                  >
+                    {profile.name}
+                    {doc.needs_review ? " · suggested" : ""}
+                  </Badge>
+                )}
+                {/* Inline confirm — only when AI's pick is provisional */}
+                {doc.needs_review && profile && (
+                  <ConfirmProfileButton
+                    documentId={doc.id}
+                    profileName={profile.name}
+                  />
+                )}
                 {doc.purchase_category && (
                   <Badge variant="teal">
                     {titleCase(doc.purchase_category)}

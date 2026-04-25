@@ -1,5 +1,279 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
-import type { ProfileRow } from "@/types/document";
+import type { DocumentExtraction, ProfileRow } from "@/types/document";
+
+/**
+ * Pull a YYYY year out of either a structured date string ("1936-07-27",
+ * "27-07-1936", "27/07/1936") or freeform text. Returns null if no plausible
+ * birth year is found.
+ */
+function extractYear(input: unknown): number | null {
+  if (input == null) return null;
+  const s = String(input);
+  // Look for a 4-digit year between 1900 and current year
+  const matches = s.match(/\b(19\d{2}|20\d{2})\b/g);
+  if (!matches || matches.length === 0) return null;
+  const now = new Date().getFullYear();
+  for (const m of matches) {
+    const y = Number(m);
+    if (y >= 1900 && y <= now) return y;
+  }
+  return null;
+}
+
+/** Lowercase, trim, strip non-alphanumerics — for fuzzy text comparison. */
+function norm(s: unknown): string {
+  return String(s ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+}
+
+/** Strict IBAN normalisation — uppercase, no whitespace. */
+function ibanNorm(s: unknown): string {
+  return String(s ?? "").toUpperCase().replace(/\s+/g, "");
+}
+
+/**
+ * The signals we'll look for in each profile, derived from its structured
+ * attributes AND its free-text description (so descriptions like
+ * "Born 1936, lives in Dieren" still produce hard signals).
+ */
+interface ProfileSignals {
+  profile: ProfileRow;
+  birthYear: number | null;
+  cities: Set<string>;
+  postalCodes: Set<string>;
+  ibans: Set<string>;
+  bsns: Set<string>;
+  patientNumbers: Set<string>;
+  policyNumbers: Set<string>;
+  customerNumbers: Set<string>;
+}
+
+function signalsFor(profile: ProfileRow): ProfileSignals {
+  const a = (profile.attributes || {}) as Record<string, string>;
+  const desc = profile.description || "";
+
+  const cities = new Set<string>();
+  if (a.city) cities.add(norm(a.city));
+  // Also match any standalone capitalised word in description that looks
+  // like a place name. Lazy heuristic — Dutch city lists would be better,
+  // but covers "Dieren", "Amsterdam", etc. Single-word, length >= 3.
+  for (const word of desc.split(/[\s,.;]+/)) {
+    if (/^[A-Z][a-zA-ZëïéüöáíóúÄëïöü]{2,}$/.test(word)) {
+      cities.add(norm(word));
+    }
+  }
+
+  const postalCodes = new Set<string>();
+  if (a.postal_code) postalCodes.add(norm(a.postal_code));
+  // Dutch postal codes (1234 AB) — match anywhere in description
+  Array.from(desc.matchAll(/\b(\d{4}\s*[A-Z]{2})\b/g)).forEach((m) =>
+    postalCodes.add(norm(m[1]))
+  );
+
+  const ibans = new Set<string>();
+  if (a.iban) ibans.add(ibanNorm(a.iban));
+  // Match an IBAN-shaped token in the description
+  Array.from(desc.matchAll(/\b([A-Z]{2}\d{2}[A-Z0-9]{4,30})\b/g)).forEach((m) =>
+    ibans.add(ibanNorm(m[1]))
+  );
+
+  const collectNumbers = (key: string): Set<string> => {
+    const s = new Set<string>();
+    if (a[key]) s.add(norm(a[key]));
+    return s;
+  };
+
+  return {
+    profile,
+    birthYear: extractYear(a.birth_date) ?? extractYear(desc),
+    cities,
+    postalCodes,
+    ibans,
+    bsns: collectNumbers("bsn"),
+    patientNumbers: collectNumbers("patient_number"),
+    policyNumbers: collectNumbers("policy_number"),
+    customerNumbers: collectNumbers("customer_number"),
+  };
+}
+
+/**
+ * The signals we extracted FROM the document being filed.
+ */
+interface DocumentSignals {
+  birthYear: number | null;
+  cities: Set<string>;
+  postalCodes: Set<string>;
+  ibans: Set<string>;
+  bsns: Set<string>;
+  patientNumbers: Set<string>;
+  policyNumbers: Set<string>;
+  customerNumbers: Set<string>;
+}
+
+function signalsForDocument(extraction: DocumentExtraction): DocumentSignals {
+  const ef = (extraction.extracted_fields || {}) as Record<string, unknown>;
+  const ocr = extraction.ocr_text || "";
+  const all = `${ocr}\n${JSON.stringify(ef)}`;
+
+  const cities = new Set<string>();
+  if (ef.city) cities.add(norm(ef.city));
+  if (ef.address) {
+    // Crude — last word of address often the city
+    const last = String(ef.address).trim().split(/\s+/).pop();
+    if (last) cities.add(norm(last));
+  }
+
+  const postalCodes = new Set<string>();
+  if (ef.postal_code) postalCodes.add(norm(ef.postal_code));
+  Array.from(all.matchAll(/\b(\d{4}\s*[A-Z]{2})\b/g)).forEach((m) =>
+    postalCodes.add(norm(m[1]))
+  );
+
+  const ibans = new Set<string>();
+  if (ef.iban) ibans.add(ibanNorm(ef.iban));
+  Array.from(all.matchAll(/\b([A-Z]{2}\d{2}[A-Z0-9]{4,30})\b/g)).forEach((m) =>
+    ibans.add(ibanNorm(m[1]))
+  );
+
+  const numberFromAll = (key: string, len = 8): Set<string> => {
+    const s = new Set<string>();
+    if (ef[key]) s.add(norm(ef[key]));
+    return s;
+  };
+
+  return {
+    birthYear: extractYear(ef.birth_date),
+    cities,
+    postalCodes,
+    ibans,
+    bsns: numberFromAll("bsn"),
+    patientNumbers: numberFromAll("patient_number"),
+    policyNumbers: numberFromAll("policy_number"),
+    customerNumbers: numberFromAll("customer_number"),
+  };
+}
+
+/**
+ * Try to match the document to a single profile based ONLY on hard,
+ * deterministic identifiers — birth year, city, postal code, IBAN, BSN,
+ * patient/policy/customer number. Skips Claude entirely.
+ *
+ * Returns the matched profile + a human-readable reason if (and only if)
+ * EXACTLY ONE profile uniquely matches at least one strong identifier.
+ * Returns null when zero or multiple profiles tie — those cases fall
+ * through to the existing AI-based suggestProfile.
+ *
+ * Why: a bill with `birth_date: 27-07-1936` and a Father profile whose
+ * description is "Born 1936, lives in Dieren" should never need fuzzy AI
+ * scoring. The year alone uniquely identifies Father; that's a binary
+ * fact the system should treat as 1.0 confidence.
+ */
+export function deterministicProfileMatch(
+  extraction: DocumentExtraction,
+  profiles: ProfileRow[]
+): { profile: ProfileRow; reason: string } | null {
+  if (!profiles.length) return null;
+
+  const docSig = signalsForDocument(extraction);
+  const profSigs = profiles.map(signalsFor);
+
+  // Each entry: list of profiles that share this signal with the doc, plus
+  // the human-readable reason text we'd cite.
+  const checks: { reason: (p: ProfileRow) => string; matches: ProfileSignals[] }[] = [];
+
+  // BSN — gold standard
+  if (docSig.bsns.size) {
+    const m = profSigs.filter((p) => Array.from(p.bsns).some((b) => docSig.bsns.has(b)));
+    if (m.length) checks.push({ reason: () => `BSN matches profile attribute`, matches: m });
+  }
+  // IBAN
+  if (docSig.ibans.size) {
+    const m = profSigs.filter((p) =>
+      Array.from(p.ibans).some((i) => docSig.ibans.has(i))
+    );
+    if (m.length) checks.push({ reason: () => `IBAN matches profile attribute or description`, matches: m });
+  }
+  // Patient number
+  if (docSig.patientNumbers.size) {
+    const m = profSigs.filter((p) =>
+      Array.from(p.patientNumbers).some((n) => docSig.patientNumbers.has(n))
+    );
+    if (m.length) checks.push({ reason: () => `Patient number matches profile attribute`, matches: m });
+  }
+  // Policy number
+  if (docSig.policyNumbers.size) {
+    const m = profSigs.filter((p) =>
+      Array.from(p.policyNumbers).some((n) => docSig.policyNumbers.has(n))
+    );
+    if (m.length) checks.push({ reason: () => `Policy number matches profile attribute`, matches: m });
+  }
+  // Customer number
+  if (docSig.customerNumbers.size) {
+    const m = profSigs.filter((p) =>
+      Array.from(p.customerNumbers).some((n) => docSig.customerNumbers.has(n))
+    );
+    if (m.length) checks.push({ reason: () => `Customer number matches profile attribute`, matches: m });
+  }
+  // Postal code
+  if (docSig.postalCodes.size) {
+    const m = profSigs.filter((p) =>
+      Array.from(p.postalCodes).some((pc) => docSig.postalCodes.has(pc))
+    );
+    if (m.length) checks.push({ reason: () => `Postal code matches profile attribute or description`, matches: m });
+  }
+  // Birth year — strong signal, especially at the family level
+  if (docSig.birthYear != null) {
+    const m = profSigs.filter((p) => p.birthYear === docSig.birthYear);
+    if (m.length) checks.push({ reason: () => `Birth year ${docSig.birthYear} matches profile attribute or description`, matches: m });
+  }
+  // City — soft but cumulative
+  if (docSig.cities.size) {
+    const m = profSigs.filter((p) =>
+      Array.from(p.cities).some((c) => docSig.cities.has(c))
+    );
+    if (m.length) checks.push({ reason: () => `City matches profile attribute or description`, matches: m });
+  }
+
+  // Look for a UNIQUE match: at least one signal where exactly one profile matched
+  for (const check of checks) {
+    if (check.matches.length === 1) {
+      const winner = check.matches[0];
+      return {
+        profile: winner.profile,
+        reason: `Deterministic: ${check.reason(winner.profile)} (${winner.profile.name}).`,
+      };
+    }
+  }
+
+  // No single signal pins it down — but if the SAME profile is the unique
+  // match across multiple signals (e.g. birth year + city both point at
+  // Father), we trust it even if each signal alone matched several profiles.
+  // Score profiles by number of matched signals where they're a candidate.
+  const scoreById = new Map<number, number>();
+  for (const check of checks) {
+    for (const m of check.matches) {
+      scoreById.set(m.profile.id, (scoreById.get(m.profile.id) || 0) + 1);
+    }
+  }
+  if (scoreById.size > 0) {
+    const sorted = Array.from(scoreById.entries()).sort((a, b) => b[1] - a[1]);
+    const [topId, topScore] = sorted[0];
+    const second = sorted[1];
+    // Top has at least 2 signal matches AND beats the runner-up by a margin
+    if (topScore >= 2 && (!second || topScore - second[1] >= 1)) {
+      const winner = profSigs.find((p) => p.profile.id === topId);
+      if (winner) {
+        return {
+          profile: winner.profile,
+          reason: `Deterministic: ${topScore} identifying signals point at ${winner.profile.name}.`,
+        };
+      }
+    }
+  }
+
+  return null;
+}
 
 /**
  * Best-effort fuzzy match between a profile_hint string (the human name as it

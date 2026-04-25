@@ -1,6 +1,7 @@
 import { createClient } from "@/lib/supabase/server";
 import { Card } from "@/components/ui/card";
 import { BookkeepingSettings } from "@/components/settings/bookkeeping-settings";
+import { GoogleConnect } from "@/components/settings/google-connect";
 
 export const dynamic = "force-dynamic";
 
@@ -46,6 +47,17 @@ export default async function SettingsPage() {
             active={anthropicConfigured}
           />
         </div>
+      </Card>
+
+      <Card>
+        <div className="section-label mb-3">Google Tasks</div>
+        <p className="text-xs text-muted-foreground mb-4">
+          Push individual Paperfile actions into a &quot;Paperfile&quot; list in
+          your Google Tasks. Marking an action done in Paperfile will also
+          close the Google Task. Per-action button — you decide which actions
+          matter enough to remember outside Paperfile.
+        </p>
+        <GoogleConnect />
       </Card>
 
       <Card>

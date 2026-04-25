@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { completeGoogleTask } from "@/lib/integrations/google-tasks";
 
 export const runtime = "nodejs";
 
@@ -38,5 +39,29 @@ export async function PATCH(
     .maybeSingle();
   if (error)
     return NextResponse.json({ error: error.message }, { status: 500 });
+
+  // If we just closed an action that's linked to a Google Task, mark the
+  // Google task done too. Best-effort — never fail the local update on it.
+  if (
+    patch.status === "done" &&
+    data &&
+    data.google_task_id &&
+    data.google_task_list_id
+  ) {
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+    if (user) {
+      try {
+        await completeGoogleTask(
+          user.id,
+          data.google_task_list_id,
+          data.google_task_id
+        );
+      } catch (e) {
+        console.warn("[actions PATCH] Google task complete failed", e);
+      }
+    }
+  }
   return NextResponse.json({ data });
 }

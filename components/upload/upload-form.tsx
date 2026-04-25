@@ -128,11 +128,11 @@ export function UploadForm() {
     }
 
     setSubmitting(false);
-    if (lastDocId && (combineMode || pending.length === 1)) {
-      router.push(`/document/${lastDocId}`);
-    } else {
-      router.push("/inbox");
-    }
+    // Always land at /inbox after a scan — fire-and-forget. Don't push the
+    // user to the document detail page (which has profile dropdowns and feels
+    // like "you must assign this before continuing"). Triage happens on the
+    // laptop via the inbox's "Needs review" banner.
+    router.push("/inbox");
     router.refresh();
   }
 

@@ -12,6 +12,7 @@ import {
   Trello,
   Download,
   Send,
+  ListChecks,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Spinner } from "@/components/ui/spinner";
@@ -38,6 +39,16 @@ export default function ActionsPage() {
   );
   const [query, setQuery] = useState("");
   const [focusedId, setFocusedId] = useState<string | null>(null);
+  // Whether the user has connected Google Tasks — controls visibility of
+  // the "Send to Google Tasks" button on each focused action.
+  const [googleConnected, setGoogleConnected] = useState(false);
+
+  useEffect(() => {
+    fetch("/api/settings")
+      .then((r) => r.json())
+      .then((j) => setGoogleConnected(!!j?.data?.google_oauth?.refresh_token))
+      .catch(() => {});
+  }, []);
 
   async function load() {
     setLoading(true);
@@ -233,6 +244,7 @@ export default function ActionsPage() {
         {focused ? (
           <FocusedAction
             action={focused as ActionWithDoc}
+            googleConnected={googleConnected}
             onMarkDone={() => update(focused.id, { status: "done" })}
             onDismiss={() => update(focused.id, { status: "dismissed" })}
             onReopen={() => update(focused.id, { status: "open" })}
@@ -306,12 +318,14 @@ function ActionRowItem({
 
 function FocusedAction({
   action,
+  googleConnected,
   onMarkDone,
   onDismiss,
   onReopen,
   onActionRefresh,
 }: {
   action: ActionWithDoc;
+  googleConnected: boolean;
   onMarkDone: () => void;
   onDismiss: () => void;
   onReopen: () => void;
@@ -323,6 +337,35 @@ function FocusedAction({
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
   const [sendDone, setSendDone] = useState<string | null>(null);
+
+  // Google Tasks push state — separate from the bookkeeping send state.
+  const [pushingGoogle, setPushingGoogle] = useState(false);
+  const [googleError, setGoogleError] = useState<string | null>(null);
+  const [googleDone, setGoogleDone] = useState<string | null>(null);
+
+  async function pushToGoogleTasks() {
+    setPushingGoogle(true);
+    setGoogleError(null);
+    setGoogleDone(null);
+    try {
+      const res = await fetch(
+        `/api/actions/${action.id}/push-to-google`,
+        { method: "POST" }
+      );
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
+      setGoogleDone(
+        json.already_pushed
+          ? "Already in Google Tasks."
+          : "Added to Google Tasks."
+      );
+      onActionRefresh();
+    } catch (e: unknown) {
+      setGoogleError(e instanceof Error ? e.message : "Push failed");
+    } finally {
+      setPushingGoogle(false);
+    }
+  }
 
   async function sendToBookkeeping() {
     if (!action.document) return;
@@ -448,7 +491,7 @@ function FocusedAction({
           )}
         </div>
 
-        {/* Planning: calendar / trello */}
+        {/* Planning: calendar / google tasks / trello */}
         <div className="border-t border-border pt-4">
           <div className="section-label mb-2">Plan it</div>
           <div className="flex flex-wrap gap-2">
@@ -464,6 +507,32 @@ function FocusedAction({
                 No due date — add one to schedule it.
               </span>
             )}
+
+            {/* Google Tasks — only visible when the user has connected Google */}
+            {googleConnected &&
+              (action.google_task_id ? (
+                <span className="pill bg-brand-green/10 text-brand-green">
+                  <CheckCircle2 className="h-3.5 w-3.5" />
+                  In Google Tasks
+                </span>
+              ) : (
+                <button
+                  onClick={pushToGoogleTasks}
+                  disabled={pushingGoogle}
+                  className="btn-secondary text-xs"
+                >
+                  {pushingGoogle ? (
+                    <>
+                      <Spinner className="h-3.5 w-3.5" /> Sending…
+                    </>
+                  ) : (
+                    <>
+                      <ListChecks className="h-3.5 w-3.5" /> Send to Google Tasks
+                    </>
+                  )}
+                </button>
+              ))}
+
             <a
               href="/api/actions/export?format=trello&status=open"
               className="btn-secondary text-xs"
@@ -471,6 +540,28 @@ function FocusedAction({
               <Trello className="h-3.5 w-3.5" /> Export to Trello
             </a>
           </div>
+
+          {/* Hint to connect Google when not connected */}
+          {!googleConnected && (
+            <p className="text-[11px] text-muted-foreground mt-2">
+              Want this in Google Tasks?{" "}
+              <Link href="/settings" className="underline text-brand-purple">
+                Connect Google in settings
+              </Link>
+              .
+            </p>
+          )}
+
+          {googleError && (
+            <p className="text-xs text-destructive font-semibold mt-2">
+              {googleError}
+            </p>
+          )}
+          {googleDone && (
+            <p className="text-xs text-brand-green font-semibold mt-2">
+              {googleDone}
+            </p>
+          )}
         </div>
       </div>
 

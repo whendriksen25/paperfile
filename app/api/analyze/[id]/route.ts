@@ -6,7 +6,7 @@ import { suggestProfile } from "@/lib/ai/suggest-profile";
 import {
   listProfilesForUser,
   matchProfileByHint,
-  ensureDefaultProfile,
+  deterministicProfileMatch,
 } from "@/lib/services/profiles";
 
 const PROFILE_AUTO_ASSIGN_THRESHOLD = 0.7;
@@ -92,8 +92,17 @@ export async function POST(
     let profileMatchConfidence: number | null = null;
     const profiles = await listProfilesForUser(admin, user.id);
 
+    // First: try deterministic matching on hard identifiers (birth year,
+    // city, IBAN, postal code, BSN, patient/policy/customer numbers). This
+    // crosses extracted_fields against each profile's structured attributes
+    // AND its free-text description (so descriptions like "Born 1936, lives
+    // in Dieren" still produce hard signals). When ONE profile uniquely
+    // matches, skip the AI entirely — it's a binary fact, not a guess.
+    const deterministic = deterministicProfileMatch(extraction, profiles);
+
     // Always run Claude's suggestion so we can surface its ranking on the
-    // detail page, even when the user pre-pinned a profile at upload.
+    // detail page, even when the user pre-pinned a profile at upload or
+    // we already deterministically matched. Useful for explainability.
     let suggestion: Awaited<ReturnType<typeof suggestProfile>> | null = null;
     try {
       suggestion = await suggestProfile(extraction, profiles);
@@ -105,12 +114,18 @@ export async function POST(
       profileName = profiles.find((p) => p.id === profileId)?.name || null;
       profileMatchReason = "User selected at upload";
       profileMatchConfidence = 1;
+    } else if (deterministic) {
+      // Hard identifier match wins outright.
+      profileId = deterministic.profile.id;
+      profileName = deterministic.profile.name;
+      profileMatchReason = deterministic.reason;
+      profileMatchConfidence = 1;
     } else {
-      if (
-        suggestion &&
-        suggestion.profileId != null &&
-        suggestion.confidence >= PROFILE_AUTO_ASSIGN_THRESHOLD
-      ) {
+      // Always take Claude's top suggestion if it picked anything at all,
+      // even at low confidence — "best guess + please confirm" is friendlier
+      // than "we gave up". The needs_review flag (set below) tells the user
+      // that this assignment is provisional.
+      if (suggestion && suggestion.profileId != null) {
         profileId = suggestion.profileId;
         profileName = profiles.find((p) => p.id === profileId)?.name || null;
         profileMatchReason = suggestion.reason;
@@ -127,14 +142,24 @@ export async function POST(
         }
       }
 
+      // Truly stumped — Claude returned nothing AND no name token matched.
+      // Rare. Leave unassigned + flag for review.
       if (!profileId) {
-        const def = await ensureDefaultProfile(admin, user.id);
-        profileId = def.id;
-        profileName = def.name;
-        profileMatchReason = "Default profile (no confident match)";
-        profileMatchConfidence = 0.3;
+        profileName = null;
+        profileMatchReason = "Needs review — no confident profile match";
+        profileMatchConfidence = 0;
       }
     }
+
+    // Anything assigned at less than the auto-assign threshold (and not
+    // user-pinned or deterministic) is provisional — the user should
+    // confirm or correct it. The "Needs review" banner + per-card
+    // Confirm/Refile UI cover that.
+    const provisional =
+      !!profileId &&
+      profileMatchReason !== "User selected at upload" &&
+      !deterministic &&
+      (profileMatchConfidence ?? 0) < PROFILE_AUTO_ASSIGN_THRESHOLD;
 
     // 4. Move file in storage backend to final destination
     const destination = storage.buildDestinationPath({
@@ -223,6 +248,10 @@ export async function POST(
         due_date: extraction.due_date || null,
         action_summary: needsAction ? extraction.action_summary || null : null,
         handoff_status: isFinancial ? "pending" : "not_applicable",
+        // Surface for triage when the assignment is provisional (low-confidence
+        // AI guess, name-token match, or completely unassigned). Cleared by
+        // the user via the per-card Confirm button or the RefileWidget.
+        needs_review: !profileId || provisional,
         status: "processed",
       })
       .eq("id", id);

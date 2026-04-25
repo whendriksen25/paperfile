@@ -7,6 +7,17 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 export interface UserSettings {
   bookkeeping_url?: string | null;
   bookkeeping_token?: string | null;
+
+  // Google OAuth — stored after the user clicks "Connect Google" on /settings.
+  // refresh_token rotates on each refresh; access_token is short-lived.
+  // We only ever ask for the tasks scope (https://www.googleapis.com/auth/tasks).
+  google_oauth?: {
+    refresh_token: string;
+    access_token?: string | null;
+    expires_at?: number | null; // ms epoch
+    email?: string | null;       // for display in settings
+    task_list_id?: string | null; // cached "Paperfile" list id
+  } | null;
 }
 
 /** Fetch (or default) the current user's settings row. Never throws. */

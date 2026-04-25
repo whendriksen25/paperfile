@@ -149,6 +149,11 @@ export interface ActionRow {
   created_at: string;
   updated_at: string;
   completed_at: string | null;
+
+  // External integrations
+  google_task_id: string | null;
+  google_task_list_id: string | null;
+  google_task_synced_at: string | null;
 }
 
 export interface UploadResult {
