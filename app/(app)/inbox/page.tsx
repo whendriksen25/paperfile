@@ -234,7 +234,13 @@ export default async function InboxPage({
           </p>
         </div>
       ) : group === "none" ? (
+        // The `key` forces React to fully remount the infinite-scroll list
+        // when the active filters change. Without it, the component's
+        // useState(initialDocs) only fires on first mount and switching
+        // filter (e.g. Pa → Suus) leaves stale Pa cards on screen even
+        // though the server returns the right Suus docs.
         <InboxInfiniteList
+          key={`inbox:${sp.profile_id || "all"}:${sp.type || "all"}:${sp.batch || "all"}:${sp.needs_review || "0"}`}
           initialDocs={docs}
           initialNextCursor={initialNextCursor}
           pageSize={INBOX_PAGE_SIZE}
