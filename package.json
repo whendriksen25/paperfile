@@ -18,6 +18,7 @@
     "clsx": "^2.1.1",
     "dropbox": "^10.34.0",
     "heic-convert": "^2.1.0",
+    "heic2any": "^0.0.4",
     "lucide-react": "^0.468.0",
     "next": "14.2.21",
     "pdf-lib": "^1.17.1",
