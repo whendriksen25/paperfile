@@ -9,11 +9,15 @@ import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils/cn";
 import { formatBytes } from "@/lib/utils/format";
 import { useProfiles } from "@/hooks/useProfiles";
+import {
+  compressImageInBrowser,
+  shouldCompress,
+} from "@/lib/utils/compress-image-client";
 
 interface PendingFile {
   id: string;
   file: File;
-  progress: "queued" | "uploading" | "done" | "failed";
+  progress: "queued" | "compressing" | "uploading" | "done" | "failed";
   error?: string;
   documentId?: string;
 }
@@ -67,15 +71,62 @@ export function UploadForm() {
     // pre-loop snapshot). Without this, navigation-on-success masks failures.
     let anyFailed = false;
 
-    if (combineMode) {
-      // Single POST with all files; server stitches into one PDF.
+    // ----- Step 1: client-side compression -----
+    // Shrink + HEIC-convert images in the browser BEFORE upload. Avoids
+    // Vercel's 4.5 MB body limit AND fixes iPhone HEIC docs that the server's
+    // sharp can't always decode. PDFs and small JPEGs are skipped.
+    //
+    // We replace each PendingFile's `.file` with the compressed version,
+    // then proceed to upload as before.
+    const compressed: PendingFile[] = [];
+    for (const item of pending) {
+      if (item.progress === "done") {
+        compressed.push(item);
+        continue;
+      }
+      if (!shouldCompress(item.file)) {
+        compressed.push(item);
+        continue;
+      }
       setPending((p) =>
-        p.map((f) => ({ ...f, progress: "uploading" as const }))
+        p.map((f) =>
+          f.id === item.id ? { ...f, progress: "compressing" } : f
+        )
+      );
+      try {
+        const small = await compressImageInBrowser(item.file);
+        const next = { ...item, file: small, progress: "queued" as const };
+        compressed.push(next);
+        setPending((p) => p.map((f) => (f.id === item.id ? next : f)));
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : "Compression failed";
+        anyFailed = true;
+        setPending((p) =>
+          p.map((f) =>
+            f.id === item.id ? { ...f, progress: "failed", error: msg } : f
+          )
+        );
+      }
+    }
+    // Use the compressed list from here on. Bail early if every file failed
+    // compression — there's nothing left to upload.
+    const usableFiles = compressed.filter((f) => f.progress !== "failed");
+    if (usableFiles.length === 0) {
+      setSubmitting(false);
+      return;
+    }
+
+    if (combineMode) {
+      // Single POST with all (compressed) files; server stitches into one PDF.
+      setPending((p) =>
+        p.map((f) =>
+          f.progress === "failed" ? f : { ...f, progress: "uploading" as const }
+        )
       );
       const fd = new FormData();
       fd.append("combine", "1");
       if (combinedName.trim()) fd.append("combinedName", combinedName.trim());
-      for (const it of pending) fd.append("files", it.file);
+      for (const it of usableFiles) fd.append("files", it.file);
       if (batch) fd.append("batch", batch);
       if (profileId) fd.append("profile_id", String(profileId));
       if (tags.length) fd.append("tags", tags.join(","));
@@ -99,7 +150,7 @@ export function UploadForm() {
         );
       }
     } else {
-      for (const item of pending) {
+      for (const item of usableFiles) {
         if (item.progress === "done") continue;
         setPending((p) =>
           p.map((f) => (f.id === item.id ? { ...f, progress: "uploading" } : f))
@@ -299,17 +350,38 @@ export function UploadForm() {
                 <div className="text-sm font-semibold truncate">
                   {item.file.name}
                 </div>
-                <div className="text-[11px] text-muted-foreground">
-                  {formatBytes(item.file.size)} · {item.progress}
+                <div
+                  className={cn(
+                    "text-[11px]",
+                    item.progress === "failed"
+                      ? "text-destructive font-semibold"
+                      : "text-muted-foreground"
+                  )}
+                >
+                  {formatBytes(item.file.size)} ·{" "}
+                  {item.progress === "compressing"
+                    ? "Compressing on device…"
+                    : item.progress === "uploading"
+                      ? "Uploading…"
+                      : item.progress === "done"
+                        ? "Done"
+                        : item.progress === "failed"
+                          ? "Failed"
+                          : "Queued"}
                   {item.error ? ` — ${item.error}` : ""}
                 </div>
               </div>
               <button
                 className={cn(
                   "p-1.5 rounded-full text-muted-foreground hover:bg-muted hover:text-destructive",
-                  item.progress === "uploading" && "opacity-50 cursor-not-allowed"
+                  (item.progress === "uploading" ||
+                    item.progress === "compressing") &&
+                    "opacity-50 cursor-not-allowed"
                 )}
-                disabled={item.progress === "uploading"}
+                disabled={
+                  item.progress === "uploading" ||
+                  item.progress === "compressing"
+                }
                 onClick={() => removeFile(item.id)}
                 aria-label="Remove"
               >
