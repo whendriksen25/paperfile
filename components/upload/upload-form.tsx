@@ -62,6 +62,10 @@ export function UploadForm() {
       .filter(Boolean);
 
     let lastDocId: string | null = null;
+    // Tracked locally because reading `pending` after the loop returns stale
+    // state (React batches setPending calls; the closure's `pending` is the
+    // pre-loop snapshot). Without this, navigation-on-success masks failures.
+    let anyFailed = false;
 
     if (combineMode) {
       // Single POST with all files; server stitches into one PDF.
@@ -89,6 +93,7 @@ export function UploadForm() {
         );
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : "Upload failed";
+        anyFailed = true;
         setPending((p) =>
           p.map((f) => ({ ...f, progress: "failed" as const, error: msg }))
         );
@@ -118,6 +123,7 @@ export function UploadForm() {
           );
         } catch (e: unknown) {
           const msg = e instanceof Error ? e.message : "Upload failed";
+          anyFailed = true;
           setPending((p) =>
             p.map((f) =>
               f.id === item.id ? { ...f, progress: "failed", error: msg } : f
@@ -128,10 +134,19 @@ export function UploadForm() {
     }
 
     setSubmitting(false);
-    // Always land at /inbox after a scan — fire-and-forget. Don't push the
-    // user to the document detail page (which has profile dropdowns and feels
-    // like "you must assign this before continuing"). Triage happens on the
-    // laptop via the inbox's "Needs review" banner.
+
+    // Did anything actually fail? If yes, stay on /upload so the user can see
+    // the error message — silent navigation to /inbox is what made the HEIC
+    // bug invisible for so long.
+    if (anyFailed) {
+      // Stay put — the per-file error message is rendered next to its name.
+      return;
+    }
+
+    // Successful flow: land at /inbox after a scan — fire-and-forget. Don't
+    // push the user to the document detail page (which has profile dropdowns
+    // and feels like "you must assign this before continuing"). Triage
+    // happens on the laptop via the inbox's "Needs review" banner.
     router.push("/inbox");
     router.refresh();
   }
