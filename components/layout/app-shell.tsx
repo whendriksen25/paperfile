@@ -12,7 +12,7 @@ import {
   ListTree,
   Settings,
   LogOut,
-  BarChart3,
+  Binoculars,
 } from "lucide-react";
 import { Wordmark } from "@/components/brand/logo";
 import Image from "next/image";
@@ -23,7 +23,7 @@ const core = [
   { href: "/upload", label: "Scan it", icon: ScanLine },
   { href: "/inbox", label: "File it", icon: FolderCheck },
   { href: "/actions", label: "Act on it", icon: CheckCircle2 },
-  { href: "/reports", label: "Reports", icon: BarChart3 },
+  { href: "/reports", label: "Watch it", icon: Binoculars },
 ];
 
 const organization = [
@@ -36,7 +36,7 @@ const mobileNav = [
   { href: "/upload", label: "Scan", icon: ScanLine },
   { href: "/inbox", label: "Library", icon: FolderCheck },
   { href: "/actions", label: "Actions", icon: CheckCircle2 },
-  { href: "/reports", label: "Reports", icon: BarChart3 },
+  { href: "/reports", label: "Watch", icon: Binoculars },
 ];
 
 interface User {
