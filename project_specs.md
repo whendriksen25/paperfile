@@ -279,3 +279,10 @@ single user, returns success.
 - Supabase project: `document-archive`
 - Dropbox app: `document-archive`
 - App title (in UI): `Archive`
+
+## Working log conventions
+
+When Claude runs any command in the chat (bash, git, npm, migrations, dev server, etc.),
+it must prefix the command output with the **date and exact local time** the command
+ran, formatted as `[YYYY-MM-DD HH:MM:SS TZ]`. Run `date "+%Y-%m-%d %H:%M:%S %Z"` to get
+the current time. This makes the chat double as a time-stamped activity log.
