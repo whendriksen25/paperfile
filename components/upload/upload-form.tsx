@@ -1,8 +1,16 @@
 "use client";
 
 import { useRef, useState } from "react";
-import { useRouter } from "next/navigation";
-import { Camera, Upload as UploadIcon, X, Sparkles, Layers } from "lucide-react";
+import Link from "next/link";
+import {
+  Camera,
+  Upload as UploadIcon,
+  X,
+  Sparkles,
+  Layers,
+  CheckCircle2,
+  ArrowRight,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
@@ -23,7 +31,6 @@ interface PendingFile {
 }
 
 export function UploadForm() {
-  const router = useRouter();
   const fileInput = useRef<HTMLInputElement>(null);
   const cameraInput = useRef<HTMLInputElement>(null);
   const { profiles, active } = useProfiles();
@@ -32,6 +39,10 @@ export function UploadForm() {
   const [tagsInput, setTagsInput] = useState("");
   const [pending, setPending] = useState<PendingFile[]>([]);
   const [submitting, setSubmitting] = useState(false);
+  // Running tally of docs successfully sent off in this /upload session.
+  // We use it for the "X uploaded · processing in inbox" banner that lets
+  // the user keep scanning without leaving the page.
+  const [sessionUploaded, setSessionUploaded] = useState(0);
   // When on, the server stitches all picked files into ONE multi-page PDF
   // and treats them as a single Paperfile document.
   const [combineMode, setCombineMode] = useState(false);
@@ -191,19 +202,57 @@ export function UploadForm() {
     // bug invisible for so long.
     if (anyFailed) {
       // Stay put — the per-file error message is rendered next to its name.
+      // Drop the successful items so the failures stand out visually, but
+      // keep the count for the banner.
+      setPending((p) => {
+        const successCount = p.filter((f) => f.progress === "done").length;
+        if (successCount) setSessionUploaded((n) => n + successCount);
+        return p.filter((f) => f.progress === "failed");
+      });
       return;
     }
 
-    // Successful flow: land at /inbox after a scan — fire-and-forget. Don't
-    // push the user to the document detail page (which has profile dropdowns
-    // and feels like "you must assign this before continuing"). Triage
-    // happens on the laptop via the inbox's "Needs review" banner.
-    router.push("/inbox");
-    router.refresh();
+    // Successful batch: stay on /upload so the user can keep scanning.
+    // Clear pending so the screen is fresh for the next photo, bump the
+    // session counter so the "X uploaded · processing" banner appears.
+    const justUploaded = pending.length;
+    setPending([]);
+    setSessionUploaded((n) => n + justUploaded);
+    // Reset combine-mode state so the next batch starts clean.
+    if (combineMode) {
+      setCombineMode(false);
+      setCombinedName("");
+    }
   }
 
   return (
     <div className="space-y-5">
+      {/* Continuous-scan banner: appears after the first successful upload
+          in this page session. Tells the user that previous scans are off
+          to the AI, and gives them a one-tap path to the inbox without
+          forcing them off /upload. */}
+      {sessionUploaded > 0 && (
+        <div className="surface bg-brand-green/5 border-brand-green/20 p-3 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2 text-sm">
+            <CheckCircle2 className="h-4 w-4 text-brand-green shrink-0" />
+            <span>
+              <span className="font-bold text-brand-green">
+                {sessionUploaded}{" "}
+                {sessionUploaded === 1 ? "document" : "documents"}
+              </span>{" "}
+              uploaded · processing in the background
+            </span>
+          </div>
+          <Link
+            href="/inbox"
+            className="text-xs font-bold text-brand-purple hover:opacity-80 inline-flex items-center gap-1 shrink-0"
+          >
+            View inbox
+            <ArrowRight className="h-3 w-3" />
+          </Link>
+        </div>
+      )}
+
       <div className="grid grid-cols-2 gap-4">
         <button
           type="button"
