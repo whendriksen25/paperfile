@@ -9,7 +9,7 @@
 // Flags:
 //   --dry-run        — preview only, no Dropbox moves, no DB writes
 //   --limit=N        — stop after N candidate rows (default: all)
-//   --user=<email>   — restrict to one user (default: DEV_USER_EMAIL)
+//   --user=<email>   — restrict to one user (default: ALL users with docs)
 //
 // Safe to re-run: rows whose path already matches the destination are skipped.
 
@@ -22,7 +22,8 @@ const dryRun = args.includes("--dry-run");
 const limitArg = args.find((a) => a.startsWith("--limit="));
 const userArg = args.find((a) => a.startsWith("--user="));
 const limit = limitArg ? Math.max(1, Number(limitArg.split("=")[1])) : 100000;
-const userEmail = userArg ? userArg.split("=")[1] : process.env.DEV_USER_EMAIL;
+// If no --user= flag, process ALL users that have documents.
+const userEmail = userArg ? userArg.split("=")[1] : null;
 
 // ---------- env sanity ----------
 function need(k) {
@@ -115,44 +116,66 @@ const patchedFetch = async (input, init) => {
 // ---------- run ----------
 async function main() {
   console.log(
-    `\n[rename] start  dryRun=${dryRun}  limit=${limit}  user=${userEmail}\n`
+    `\n[rename] start  dryRun=${dryRun}  limit=${limit}  user=${userEmail || "ALL"}\n`
   );
 
   const supabase = createClient(SUPABASE_URL, SERVICE_KEY, {
     auth: { autoRefreshToken: false, persistSession: false },
   });
 
-  // 1. Resolve user_id from email (so we don't accidentally touch other users)
+  // 1. Build email-by-id map (for the per-user breakdown print)
   const { data: usersList, error: userErr } =
     await supabase.auth.admin.listUsers({ page: 1, perPage: 200 });
   if (userErr) throw userErr;
-  const target = (usersList?.users || []).find(
-    (u) => u.email?.toLowerCase() === userEmail.toLowerCase()
+  const emailById = new Map(
+    (usersList?.users || []).map((u) => [u.id, u.email || "(no email)"])
   );
-  if (!target) {
-    console.error(`User not found for email ${userEmail}`);
-    process.exit(1);
+
+  // Optional restrict
+  let restrictUserId = null;
+  if (userEmail) {
+    const target = (usersList?.users || []).find(
+      (u) => u.email?.toLowerCase() === userEmail.toLowerCase()
+    );
+    if (!target) {
+      console.error(`User not found for email ${userEmail}`);
+      process.exit(1);
+    }
+    restrictUserId = target.id;
+    console.log(`[rename] restricting to user ${target.email} (${target.id})`);
   }
-  console.log(`[rename] user resolved: ${target.email} (${target.id})`);
 
   // 2. Pull processed docs
-  const { data: docs, error } = await supabase
+  let q = supabase
     .from("documents")
     .select(
-      "id, file_name, document_type, document_date, sender, title, primary_profile_id, dropbox_path, status"
+      "id, user_id, file_name, document_type, document_date, sender, title, primary_profile_id, dropbox_path, status"
     )
-    .eq("user_id", target.id)
     .eq("status", "processed")
     .order("created_at", { ascending: false })
     .limit(limit);
+  if (restrictUserId) q = q.eq("user_id", restrictUserId);
+  const { data: docs, error } = await q;
   if (error) throw error;
-  console.log(`[rename] candidates: ${docs.length}`);
 
-  // 3. Profile name lookup
-  const { data: profiles } = await supabase
-    .from("profiles")
-    .select("id, name")
-    .eq("user_id", target.id);
+  // Per-user breakdown so it's obvious where the docs live
+  const countsByUser = new Map();
+  for (const d of docs) {
+    countsByUser.set(d.user_id, (countsByUser.get(d.user_id) || 0) + 1);
+  }
+  console.log(`[rename] candidates: ${docs.length}`);
+  for (const [uid, n] of countsByUser) {
+    console.log(`         ${n.toString().padStart(4)}  ${emailById.get(uid) || uid}`);
+  }
+
+  // 3. Profile name lookup (across all users, indexed by id only — ids are unique)
+  const userIds = Array.from(countsByUser.keys());
+  const { data: profiles } = userIds.length
+    ? await supabase
+        .from("profiles")
+        .select("id, name, user_id")
+        .in("user_id", userIds)
+    : { data: [] };
   const profileNameById = new Map((profiles || []).map((p) => [p.id, p.name]));
 
   // 4. Dropbox client
