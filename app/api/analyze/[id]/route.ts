@@ -8,6 +8,7 @@ import {
   matchProfileByHint,
   deterministicProfileMatch,
 } from "@/lib/services/profiles";
+import { getSenderHistory } from "@/lib/services/sender-history";
 
 const PROFILE_AUTO_ASSIGN_THRESHOLD = 0.7;
 
@@ -108,6 +109,39 @@ export async function POST(
     // After the two early returns above, `result` is necessarily a
     // DocumentExtraction. TS can't narrow through the in-check, so cast.
     const extraction = result as Exclude<typeof result, { error: string }>;
+
+    // 2.5. Sender-history learning: if the user has historically filed
+    // multiple docs from this same sender as type X, and Claude just said
+    // type Y, prefer X. This is how the system gets smarter over time —
+    // every refile teaches it what to do for the next doc from that sender.
+    // Skipped on force_profile re-runs only matters for profile, not type;
+    // history applies regardless.
+    let historyOverride: string | null = null;
+    try {
+      const history = await getSenderHistory(
+        admin,
+        user.id,
+        extraction.sender,
+        id
+      );
+      if (
+        history &&
+        history.document_type !== extraction.document_type
+      ) {
+        console.log(
+          "[api/analyze] sender-history override:",
+          history.reason,
+          "Claude said",
+          extraction.document_type,
+          "→ using",
+          history.document_type
+        );
+        historyOverride = `Reclassified by sender history: was ${extraction.document_type}, now ${history.document_type}. ${history.reason}`;
+        extraction.document_type = history.document_type;
+      }
+    } catch (e) {
+      console.warn("[api/analyze] sender history lookup failed", e);
+    }
 
     // 3. Resolve profile.
     //    Order of preference:
@@ -312,6 +346,7 @@ export async function POST(
                 ai_best_reason: suggestion?.reason || null,
               }
             : undefined,
+          _type_history_override: historyOverride || undefined,
         },
         ocr_text: extraction.ocr_text || null,
         needs_action: needsAction,

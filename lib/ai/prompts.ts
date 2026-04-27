@@ -38,6 +38,15 @@ Return STRICT JSON only — no prose, no markdown code fences, no commentary. Th
 }
 
 Rules:
+
+- **document_type — read the document, then apply these strict definitions.** A monthly recurring layout doesn't make something a utility_bill. Look at WHAT the sender does and WHY they're billing.
+  - utility_bill = a recurring bill from a literal utility provider — ENERGY, GAS, WATER, INTERNET, or TELECOM. Nothing else. NOT healthcare-contribution bills, NOT tax assessments, NOT insurance premiums, NOT pension contributions. If the sender exists primarily to provide one of those five literal utilities to households, it's a utility_bill.
+  - medical_bill = any bill connected to healthcare, including: doctors, hospitals, pharmacies, physiotherapists, opticians, dentists, mental-health providers, AND government bodies that administer healthcare contributions (e.g. patient contributions to long-term care or social support). The test: would the recipient describe this as "a healthcare cost"?
+  - tax_document = anything from a national/local tax authority — assessment, refund, audit notice, payment instruction.
+  - payslip = a payout statement from an employer or pension fund showing wages or pension paid for a period.
+  - insurance_declaration = from an insurer about a specific claim or reimbursement. insurance_policy = from an insurer about the contract/coverage itself.
+  - bank_statement = periodic statement summarising bank account activity over a period.
+
 - "extracted_fields" should contain type-specific fields that don't fit the flat schema. Examples:
   - medical_bill: provider, service_date, diagnosis_code, patient_number, patient_code, patient_reference, policy_number, insurer, bsn, birth_date, reimbursable_amount, total_excl, total_vat, total_incl, payment_iban, payment_reference, invoice_number
   - insurance_declaration: declaration_number, claim_period, insurer, insured_person, birth_date, policy_number
