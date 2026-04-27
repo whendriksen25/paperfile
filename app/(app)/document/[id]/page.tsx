@@ -45,6 +45,12 @@ export default async function DocumentDetail({
   if (error || !data) notFound();
   const doc = data as DocumentRow;
 
+  // Display name is the actual filename in storage (logical name like
+  // 20251223_cak.pdf), with the original-as-uploaded as a fallback for
+  // very old rows or pre-classified docs that haven't been moved yet.
+  const displayName =
+    parseStoragePath(doc.dropbox_path).filename || doc.file_name || "";
+
   let profile: ProfileRow | null = null;
   if (doc.primary_profile_id) {
     const { data: p } = await supabase
@@ -77,7 +83,7 @@ export default async function DocumentDetail({
 
       <header className="mb-6">
         <h1 className="text-3xl font-extrabold tracking-tight">
-          {doc.title || doc.file_name || "Untitled document"}
+          {doc.title || displayName || "Untitled document"}
         </h1>
         <p className="text-sm text-muted-foreground mt-1">
           {doc.sender || titleCase(doc.document_type) || "Unknown sender"}
@@ -137,12 +143,12 @@ export default async function DocumentDetail({
           </div>
           <DocumentPreview
             id={doc.id}
-            fileName={doc.file_name}
+            fileName={displayName}
             fileType={doc.file_type}
           />
           <div className="mt-3 flex items-center justify-between">
             <div className="text-xs">
-              <div className="font-semibold">{doc.file_name}</div>
+              <div className="font-semibold">{displayName}</div>
               <div className="text-muted-foreground">
                 {formatBytes(doc.file_size_bytes)}
               </div>
@@ -288,7 +294,7 @@ export default async function DocumentDetail({
         <div className="surface p-5">
           <h2 className="section-label mb-3">File</h2>
           <dl className="space-y-2 text-sm">
-            <Row label="Name" value={doc.file_name} />
+            <Row label="Name" value={displayName} />
             <Row label="Type" value={doc.file_type} />
             <Row label="Size" value={formatBytes(doc.file_size_bytes)} />
             <Row label="Storage" value={titleCase(doc.storage_provider)} />

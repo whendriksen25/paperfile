@@ -99,7 +99,10 @@ export function DocumentCard({
           <div className="flex items-start justify-between gap-3">
             <div className="min-w-0">
               <h3 className="text-sm font-bold text-foreground truncate">
-                {doc.title || doc.file_name || "Untitled document"}
+                {doc.title ||
+                  parseStoragePath(doc.dropbox_path).filename ||
+                  doc.file_name ||
+                  "Untitled document"}
               </h3>
               <p
                 className={`text-xs truncate mt-0.5 ${
