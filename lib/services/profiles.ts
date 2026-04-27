@@ -178,6 +178,34 @@ export function deterministicProfileMatch(
   const docSig = signalsForDocument(extraction);
   const profSigs = profiles.map(signalsFor);
 
+  // OCR-text safety net for cities: extraction sometimes doesn't put the
+  // city neatly under extracted_fields.city, but the OCR text contains the
+  // city name in plain sight. Scan the doc text for any known city name
+  // belonging to one of our profiles, and add it to docSig.cities so the
+  // city-match check below fires. This is the fix for "Bill from BENU
+  // addressed to '… 6953 CE DIEREN' came back Unassigned" — postal code
+  // wasn't in attributes, city wasn't in extracted_fields, but DIEREN was
+  // in the OCR. Without this, the matcher gave up.
+  const docTextNorm = norm(
+    (extraction.ocr_text || "") +
+      " " +
+      JSON.stringify(extraction.extracted_fields || {}) +
+      " " +
+      (extraction.recipient || "") +
+      " " +
+      (extraction.sender || "")
+  );
+  if (docTextNorm) {
+    for (const profSig of profSigs) {
+      for (const city of Array.from(profSig.cities)) {
+        if (city.length < 3) continue;
+        if (docTextNorm.includes(city)) {
+          docSig.cities.add(city);
+        }
+      }
+    }
+  }
+
   // Each entry: list of profiles that share this signal with the doc, plus
   // the human-readable reason text we'd cite.
   const checks: { reason: (p: ProfileRow) => string; matches: ProfileSignals[] }[] = [];

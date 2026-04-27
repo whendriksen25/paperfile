@@ -176,9 +176,38 @@ export default async function DocumentDetail({
               <Sparkles className="h-4 w-4 text-brand-purple" />
               Paperfile AI Suggestions
             </h2>
-            <span className="pill bg-brand-purple/10 text-brand-purple">
-              Auto-processed
-            </span>
+            {(() => {
+              // Pill that reflects the doc's ACTUAL state, not a static
+              // "Auto-processed" label. The previous static label was
+              // misleading — a doc could be mid-processing or flagged for
+              // review and still show "Auto-processed".
+              if (isPending) {
+                return (
+                  <span className="pill bg-muted text-muted-foreground">
+                    Processing…
+                  </span>
+                );
+              }
+              if (doc.status === "failed") {
+                return (
+                  <span className="pill bg-destructive/10 text-destructive">
+                    Failed
+                  </span>
+                );
+              }
+              if (doc.needs_review) {
+                return (
+                  <span className="pill bg-amber-500/10 text-amber-600">
+                    Needs review
+                  </span>
+                );
+              }
+              return (
+                <span className="pill bg-brand-purple/10 text-brand-purple">
+                  Auto-processed
+                </span>
+              );
+            })()}
           </div>
 
           <div className="space-y-4">
