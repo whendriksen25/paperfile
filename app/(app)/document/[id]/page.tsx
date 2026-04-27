@@ -10,6 +10,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { LineItemsSection, type LineItem } from "@/components/inbox/line-items";
 import { RefileWidget } from "@/components/inbox/refile-widget";
+import { RenameFilenameButton } from "@/components/inbox/rename-filename-button";
 import {
   ProfileMatchPanel,
   type ProfileMatchInfo,
@@ -146,10 +147,13 @@ export default async function DocumentDetail({
             fileName={displayName}
             fileType={doc.file_type}
           />
-          <div className="mt-3 flex items-center justify-between">
-            <div className="text-xs">
-              <div className="font-semibold">{displayName}</div>
-              <div className="text-muted-foreground">
+          <div className="mt-3 flex items-center justify-between gap-3">
+            <div className="text-xs min-w-0">
+              <RenameFilenameButton
+                documentId={doc.id}
+                currentFilename={displayName}
+              />
+              <div className="text-muted-foreground mt-0.5">
                 {formatBytes(doc.file_size_bytes)}
               </div>
             </div>
