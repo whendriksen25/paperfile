@@ -322,23 +322,33 @@ export function UploadForm() {
 
       {sessionUploaded > 0 && (
         <div className="surface bg-brand-green/5 border-brand-green/20 p-3 flex items-center justify-between gap-3">
-          <div className="flex items-center gap-2 text-sm">
+          <div className="flex items-center gap-2 text-sm min-w-0">
             <CheckCircle2 className="h-4 w-4 text-brand-green shrink-0" />
-            <span>
+            <span className="truncate">
               <span className="font-bold text-brand-green">
                 {sessionUploaded}{" "}
                 {sessionUploaded === 1 ? "document" : "documents"}
               </span>{" "}
-              uploaded · processing in the background
+              uploaded this session
             </span>
           </div>
-          <Link
-            href="/inbox"
-            className="text-xs font-bold text-brand-purple hover:opacity-80 inline-flex items-center gap-1 shrink-0"
-          >
-            View inbox
-            <ArrowRight className="h-3 w-3" />
-          </Link>
+          <div className="flex items-center gap-2 shrink-0">
+            <Link
+              href="/inbox"
+              className="text-xs font-bold text-brand-purple hover:opacity-80 inline-flex items-center gap-1"
+            >
+              View inbox
+              <ArrowRight className="h-3 w-3" />
+            </Link>
+            <button
+              type="button"
+              onClick={() => setSessionUploaded(0)}
+              className="p-1 text-muted-foreground hover:text-foreground"
+              aria-label="Dismiss"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
         </div>
       )}
 
