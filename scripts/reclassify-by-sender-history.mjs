@@ -38,7 +38,7 @@ const DBX_ROOT = (process.env.DROPBOX_ROOT_FOLDER || "/Archive").startsWith("/")
   ? process.env.DROPBOX_ROOT_FOLDER || "/Archive"
   : "/" + (process.env.DROPBOX_ROOT_FOLDER || "Archive");
 
-// ---------- helpers (mirror app code) ----------
+// ---------- helpers (mirror app code in lib/services/sender-history.ts) ----------
 function normalizeSender(s) {
   if (!s) return "";
   return String(s)
@@ -48,6 +48,23 @@ function normalizeSender(s) {
     .replace(/[^a-z0-9]/g, "")
     .slice(0, 32);
 }
+// Generic / fallback document types — never override INTO these, and never
+// downgrade FROM a specific type INTO one of these. Keep in sync with
+// GENERIC_TYPES in lib/services/sender-history.ts.
+const GENERIC_TYPES = new Set(["other", "letter"]);
+function shouldApplyOverride(currentType, historicalType) {
+  if (!historicalType) return false;
+  if (GENERIC_TYPES.has(historicalType)) return false;
+  if (!currentType) return true;
+  if (currentType === historicalType) return false;
+  if (!GENERIC_TYPES.has(currentType) && GENERIC_TYPES.has(historicalType)) {
+    return false;
+  }
+  return true;
+}
+// Strong-majority threshold (matches getSenderHistory). Below this we
+// assume the sender legitimately produces multiple types and skip.
+const HISTORY_RATIO_THRESHOLD = 0.8;
 function safeSegment(name) {
   return (name || "")
     .replace(/[\\/:*?"<>|]/g, "_")
@@ -177,11 +194,13 @@ async function main() {
     const totalVotes = sorted.reduce((s, [, v]) => s + v, 0);
     const [winnerType, winnerVotes] = sorted[0];
     const ratio = winnerVotes / totalVotes;
-    if (ratio < 0.6) continue;
+    if (ratio < HISTORY_RATIO_THRESHOLD) continue;
+    // Don't propagate "other"/"letter" wins — generic types as the winner
+    // mean we'd be degrading classification, not improving it.
+    if (GENERIC_TYPES.has(winnerType)) continue;
 
-    // Mark every doc in this group whose document_type ≠ winnerType for reclassification.
     for (const d of group) {
-      if (d.document_type === winnerType) continue;
+      if (!shouldApplyOverride(d.document_type, winnerType)) continue;
       plans.push({
         doc: d,
         from_type: d.document_type,

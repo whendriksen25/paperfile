@@ -8,7 +8,10 @@ import {
   matchProfileByHint,
   deterministicProfileMatch,
 } from "@/lib/services/profiles";
-import { getSenderHistory } from "@/lib/services/sender-history";
+import {
+  getSenderHistory,
+  shouldApplyHistoryOverride,
+} from "@/lib/services/sender-history";
 
 const PROFILE_AUTO_ASSIGN_THRESHOLD = 0.7;
 
@@ -126,7 +129,7 @@ export async function POST(
       );
       if (
         history &&
-        history.document_type !== extraction.document_type
+        shouldApplyHistoryOverride(extraction.document_type, history.document_type)
       ) {
         console.log(
           "[api/analyze] sender-history override:",

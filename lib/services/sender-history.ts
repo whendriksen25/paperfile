@@ -34,6 +34,43 @@ function normalizeSender(s: string | null | undefined): string {
     .slice(0, 32);
 }
 
+/**
+ * Document types that are vague / fallback. We never override a more
+ * specific type INTO one of these — that would degrade classification.
+ *  - "other": explicit fallback bucket meaning "we couldn't classify"
+ *  - "letter": generic correspondence; loses signal vs payslip / medical_bill / etc.
+ */
+const GENERIC_TYPES = new Set<string>(["other", "letter"]);
+
+/**
+ * Decides whether to actually apply a sender-history override given the
+ * doc's current type and the historical winner. Three guards:
+ *
+ *  1. Don't override into "other" — the historical winner being "other"
+ *     means most prior docs from this sender were unclassifiable noise,
+ *     not a meaningful signal. (Already filtered inside getSenderHistory,
+ *     but defensive here too.)
+ *  2. If current type is already the historical winner, no override needed.
+ *  3. Don't downgrade specificity: prescription → other, payslip → letter,
+ *     etc. A specific type beats a generic one even if the generic is the
+ *     statistical majority for that sender.
+ */
+export function shouldApplyHistoryOverride(
+  currentType: string | null | undefined,
+  historicalType: string
+): boolean {
+  if (!historicalType) return false;
+  if (GENERIC_TYPES.has(historicalType)) return false;
+  if (!currentType) return true;
+  if (currentType === historicalType) return false;
+  // Don't downgrade specific → generic (covered by GENERIC_TYPES guard above
+  // since historicalType can't be generic, but kept explicit for clarity).
+  if (!GENERIC_TYPES.has(currentType) && GENERIC_TYPES.has(historicalType)) {
+    return false;
+  }
+  return true;
+}
+
 export interface SenderHistory {
   /** What the bulk of prior docs from this sender are typed as. */
   document_type: string;
@@ -109,10 +146,16 @@ export async function getSenderHistory(
   const [topType, topInfo] = sorted[0];
   const ratio = totalVotes ? topInfo.votes / totalVotes : 0;
 
-  // Need a real majority to act on history. Below 60% means the sender
-  // legitimately produces multiple types (e.g. an insurer sending both
-  // policy docs and claim declarations), and we shouldn't flatten that.
-  if (ratio < 0.6) return null;
+  // Need a strong majority to act on history. Below 80% means the sender
+  // legitimately produces multiple document types (e.g. ABP sends both
+  // payslips AND letters; an insurer sends policy docs AND claim
+  // declarations) and we shouldn't flatten that signal.
+  if (ratio < 0.8) return null;
+
+  // Never let "other" win — it's a fallback bucket. A sender whose top
+  // type is "other" just means Claude was uncertain on most past docs;
+  // that's noise, not a signal we should propagate.
+  if (GENERIC_TYPES.has(topType)) return null;
 
   const reason = `History: ${matching.length} prior documents from "${senderRaw}" — ${topInfo.votes} votes for ${topType}${topInfo.confirmed ? ` (${topInfo.confirmed} user-confirmed)` : ""}.`;
 
