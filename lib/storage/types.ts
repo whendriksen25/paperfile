@@ -28,6 +28,10 @@ export interface BuildDestinationParams {
   documentType?: string | null;
   documentDateISO?: string | null;
   filename: string;
+  /** When provided, drives the YYYYMMDD_{sender} logical filename. */
+  sender?: string | null;
+  /** Title fallback when sender is empty. */
+  title?: string | null;
 }
 
 export interface StorageAdapter {

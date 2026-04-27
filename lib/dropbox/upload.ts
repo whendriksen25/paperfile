@@ -47,8 +47,68 @@ export async function uploadToDropboxInbox(params: {
 }
 
 /**
+ * Pull the file extension off the original upload, defaulting sensibly.
+ * Always lowercase, always with leading dot.
+ */
+function fileExtension(name: string): string {
+  const m = /\.([a-zA-Z0-9]{1,8})$/.exec(name);
+  if (!m) return ".bin";
+  return "." + m[1].toLowerCase();
+}
+
+/**
+ * Compress a sender or title string into a tidy filename slug:
+ *   - keep letters / digits / single underscores
+ *   - collapse repeated separators
+ *   - strip diacritics so "Apothéék BV" → "apotheek_bv"
+ *   - cap at maxLen (default 40) so filenames stay scannable
+ */
+function slugify(input: string, maxLen = 40): string {
+  if (!input) return "";
+  return input
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "") // strip accents
+    .replace(/[^a-zA-Z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, maxLen)
+    .replace(/_+$/g, "")
+    .toLowerCase();
+}
+
+/**
+ * Construct a logical, human-scannable filename from the doc's metadata:
+ *   YYYYMMDD_{sender_or_title}.{ext}
+ * e.g. "20250819_b_r_de_klyn_arts.jpg"
+ *
+ * Falls back gracefully when metadata is incomplete:
+ *   - no date: uses today's date
+ *   - no sender: tries title
+ *   - no title:  uses sanitized original filename without its extension
+ */
+export function buildLogicalFilename(params: {
+  documentDateISO?: string | null;
+  sender?: string | null;
+  title?: string | null;
+  originalFilename: string;
+}): string {
+  const ext = fileExtension(params.originalFilename);
+  const date = params.documentDateISO || new Date().toISOString().slice(0, 10);
+  const datePart = date.replace(/-/g, "").slice(0, 8); // YYYYMMDD
+  const senderSlug = slugify(params.sender || "");
+  const titleSlug = slugify(params.title || "");
+  const fallback = slugify(params.originalFilename.replace(/\.[^.]+$/, ""));
+  const subject = senderSlug || titleSlug || fallback || "document";
+  return `${datePart}_${subject}${ext}`;
+}
+
+/**
  * Builds the final Dropbox path for a classified document:
- *   {root}/{profile}/{year}/{type}/{filename}
+ *   {root}/{profile}/{year}/{type}/YYYYMMDD_{sender}.{ext}
+ *
+ * The logical-name layer is opt-in via the `sender` / `title` fields — when
+ * the caller passes those, we synthesise a tidy filename. When they're not
+ * passed (e.g. a doc the user manually re-files without re-running Claude),
+ * we keep whatever filename was supplied.
  *
  * Falls back to "_unsorted" when profile or type are missing.
  */
@@ -57,15 +117,32 @@ export function buildDestinationPath(params: {
   documentType?: string | null;
   documentDateISO?: string | null;
   filename: string;
+  /** When provided, drives the new YYYYMMDD_{sender} naming. Optional. */
+  sender?: string | null;
+  /** Title fallback when sender is empty. Optional. */
+  title?: string | null;
 }): string {
   const root = dropboxRootFolder();
   const profile = safeSegment(params.profileSlug || "_unsorted");
   const year =
-    (params.documentDateISO && /^\d{4}/.test(params.documentDateISO)
+    params.documentDateISO && /^\d{4}/.test(params.documentDateISO)
       ? params.documentDateISO.slice(0, 4)
-      : new Date().getFullYear().toString());
+      : new Date().getFullYear().toString();
   const type = safeSegment(params.documentType || "_unsorted");
-  const filename = safeSegment(params.filename);
+
+  // Use the new logical name when we have any signal to build one;
+  // otherwise keep the caller's filename (preserves backward compat).
+  const useLogical = !!(params.sender || params.title);
+  const filename = useLogical
+    ? safeSegment(
+        buildLogicalFilename({
+          documentDateISO: params.documentDateISO,
+          sender: params.sender,
+          title: params.title,
+          originalFilename: params.filename,
+        })
+      )
+    : safeSegment(params.filename);
   return `${root}/${profile}/${year}/${type}/${filename}`;
 }
 

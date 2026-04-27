@@ -272,6 +272,23 @@ single user, returns success.
 - Receipts-to-tax export.
 - Calendar integration for action due-dates.
 
+## Project location on disk
+
+This is the canonical local working directory for everything in this app —
+codebase, git repo, dev server, all Claude commands:
+
+```
+/Users/jean/Documents/Personal/Werk/Software/document-archive
+```
+
+All `cd`, `git`, `npm`, `node`, `npx`, and curl commands run from inside this
+folder. The git remote is `https://github.com/whendriksen25/paperfile.git`
+(branch `main`).
+
+The sibling folder `bookkeeping-aiuto/` is a **different app** with its own repo
+and is not touched by Paperfile changes. Don't push Paperfile commits from the
+bookkeeping-aiuto folder, and don't push bookkeeping commits from here.
+
 ## Naming
 
 - Project folder: `document-archive`

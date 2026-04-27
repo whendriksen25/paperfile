@@ -199,6 +199,8 @@ export async function POST(
       documentType: extraction.document_type,
       documentDateISO: extraction.document_date,
       filename: doc.file_name || "file.pdf",
+      sender: extraction.sender,
+      title: extraction.title,
     });
     let newPath = doc.dropbox_path;
     let shareLink: string | null = doc.dropbox_shared_link;

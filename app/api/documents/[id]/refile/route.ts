@@ -92,6 +92,8 @@ export async function POST(
       documentType: targetDocType,
       documentDateISO: doc.document_date,
       filename: doc.file_name || "file.bin",
+      sender: doc.sender,
+      title: doc.title,
     });
 
     let newPath = doc.dropbox_path;

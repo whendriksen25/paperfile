@@ -104,6 +104,8 @@ export async function POST(request: NextRequest) {
     documentType: extraction.document_type,
     documentDateISO: extraction.document_date,
     filename: doc.file_name || "file.jpg",
+    sender: extraction.sender,
+    title: extraction.title,
   });
   let newPath = doc.dropbox_path;
   let shareLink: string | null = doc.dropbox_shared_link;
