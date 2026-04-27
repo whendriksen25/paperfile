@@ -47,6 +47,12 @@ export function UploadForm() {
   // never get bundled into the next combine/scan batch — once Scan is hit,
   // those items are off the table for combining with future ones.
   const [recentFailures, setRecentFailures] = useState<PendingFile[]>([]);
+  // Items the server detected as duplicates of an existing doc. Surfaced
+  // separately so the user can see "this scan matched XYZ" instead of
+  // wondering why their upload didn't show up in the inbox.
+  const [recentDuplicates, setRecentDuplicates] = useState<
+    { id: string; fileName: string; existingId: string }[]
+  >([]);
   // When on, the server stitches all picked files into ONE multi-page PDF
   // and treats them as a single Paperfile document.
   const [combineMode, setCombineMode] = useState(false);
@@ -90,6 +96,11 @@ export function UploadForm() {
     // them out of the active pending list into recentFailures so they can't
     // accidentally be combined with the next batch.
     const failuresThisRun: PendingFile[] = [];
+    // Count of items the server flagged as duplicates of an existing doc
+    // during this submit. The dup details get pushed into recentDuplicates
+    // state inline, but we also need a local count so the green-banner
+    // tally is accurate (state closure is stale at end-of-run).
+    let dupsThisRun = 0;
 
     // ----- Step 1: client-side compression -----
     // Shrink + HEIC-convert images in the browser BEFORE upload. Avoids
@@ -171,13 +182,28 @@ export function UploadForm() {
         if (!res.ok) throw new Error(await res.text());
         const json = await res.json();
         lastDocId = json.data?.id || null;
-        setPending((p) =>
-          p.map((f) => ({
-            ...f,
-            progress: "done" as const,
-            documentId: lastDocId || undefined,
-          }))
-        );
+        if (json.duplicate && lastDocId) {
+          // Combined PDF matched an existing doc — surface as duplicate
+          // instead of pretending we did a new upload.
+          dupsThisRun += batchSize; // whole combined batch counts as one dup
+          setRecentDuplicates((prev) => [
+            ...prev,
+            {
+              id: crypto.randomUUID(),
+              fileName: combinedName.trim() || "combined document",
+              existingId: lastDocId as string,
+            },
+          ]);
+          setPending([]);
+        } else {
+          setPending((p) =>
+            p.map((f) => ({
+              ...f,
+              progress: "done" as const,
+              documentId: lastDocId || undefined,
+            }))
+          );
+        }
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : "Upload failed";
         anyFailed = true;
@@ -204,13 +230,29 @@ export function UploadForm() {
           if (!res.ok) throw new Error(await res.text());
           const json = await res.json();
           lastDocId = json.data?.id || null;
-          setPending((p) =>
-            p.map((f) =>
-              f.id === item.id
-                ? { ...f, progress: "done", documentId: lastDocId || undefined }
-                : f
-            )
-          );
+          if (json.duplicate && lastDocId) {
+            // Server saw this exact file before — surface a duplicate
+            // marker and remove it from pending so it doesn't show as
+            // a fresh upload.
+            dupsThisRun++;
+            setRecentDuplicates((prev) => [
+              ...prev,
+              {
+                id: crypto.randomUUID(),
+                fileName: item.file.name,
+                existingId: lastDocId as string,
+              },
+            ]);
+            setPending((p) => p.filter((f) => f.id !== item.id));
+          } else {
+            setPending((p) =>
+              p.map((f) =>
+                f.id === item.id
+                  ? { ...f, progress: "done", documentId: lastDocId || undefined }
+                  : f
+              )
+            );
+          }
         } catch (e: unknown) {
           const msg = e instanceof Error ? e.message : "Upload failed";
           anyFailed = true;
@@ -229,9 +271,13 @@ export function UploadForm() {
     // Always close the batch: pending is cleared so any new files the user
     // adds form a fresh batch and won't be combined with these (whether
     // they succeeded or failed). Successes feed the green banner counter;
-    // failures move into a separate "Recent failures" surface.
+    // failures move into a separate "Recent failures" surface; duplicates
+    // are surfaced in their own "Skipped duplicates" surface.
     const failedCount = failuresThisRun.length;
-    const successCount = batchSize - failedCount;
+    const successCount = Math.max(
+      0,
+      batchSize - failedCount - dupsThisRun
+    );
     setPending([]);
     if (successCount > 0) setSessionUploaded((n) => n + successCount);
     if (failedCount > 0) {
@@ -315,6 +361,42 @@ export function UploadForm() {
                   <X className="h-3.5 w-3.5" />
                 </button>
               </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {recentDuplicates.length > 0 && (
+        <div className="surface bg-amber-50 border-amber-300 p-3 space-y-2">
+          <div className="flex items-center justify-between gap-3">
+            <div className="text-xs font-bold text-amber-900 uppercase tracking-wide">
+              {recentDuplicates.length === 1
+                ? "1 duplicate skipped"
+                : `${recentDuplicates.length} duplicates skipped`}
+            </div>
+            <button
+              type="button"
+              onClick={() => setRecentDuplicates([])}
+              className="text-[11px] font-semibold text-muted-foreground hover:text-foreground"
+            >
+              Dismiss all
+            </button>
+          </div>
+          {recentDuplicates.map((d) => (
+            <div
+              key={d.id}
+              className="flex items-center justify-between gap-3 text-xs"
+            >
+              <div className="min-w-0 truncate">
+                <span className="font-semibold">{d.fileName}</span>{" "}
+                <span className="text-amber-800">already in Paperfile</span>
+              </div>
+              <Link
+                href={`/document/${d.existingId}`}
+                className="text-[11px] font-bold text-brand-purple hover:opacity-80 shrink-0"
+              >
+                Open original →
+              </Link>
             </div>
           ))}
         </div>

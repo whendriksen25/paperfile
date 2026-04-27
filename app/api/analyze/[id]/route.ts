@@ -239,6 +239,42 @@ export async function POST(
       "bank_statement",
     ].includes(extraction.document_type || "");
 
+    // Layer 2 dedup: now that we have sender + date + amount + type from
+    // Claude, look for another doc owned by this user with the same
+    // tuple. If we find one, soft-link to it so the detail page can
+    // surface a "looks like a duplicate of …" banner. Doesn't block —
+    // the user decides whether to keep both or delete one.
+    let possibleDuplicateOf: string | null = null;
+    {
+      const senderNorm = (extraction.sender || "").trim();
+      if (
+        senderNorm &&
+        extraction.document_date &&
+        extraction.document_type &&
+        extraction.amount != null
+      ) {
+        const { data: dupRow } = await admin
+          .from("documents")
+          .select("id")
+          .eq("user_id", user.id)
+          .neq("id", id)
+          .eq("sender", senderNorm)
+          .eq("document_date", extraction.document_date)
+          .eq("document_type", extraction.document_type)
+          .eq("amount", extraction.amount)
+          .order("created_at", { ascending: true })
+          .limit(1)
+          .maybeSingle();
+        if (dupRow) {
+          possibleDuplicateOf = dupRow.id as string;
+          console.log(
+            "[api/analyze] possible duplicate detected — soft-linking to",
+            possibleDuplicateOf
+          );
+        }
+      }
+    }
+
     // 6. Update the document row with everything
     const { error: updateErr } = await admin
       .from("documents")
@@ -246,6 +282,7 @@ export async function POST(
         dropbox_path: newPath,
         dropbox_shared_link: shareLink,
         primary_profile_id: profileId,
+        possible_duplicate_of: possibleDuplicateOf,
         document_type: extraction.document_type || null,
         document_subtype: extraction.document_subtype || null,
         confidence: extraction.confidence ?? null,

@@ -76,6 +76,10 @@ export interface DocumentRow {
   bookkeeping_doc_id: string | null;
   bookkeeping_url: string | null;
 
+  // Duplicate detection (migration 010)
+  content_hash: string | null;          // SHA-256 of the uploaded buffer
+  possible_duplicate_of: string | null; // FK to another documents.id
+
   uploaded_by: string | null;
   created_at: string;
   updated_at: string;

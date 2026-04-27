@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { createHash } from "crypto";
 import { createClient, createServiceClient } from "@/lib/supabase/server";
 import { getStorage } from "@/lib/storage";
 import { combineImagesToPdf } from "@/lib/utils/combine-images";
@@ -87,6 +88,34 @@ export async function POST(request: NextRequest) {
       .map((t) => t.trim())
       .filter(Boolean);
 
+    // Layer 1 dedup: SHA-256 hash of the final buffer (post-combine if
+    // applicable). If the same user has already uploaded a doc with the
+    // same hash, short-circuit — return their existing doc instead of
+    // creating a duplicate row + uploading to Dropbox.
+    const contentHash = createHash("sha256").update(buffer).digest("hex");
+    const admin = await createServiceClient();
+    {
+      const { data: existing } = await admin
+        .from("documents")
+        .select("id, file_name, status, dropbox_path")
+        .eq("user_id", user.id)
+        .eq("content_hash", contentHash)
+        .limit(1)
+        .maybeSingle();
+      if (existing) {
+        console.log(
+          "[api/upload] duplicate detected — returning existing doc",
+          existing.id
+        );
+        return NextResponse.json({
+          data: existing,
+          duplicate: true,
+          duplicate_of: existing.id,
+          duplicate_reason: "Same file content (SHA-256) as an existing upload.",
+        });
+      }
+    }
+
     // 1. Upload to the configured storage backend's staging area
     const storage = getStorage();
     const uploaded = await storage.uploadToInbox({
@@ -95,7 +124,6 @@ export async function POST(request: NextRequest) {
     });
 
     // 2. Insert row (status = pending)
-    const admin = await createServiceClient();
     const { data: row, error: insertError } = await admin
       .from("documents")
       .insert({
@@ -105,6 +133,7 @@ export async function POST(request: NextRequest) {
         file_name: displayName,
         file_type: combine ? "application/pdf" : ((formData.get("file") as File | null)?.type || null),
         file_size_bytes: uploaded.size,
+        content_hash: contentHash,
         batch,
         person: personRaw,
         primary_profile_id: profileId,

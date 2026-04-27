@@ -11,6 +11,7 @@ import { Badge } from "@/components/ui/badge";
 import { LineItemsSection, type LineItem } from "@/components/inbox/line-items";
 import { RefileWidget } from "@/components/inbox/refile-widget";
 import { RenameFilenameButton } from "@/components/inbox/rename-filename-button";
+import { DuplicateBanner } from "@/components/inbox/duplicate-banner";
 import {
   ProfileMatchPanel,
   type ProfileMatchInfo,
@@ -69,6 +70,24 @@ export default async function DocumentDetail({
     .eq("document_id", id)
     .maybeSingle();
   action = (a as ActionRow) || null;
+
+  // Layer 2 dedup: if analyze flagged this as a possible duplicate of
+  // another doc, fetch a tiny summary of that doc so the banner can
+  // describe it ("Looks like a duplicate of X from Y on Z").
+  let duplicateOf: {
+    id: string;
+    title: string | null;
+    sender: string | null;
+    document_date: string | null;
+  } | null = null;
+  if (doc.possible_duplicate_of) {
+    const { data: dup } = await supabase
+      .from("documents")
+      .select("id, title, sender, document_date")
+      .eq("id", doc.possible_duplicate_of)
+      .maybeSingle();
+    duplicateOf = (dup as typeof duplicateOf) || null;
+  }
 
   const isPending = doc.status === "pending" || doc.status === "processing";
 
@@ -133,6 +152,13 @@ export default async function DocumentDetail({
             Refresh in a moment to see the extracted details.
           </p>
         </div>
+      )}
+
+      {duplicateOf && (
+        <DuplicateBanner
+          currentId={doc.id}
+          duplicate={duplicateOf}
+        />
       )}
 
       {/* Two-pane layout: source on left, AI suggestions on right */}
