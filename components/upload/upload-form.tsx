@@ -111,12 +111,27 @@ export function UploadForm() {
         setPending((p) => p.map((f) => (f.id === item.id ? next : f)));
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : "Compression failed";
-        anyFailed = true;
-        setPending((p) =>
-          p.map((f) =>
-            f.id === item.id ? { ...f, progress: "failed", error: msg } : f
-          )
+        console.warn(
+          `[upload] compression failed for ${item.file.name}: ${msg}`
         );
+        // Pragmatic fallback: compression is an optimisation, not a
+        // requirement. If the original is small enough to fit in Vercel's
+        // 4.5 MB body limit comfortably, upload it uncompressed and let
+        // the server (which has heic-convert + sharp fallbacks) deal with
+        // it. Only treat it as a real failure for big files where the
+        // upload will definitely be rejected at the edge.
+        if (item.file.size <= 3_500_000) {
+          const next = { ...item, progress: "queued" as const };
+          compressed.push(next);
+          setPending((p) => p.map((f) => (f.id === item.id ? next : f)));
+        } else {
+          anyFailed = true;
+          setPending((p) =>
+            p.map((f) =>
+              f.id === item.id ? { ...f, progress: "failed", error: msg } : f
+            )
+          );
+        }
       }
     }
     // Use the compressed list from here on. Bail early if every file failed

@@ -125,12 +125,22 @@ export async function compressImageInBrowser(
 
 /**
  * Light decision helper: does this file actually need compression?
- * - PDFs: never (skip — they're already optimised, and we don't compress them)
- * - Already-small JPEGs: skip if under maxBytes (no point recompressing)
- * - Everything else (HEIC, large JPEGs, PNGs): compress.
+ *
+ *  - PDFs: never (already optimised, and we don't compress them).
+ *  - Anything ≤ maxBytes: skip — small enough to fit in Vercel's 4.5 MB
+ *    body limit comfortably with margin. Compression is purely an
+ *    optimisation for large iPhone scans; small files don't need it.
+ *    Skipping HEIC compression for small files is safe because the server
+ *    has its own HEIC fallback (heic-convert).
+ *  - Everything else (HEIC, large JPEGs, PNGs > maxBytes): compress.
+ *
+ * Default threshold is 1 MB — slightly higher than before so common
+ * iPhone camera output (700 KB-ish JPEGs) skips the canvas/heic2any
+ * path entirely, which was the source of "Load failed" errors on iOS
+ * when the dynamic import for heic2any flaked.
  */
-export function shouldCompress(file: File, maxBytes = 800_000): boolean {
+export function shouldCompress(file: File, maxBytes = 1_000_000): boolean {
   if (file.type === "application/pdf") return false;
-  if (file.type === "image/jpeg" && file.size <= maxBytes) return false;
+  if (file.size <= maxBytes) return false;
   return true;
 }
