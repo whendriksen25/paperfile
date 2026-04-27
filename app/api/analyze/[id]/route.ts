@@ -57,25 +57,57 @@ export async function POST(
     const buffer = await storage.downloadFile(doc.dropbox_path);
 
     // 2. Run Claude extraction
-    const extraction = await extractDocument(
+    const result = await extractDocument(
       buffer,
       doc.file_name || "file.pdf"
     );
 
-    if (!extraction) {
+    if (!result) {
       await admin
         .from("documents")
         .update({
           status: "failed",
           needs_review: true,
-          review_notes: "Claude returned no parseable JSON",
+          review_notes: "Claude returned an empty response — try again.",
         })
         .eq("id", id);
       return NextResponse.json(
-        { error: "Extraction produced no JSON" },
+        { error: "Extraction produced no response" },
         { status: 500 }
       );
     }
+
+    // Parse-failure path: surface what Claude actually said in review_notes
+    // so the user / future-Claude run can see what went wrong instead of
+    // staring at an opaque "no parseable JSON" error.
+    if ("error" in result && result.error === "parse_failed") {
+      const truncated =
+        result.stop_reason === "max_tokens" || result.stop_reason === "length";
+      const note = [
+        truncated
+          ? "Claude's response was cut off (max_tokens). Try Re-analyse — the parser now allows 16k tokens."
+          : "Claude's response wasn't valid JSON.",
+        `stop_reason: ${result.stop_reason || "unknown"}`,
+        "First 500 chars of the response:",
+        result.raw_text.slice(0, 500),
+      ].join("\n");
+      await admin
+        .from("documents")
+        .update({
+          status: "failed",
+          needs_review: true,
+          review_notes: note.slice(0, 4000),
+        })
+        .eq("id", id);
+      return NextResponse.json(
+        { error: "Extraction returned non-JSON response", stop_reason: result.stop_reason },
+        { status: 500 }
+      );
+    }
+
+    // After the two early returns above, `result` is necessarily a
+    // DocumentExtraction. TS can't narrow through the in-check, so cast.
+    const extraction = result as Exclude<typeof result, { error: string }>;
 
     // 3. Resolve profile.
     //    Order of preference:

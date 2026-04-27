@@ -12,17 +12,73 @@ function stripCodeFence(s: string): string {
   return s.trim();
 }
 
-function safeParseJSON(s: string): Record<string, unknown> | null {
-  if (!s) return null;
-  try {
-    return JSON.parse(s);
-  } catch {
-    try {
-      return JSON.parse(stripCodeFence(s));
-    } catch {
-      return null;
+/**
+ * Slice out the first balanced {…} object in the string. Handles strings
+ * with escaped quotes so braces inside string literals don't fool the
+ * counter. Returns null if no balanced object is found.
+ */
+function extractFirstObject(s: string): string | null {
+  const start = s.indexOf("{");
+  if (start === -1) return null;
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = start; i < s.length; i++) {
+    const c = s[i];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (c === "\\" && inString) {
+      escape = true;
+      continue;
+    }
+    if (c === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+    if (c === "{") depth++;
+    else if (c === "}") {
+      depth--;
+      if (depth === 0) return s.slice(start, i + 1);
     }
   }
+  return null; // unterminated — likely truncated by max_tokens
+}
+
+/** Drop trailing commas before closing braces/brackets — common Claude tic. */
+function stripTrailingCommas(s: string): string {
+  return s.replace(/,(\s*[}\]])/g, "$1");
+}
+
+/**
+ * Try increasingly aggressive parses until one works. We prefer the
+ * cleanest input but degrade gracefully:
+ *  1. raw text
+ *  2. text with code fence removed
+ *  3. first balanced {…} sliced out
+ *  4. that slice with trailing commas removed
+ * Returns null if everything fails (truncation, gibberish, etc.).
+ */
+function safeParseJSON(s: string): Record<string, unknown> | null {
+  if (!s) return null;
+  const candidates = [s, stripCodeFence(s)];
+  const obj = extractFirstObject(s) || extractFirstObject(stripCodeFence(s));
+  if (obj) {
+    candidates.push(obj);
+    candidates.push(stripTrailingCommas(obj));
+  }
+  for (const cand of candidates) {
+    try {
+      const parsed = JSON.parse(cand);
+      if (parsed && typeof parsed === "object")
+        return parsed as Record<string, unknown>;
+    } catch {
+      // try next candidate
+    }
+  }
+  return null;
 }
 
 function getMimeType(
@@ -43,10 +99,21 @@ function getMimeType(
   return map[ext] || "image/jpeg";
 }
 
+/**
+ * Returned by extractDocument when Claude responded but the response
+ * couldn't be parsed as JSON. Caller is expected to surface the raw
+ * response in review_notes so a human can see what went wrong.
+ */
+export interface ExtractionFailure {
+  error: "parse_failed";
+  raw_text: string;
+  stop_reason: string | null;
+}
+
 export async function extractDocument(
   fileBuffer: Buffer,
   filename: string
-): Promise<DocumentExtraction | null> {
+): Promise<DocumentExtraction | ExtractionFailure | null> {
   console.log("[ai/extract] starting extraction for:", filename);
 
   const mimeType = getMimeType(filename);
@@ -78,7 +145,10 @@ export async function extractDocument(
 
   const response = await client.messages.create({
     model: "claude-sonnet-4-20250514",
-    max_tokens: 8192,
+    // 16k tokens — comfortably fits a multi-page bill with full OCR text +
+    // line items. The previous 8k limit was the most common cause of
+    // truncated-mid-JSON failures on long receipts.
+    max_tokens: 16384,
     temperature: 0,
     messages: [{ role: "user", content: contentBlocks }],
   });
@@ -87,8 +157,19 @@ export async function extractDocument(
   const rawText = textBlock && "text" in textBlock ? textBlock.text : "";
   const parsed = safeParseJSON(rawText);
 
-  console.log("[ai/extract] extraction complete for:", filename);
+  console.log(
+    "[ai/extract] complete:",
+    filename,
+    "stop:",
+    response.stop_reason,
+    "parsed?",
+    !!parsed
+  );
 
-  if (!parsed) return null;
-  return parsed as unknown as DocumentExtraction;
+  if (parsed) return parsed as unknown as DocumentExtraction;
+  return {
+    error: "parse_failed",
+    raw_text: rawText,
+    stop_reason: response.stop_reason || null,
+  };
 }

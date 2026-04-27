@@ -26,21 +26,28 @@ export async function GET(request: NextRequest) {
   if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
   const q = request.nextUrl.searchParams.get("q") || "";
-  if (!q.trim())
-    return NextResponse.json({ error: "Provide ?q=" }, { status: 400 });
+  const status = request.nextUrl.searchParams.get("status") || null;
+  if (!q.trim() && !status)
+    return NextResponse.json({ error: "Provide ?q= or ?status=" }, { status: 400 });
 
   const admin = await createServiceClient();
-  const term = q.trim();
-  const { data, error } = await admin
+  let query = admin
     .from("documents")
     .select(
       "id, status, file_name, file_type, document_type, document_date, sender, recipient, title, person, primary_profile_id, dropbox_path, needs_review, review_notes, created_at"
     )
-    .or(
-      `sender.ilike.%${term}%,file_name.ilike.%${term}%,title.ilike.%${term}%,person.ilike.%${term}%,batch.ilike.%${term}%`
-    )
     .order("created_at", { ascending: false })
     .limit(50);
+  if (q.trim()) {
+    const term = q.trim();
+    query = query.or(
+      `sender.ilike.%${term}%,file_name.ilike.%${term}%,title.ilike.%${term}%,person.ilike.%${term}%,batch.ilike.%${term}%,review_notes.ilike.%${term}%`
+    );
+  }
+  if (status) {
+    query = query.eq("status", status);
+  }
+  const { data, error } = await query;
 
   if (error)
     return NextResponse.json({ error: error.message }, { status: 500 });

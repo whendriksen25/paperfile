@@ -52,15 +52,29 @@ export async function POST(request: NextRequest) {
     console.log("[admin-bridge/analyze] downloading", doc.dropbox_path);
     const buffer = await storage.downloadFile(doc.dropbox_path);
     console.log("[admin-bridge/analyze] downloaded", buffer.length, "bytes");
-    const extraction = await extractDocument(buffer, doc.file_name || "file.jpg");
-    console.log("[admin-bridge/analyze] extracted", !!extraction);
-  if (!extraction) {
+    const result = await extractDocument(buffer, doc.file_name || "file.jpg");
+    console.log("[admin-bridge/analyze] extracted", !!result);
+  if (!result) {
     await admin
       .from("documents")
-      .update({ status: "failed", needs_review: true, review_notes: "No JSON from Claude" })
+      .update({ status: "failed", needs_review: true, review_notes: "Empty response from Claude" })
       .eq("id", doc.id);
-    return NextResponse.json({ error: "Claude returned no JSON" }, { status: 500 });
+    return NextResponse.json({ error: "Claude returned no response" }, { status: 500 });
   }
+  if ("error" in result && result.error === "parse_failed") {
+    const note = [
+      "Claude's response wasn't valid JSON.",
+      `stop_reason: ${result.stop_reason || "unknown"}`,
+      "First 500 chars:",
+      result.raw_text.slice(0, 500),
+    ].join("\n");
+    await admin
+      .from("documents")
+      .update({ status: "failed", needs_review: true, review_notes: note.slice(0, 4000) })
+      .eq("id", doc.id);
+    return NextResponse.json({ error: "Non-JSON response", stop_reason: result.stop_reason }, { status: 500 });
+  }
+  const extraction = result as Exclude<typeof result, { error: string }>;
 
   // Profile resolution (same as analyze/[id] route) — but using the row's owner
   let profileId: number | null = doc.primary_profile_id || null;
