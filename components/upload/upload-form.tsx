@@ -43,6 +43,10 @@ export function UploadForm() {
   // We use it for the "X uploaded · processing in inbox" banner that lets
   // the user keep scanning without leaving the page.
   const [sessionUploaded, setSessionUploaded] = useState(0);
+  // Items from the LAST submit that failed. Kept in a separate list so they
+  // never get bundled into the next combine/scan batch — once Scan is hit,
+  // those items are off the table for combining with future ones.
+  const [recentFailures, setRecentFailures] = useState<PendingFile[]>([]);
   // When on, the server stitches all picked files into ONE multi-page PDF
   // and treats them as a single Paperfile document.
   const [combineMode, setCombineMode] = useState(false);
@@ -76,11 +80,16 @@ export function UploadForm() {
       .map((t) => t.trim())
       .filter(Boolean);
 
+    const batchSize = pending.length;
     let lastDocId: string | null = null;
     // Tracked locally because reading `pending` after the loop returns stale
     // state (React batches setPending calls; the closure's `pending` is the
     // pre-loop snapshot). Without this, navigation-on-success masks failures.
     let anyFailed = false;
+    // Failed items from THIS submit, captured locally — at the end we move
+    // them out of the active pending list into recentFailures so they can't
+    // accidentally be combined with the next batch.
+    const failuresThisRun: PendingFile[] = [];
 
     // ----- Step 1: client-side compression -----
     // Shrink + HEIC-convert images in the browser BEFORE upload. Avoids
@@ -126,6 +135,7 @@ export function UploadForm() {
           setPending((p) => p.map((f) => (f.id === item.id ? next : f)));
         } else {
           anyFailed = true;
+          failuresThisRun.push({ ...item, progress: "failed", error: msg });
           setPending((p) =>
             p.map((f) =>
               f.id === item.id ? { ...f, progress: "failed", error: msg } : f
@@ -171,6 +181,9 @@ export function UploadForm() {
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : "Upload failed";
         anyFailed = true;
+        for (const it of usableFiles) {
+          failuresThisRun.push({ ...it, progress: "failed", error: msg });
+        }
         setPending((p) =>
           p.map((f) => ({ ...f, progress: "failed" as const, error: msg }))
         );
@@ -201,6 +214,7 @@ export function UploadForm() {
         } catch (e: unknown) {
           const msg = e instanceof Error ? e.message : "Upload failed";
           anyFailed = true;
+          failuresThisRun.push({ ...item, progress: "failed", error: msg });
           setPending((p) =>
             p.map((f) =>
               f.id === item.id ? { ...f, progress: "failed", error: msg } : f
@@ -212,32 +226,25 @@ export function UploadForm() {
 
     setSubmitting(false);
 
-    // Did anything actually fail? If yes, stay on /upload so the user can see
-    // the error message — silent navigation to /inbox is what made the HEIC
-    // bug invisible for so long.
-    if (anyFailed) {
-      // Stay put — the per-file error message is rendered next to its name.
-      // Drop the successful items so the failures stand out visually, but
-      // keep the count for the banner.
-      setPending((p) => {
-        const successCount = p.filter((f) => f.progress === "done").length;
-        if (successCount) setSessionUploaded((n) => n + successCount);
-        return p.filter((f) => f.progress === "failed");
-      });
-      return;
-    }
-
-    // Successful batch: stay on /upload so the user can keep scanning.
-    // Clear pending so the screen is fresh for the next photo, bump the
-    // session counter so the "X uploaded · processing" banner appears.
-    const justUploaded = pending.length;
+    // Always close the batch: pending is cleared so any new files the user
+    // adds form a fresh batch and won't be combined with these (whether
+    // they succeeded or failed). Successes feed the green banner counter;
+    // failures move into a separate "Recent failures" surface.
+    const failedCount = failuresThisRun.length;
+    const successCount = batchSize - failedCount;
     setPending([]);
-    setSessionUploaded((n) => n + justUploaded);
+    if (successCount > 0) setSessionUploaded((n) => n + successCount);
+    if (failedCount > 0) {
+      setRecentFailures((prev) => [...prev, ...failuresThisRun]);
+    }
     // Reset combine-mode state so the next batch starts clean.
     if (combineMode) {
       setCombineMode(false);
       setCombinedName("");
     }
+    // Touch anyFailed so the linter doesn't complain about an unused var
+    // (we keep the flag because it documents intent at each catch site).
+    void anyFailed;
   }
 
   return (
@@ -246,6 +253,73 @@ export function UploadForm() {
           in this page session. Tells the user that previous scans are off
           to the AI, and gives them a one-tap path to the inbox without
           forcing them off /upload. */}
+      {recentFailures.length > 0 && (
+        <div className="surface bg-destructive/5 border-destructive/30 p-3 space-y-2">
+          <div className="flex items-center justify-between gap-3">
+            <div className="text-xs font-bold text-destructive uppercase tracking-wide">
+              {recentFailures.length === 1
+                ? "1 file failed in your last scan"
+                : `${recentFailures.length} files failed in your last scan`}
+            </div>
+            <button
+              type="button"
+              onClick={() => setRecentFailures([])}
+              className="text-[11px] font-semibold text-muted-foreground hover:text-foreground"
+            >
+              Dismiss all
+            </button>
+          </div>
+          {recentFailures.map((item) => (
+            <div
+              key={item.id}
+              className="flex items-center justify-between gap-3 text-xs"
+            >
+              <div className="min-w-0">
+                <div className="font-semibold truncate">{item.file.name}</div>
+                <div className="text-destructive">
+                  {item.error || "Unknown error"}
+                </div>
+              </div>
+              <div className="flex items-center gap-1 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => {
+                    // Move it back into pending as a fresh queued item so
+                    // the user can retry without re-picking the file.
+                    setPending((p) => [
+                      ...p,
+                      {
+                        id: crypto.randomUUID(),
+                        file: item.file,
+                        progress: "queued",
+                      },
+                    ]);
+                    setRecentFailures((prev) =>
+                      prev.filter((f) => f.id !== item.id)
+                    );
+                  }}
+                  className="text-[11px] font-bold text-brand-purple hover:opacity-80 px-2 py-1"
+                >
+                  Retry
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setRecentFailures((prev) =>
+                      prev.filter((f) => f.id !== item.id)
+                    )
+                  }
+                  className="p-1 text-muted-foreground hover:text-foreground"
+                  aria-label="Dismiss"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
       {sessionUploaded > 0 && (
         <div className="surface bg-brand-green/5 border-brand-green/20 p-3 flex items-center justify-between gap-3">
           <div className="flex items-center gap-2 text-sm">
