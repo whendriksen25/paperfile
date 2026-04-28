@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient, createServiceClient } from "@/lib/supabase/server";
 import { getStorage } from "@/lib/storage";
+import { normalizeSender } from "@/lib/services/sender-history";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -126,7 +127,43 @@ export async function POST(
     }
 
     console.log("[api/documents/[id]/refile] done", id, "→", newPath);
-    return NextResponse.json({ ok: true, new_path: newPath });
+
+    // PROPAGATION HINT: count sibling docs from the same sender (normalized)
+    // that are NOT currently classified the same way as the user just chose.
+    // The UI uses this to render a one-click "apply to all N siblings"
+    // banner so a single refile can fix every other doc from that sender.
+    let siblingCount = 0;
+    if (doc.sender) {
+      const senderNorm = normalizeSender(doc.sender);
+      // Pull all the user's docs with a sender; filter client-side because
+      // PostgREST can't apply our normalisation rule.
+      const { data: candidates } = await admin
+        .from("documents")
+        .select("id, sender, document_type, primary_profile_id")
+        .eq("user_id", user.id)
+        .neq("id", id)
+        .eq("status", "processed")
+        .not("sender", "is", null);
+      siblingCount = (candidates || []).filter((c) => {
+        if (normalizeSender(c.sender as string) !== senderNorm) return false;
+        // A sibling is "out of sync" if either its type OR profile differs
+        // from the values the user just chose (when those were specified).
+        const typeChanged =
+          newDocType !== undefined && c.document_type !== targetDocType;
+        const profileChanged =
+          newProfileId !== undefined && c.primary_profile_id !== targetProfileId;
+        return typeChanged || profileChanged;
+      }).length;
+    }
+
+    return NextResponse.json({
+      ok: true,
+      new_path: newPath,
+      sibling_count: siblingCount,
+      sender: doc.sender || null,
+      target_type: targetDocType,
+      target_profile_id: targetProfileId,
+    });
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : "Refile failed";
     console.error("[api/documents/[id]/refile] error:", msg);

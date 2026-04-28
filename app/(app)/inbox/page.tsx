@@ -6,6 +6,7 @@ import { NeedsReviewBanner } from "@/components/inbox/needs-review-banner";
 import { InboxInfiniteList } from "@/components/inbox/infinite-list";
 import { ProfileSelector } from "@/components/layout/profile-selector";
 import { ExportToDropboxButton } from "@/components/inbox/export-button";
+import { SanityCheckButton } from "@/components/inbox/sanity-check-button";
 import { Search } from "lucide-react";
 import { titleCase } from "@/lib/utils/format";
 import {
@@ -121,6 +122,7 @@ export default async function InboxPage({
           </p>
         </header>
         <div className="flex items-center gap-3">
+          <SanityCheckButton />
           <ExportToDropboxButton
             type={sp.type || null}
             profileId={sp.profile_id ? Number(sp.profile_id) : null}

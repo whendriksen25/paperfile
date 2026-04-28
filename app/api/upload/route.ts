@@ -162,6 +162,32 @@ export async function POST(request: NextRequest) {
       headers: { cookie: request.headers.get("cookie") || "" },
     }).catch((e) => console.error("[api/upload] analyze trigger failed", e));
 
+    // 4. Periodic self-healing: every 20th upload for this user, fire
+    // the sanity check fire-and-forget. Catches orphans (path drift after
+    // analyze) and applies sender-history reclassification with safety
+    // guards. Cheap query — head:true returns count without rows.
+    try {
+      const { count } = await admin
+        .from("documents")
+        .select("*", { count: "exact", head: true })
+        .eq("user_id", user.id);
+      if (count && count % 20 === 0) {
+        console.log("[api/upload] triggering sanity check at count", count);
+        const sanityUrl = new URL(
+          `/api/maintenance/sanity-check`,
+          request.nextUrl.origin
+        );
+        fetch(sanityUrl, {
+          method: "POST",
+          headers: { cookie: request.headers.get("cookie") || "" },
+        }).catch((e) =>
+          console.warn("[api/upload] sanity-check trigger failed", e)
+        );
+      }
+    } catch (e) {
+      console.warn("[api/upload] count query for sanity-check failed", e);
+    }
+
     console.log("[api/upload] done", row.id);
     return NextResponse.json({ data: row });
   } catch (err: unknown) {

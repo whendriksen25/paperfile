@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Sparkles, FolderInput } from "lucide-react";
+import { Sparkles, FolderInput, Wand2, Loader2, X } from "lucide-react";
 import { Spinner } from "@/components/ui/spinner";
 import type { ProfileRow } from "@/types/document";
 
@@ -56,6 +56,15 @@ export function RefileWidget({
   const [reanalysing, setReanalysing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [doneMessage, setDoneMessage] = useState<string | null>(null);
+  // After save: if siblings exist with a different classification, show a
+  // banner offering one-click "apply this correction to all of them."
+  const [propagation, setPropagation] = useState<{
+    sibling_count: number;
+    sender: string | null;
+    target_type: string | null;
+  } | null>(null);
+  const [propagating, setPropagating] = useState(false);
+  const [propagateMessage, setPropagateMessage] = useState<string | null>(null);
 
   useEffect(() => {
     fetch("/api/profiles")
@@ -72,6 +81,8 @@ export function RefileWidget({
     setSaving(true);
     setError(null);
     setDoneMessage(null);
+    setPropagation(null);
+    setPropagateMessage(null);
     try {
       const res = await fetch(`/api/documents/${documentId}/refile`, {
         method: "POST",
@@ -85,10 +96,47 @@ export function RefileWidget({
       if (!res.ok) throw new Error(json.error || "Refile failed");
       setDoneMessage("Saved — file moved in Dropbox.");
       router.refresh();
+      // If the server tells us there are siblings out of sync, surface
+      // the propagation banner so the user can apply this correction
+      // to all docs from the same sender in one click.
+      if (json.sibling_count && json.sibling_count > 0) {
+        setPropagation({
+          sibling_count: json.sibling_count,
+          sender: json.sender || null,
+          target_type: json.target_type || null,
+        });
+      }
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Refile failed");
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function propagate() {
+    if (!propagation) return;
+    setPropagating(true);
+    setPropagateMessage(null);
+    try {
+      const res = await fetch(
+        `/api/documents/${documentId}/propagate-refile`,
+        { method: "POST" }
+      );
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error || "Propagate failed");
+      setPropagateMessage(
+        `Done — ${json.updated} sibling document(s) re-filed${
+          json.failed ? `, ${json.failed} failed` : ""
+        }.`
+      );
+      setPropagation(null);
+      router.refresh();
+    } catch (e: unknown) {
+      setPropagateMessage(
+        e instanceof Error ? e.message : "Propagate failed"
+      );
+    } finally {
+      setPropagating(false);
     }
   }
 
@@ -204,6 +252,59 @@ export function RefileWidget({
       {doneMessage && (
         <p className="mt-2 text-xs text-brand-green font-semibold">
           {doneMessage}
+        </p>
+      )}
+
+      {propagation && (
+        <div className="mt-3 surface bg-brand-purple/5 border-brand-purple/30 p-3">
+          <div className="flex items-start gap-3">
+            <Wand2 className="h-4 w-4 text-brand-purple shrink-0 mt-0.5" />
+            <div className="flex-1 min-w-0">
+              <div className="text-sm font-bold">
+                Apply this correction to {propagation.sibling_count} other doc
+                {propagation.sibling_count === 1 ? "" : "s"} from{" "}
+                {propagation.sender || "this sender"}?
+              </div>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                They&apos;ll be moved to the same folder structure and tagged
+                with the same profile / document type.
+              </p>
+              <div className="mt-2 flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={propagate}
+                  disabled={propagating}
+                  className="btn-primary text-xs !py-2"
+                >
+                  {propagating ? (
+                    <>
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      Applying…
+                    </>
+                  ) : (
+                    <>
+                      <Wand2 className="h-3.5 w-3.5" />
+                      Yes, apply to all
+                    </>
+                  )}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPropagation(null)}
+                  disabled={propagating}
+                  className="text-xs text-muted-foreground hover:text-foreground inline-flex items-center gap-1 px-2 py-1.5"
+                >
+                  <X className="h-3.5 w-3.5" />
+                  No, just this one
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+      {propagateMessage && (
+        <p className="mt-2 text-xs font-semibold text-brand-green">
+          {propagateMessage}
         </p>
       )}
     </div>

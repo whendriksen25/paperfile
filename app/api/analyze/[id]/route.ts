@@ -243,6 +243,23 @@ export async function POST(
     let shareLink: string | null = doc.dropbox_shared_link;
     try {
       newPath = await storage.moveFile(doc.dropbox_path, destination);
+      // ORPHAN PREVENTION: write the new path to the row IMMEDIATELY after
+      // the move succeeds — as a small, fast UPDATE that's very unlikely to
+      // time out. The big "everything else" UPDATE below can fail or get
+      // truncated by Vercel's function timeout without leaving the row
+      // pointing at a stale inbox path. This was the root cause of the
+      // four orphans we recovered manually on Apr 27.
+      try {
+        await admin
+          .from("documents")
+          .update({ dropbox_path: newPath })
+          .eq("id", id);
+      } catch (e) {
+        console.warn(
+          "[api/analyze] fast-write of dropbox_path failed (will retry in main update)",
+          e
+        );
+      }
       shareLink = await storage.getOrCreateShareLink(newPath);
     } catch (e) {
       console.warn("[api/analyze] move/share failed, keeping inbox path", e);
