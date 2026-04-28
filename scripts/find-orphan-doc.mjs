@@ -9,6 +9,11 @@
 //
 // Usage:
 //   node --env-file=.env.local scripts/find-orphan-doc.mjs <doc-id-or-prefix>
+//
+//   # Once you've confirmed where the file actually lives, repoint the row:
+//   node --env-file=.env.local scripts/find-orphan-doc.mjs <id-prefix> \
+//        --fix-with="/Archive/Pa/2024/letter/20240115_benu_direct_hulpmiddelenzorg.jpg"
+//
 // Example:
 //   node --env-file=.env.local scripts/find-orphan-doc.mjs 6a36d71a
 
@@ -16,9 +21,13 @@ import { Dropbox } from "dropbox";
 import { createClient } from "@supabase/supabase-js";
 
 const args = process.argv.slice(2);
-const docArg = args[0];
+const docArg = args.find((a) => !a.startsWith("--"));
+const fixWithArg = args.find((a) => a.startsWith("--fix-with="));
+const fixWithPath = fixWithArg
+  ? fixWithArg.slice("--fix-with=".length).replace(/^['"]|['"]$/g, "")
+  : null;
 if (!docArg) {
-  console.error("Usage: node scripts/find-orphan-doc.mjs <doc-id-or-prefix>");
+  console.error("Usage: node scripts/find-orphan-doc.mjs <doc-id-or-prefix> [--fix-with=<dropbox-path>]");
   process.exit(1);
 }
 
@@ -58,17 +67,32 @@ async function main() {
     fetch: patchedFetch,
   });
 
-  // 1. Find the row. UUID columns can't use LIKE directly, so cast to text
-  // via PostgREST's filter syntax. Accepts either a full UUID or a prefix.
-  const q = supabase
-    .from("documents")
-    .select(
-      "id, file_name, file_size_bytes, content_hash, dropbox_path, sender, document_type, document_date, status, created_at"
-    )
-    .filter("id::text", "like", `${docArg}%`)
-    .limit(5);
-  const { data: rows, error } = await q;
-  if (error) throw error;
+  // 1. Find the row. PostgREST can't LIKE on a uuid column even with a ::text
+  // cast, so accept a full UUID via .eq(), otherwise fetch recent rows and
+  // filter client-side by id prefix.
+  const cols =
+    "id, file_name, file_size_bytes, content_hash, dropbox_path, sender, document_type, document_date, status, created_at";
+  const isFullUuid =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(docArg);
+  let rows;
+  if (isFullUuid) {
+    const { data, error } = await supabase
+      .from("documents")
+      .select(cols)
+      .eq("id", docArg)
+      .limit(5);
+    if (error) throw error;
+    rows = data || [];
+  } else {
+    const { data, error } = await supabase
+      .from("documents")
+      .select(cols)
+      .order("created_at", { ascending: false })
+      .limit(1000);
+    if (error) throw error;
+    const lower = docArg.toLowerCase();
+    rows = (data || []).filter((r) => r.id.toLowerCase().startsWith(lower)).slice(0, 5);
+  }
   if (!rows || rows.length === 0) {
     console.error(`No row found matching id prefix "${docArg}"`);
     process.exit(1);
@@ -90,6 +114,54 @@ async function main() {
   console.log(`  document_date: ${doc.document_date}`);
   console.log(`  status:        ${doc.status}`);
   console.log(`  created_at:    ${doc.created_at}`);
+
+  // Fix mode: repoint the row to a known-good Dropbox path.
+  if (fixWithPath) {
+    console.log(`\n=== Fix mode: repointing to ${fixWithPath} ===`);
+    let meta;
+    try {
+      const r = await dbx.filesGetMetadata({ path: fixWithPath });
+      meta = r.result;
+    } catch (e) {
+      console.error(`  ✗ Path not found in Dropbox: ${e?.error?.error_summary || e?.message}`);
+      process.exit(1);
+    }
+    if (
+      doc.file_size_bytes &&
+      meta.size &&
+      meta.size !== doc.file_size_bytes
+    ) {
+      console.error(
+        `  ✗ Size mismatch: DB row says ${doc.file_size_bytes} bytes, file is ${meta.size}. Refusing to repoint to a different file. Use a script of your own if you really want this.`
+      );
+      process.exit(1);
+    }
+    let newShareLink = null;
+    try {
+      const link = await dbx.sharingCreateSharedLinkWithSettings({ path: fixWithPath });
+      newShareLink = link.result.url.replace("www.dropbox.com", "dl.dropboxusercontent.com");
+    } catch {
+      try {
+        const existing = await dbx.sharingListSharedLinks({ path: fixWithPath, direct_only: true });
+        if (existing.result.links.length) {
+          newShareLink = existing.result.links[0].url.replace("www.dropbox.com", "dl.dropboxusercontent.com");
+        }
+      } catch {}
+    }
+    const update = { dropbox_path: meta.path_display || fixWithPath };
+    if (newShareLink) update.dropbox_shared_link = newShareLink;
+    const { error: upErr } = await supabase
+      .from("documents")
+      .update(update)
+      .eq("id", doc.id);
+    if (upErr) {
+      console.error(`  ✗ DB update failed: ${upErr.message}`);
+      process.exit(1);
+    }
+    console.log(`  ✓ Row updated. dropbox_path → ${update.dropbox_path}`);
+    if (newShareLink) console.log(`  ✓ Share link refreshed.`);
+    return;
+  }
 
   // 2. Try the exact path
   console.log("\n=== Direct lookup ===");
