@@ -161,6 +161,34 @@ export default async function DocumentDetail({
         />
       )}
 
+      {(() => {
+        // First-seen-sender prompt: nudges the user to verify profile +
+        // type on the very first doc from a new sender. Their correction
+        // (if any) seeds the sender-history pattern that all future docs
+        // from this sender will benefit from.
+        const ef = doc.extracted_fields as Record<string, unknown> | null;
+        const isFirstSeen = ef?.["_first_seen_sender"] === true;
+        if (!isFirstSeen) return null;
+        return (
+          <div className="surface p-4 mb-5 bg-amber-50 border-amber-300">
+            <div className="flex items-start gap-3">
+              <Sparkles className="h-4 w-4 text-amber-700 shrink-0 mt-0.5" />
+              <div>
+                <div className="text-sm font-bold text-amber-900">
+                  First document from {doc.sender || "this sender"}
+                </div>
+                <p className="text-xs text-amber-800 mt-0.5">
+                  Quickly check the profile and category below — your
+                  correction (if any) sets the pattern Paperfile will use
+                  for every future document from{" "}
+                  {doc.sender || "this sender"}.
+                </p>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
       {/* Two-pane layout: source on left, AI suggestions on right */}
       <div className="grid lg:grid-cols-2 gap-5 mb-5">
         {/* Source document */}

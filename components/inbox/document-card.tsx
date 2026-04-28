@@ -98,11 +98,24 @@ export function DocumentCard({
         <div className="min-w-0 flex-1">
           <div className="flex items-start justify-between gap-3">
             <div className="min-w-0">
-              <h3 className="text-sm font-bold text-foreground truncate">
-                {doc.title ||
-                  parseStoragePath(doc.dropbox_path).filename ||
-                  doc.file_name ||
-                  "Untitled document"}
+              <h3 className="text-sm font-bold text-foreground truncate flex items-center gap-2">
+                <span className="truncate">
+                  {doc.title ||
+                    parseStoragePath(doc.dropbox_path).filename ||
+                    doc.file_name ||
+                    "Untitled document"}
+                </span>
+                {/* "New sender" pill — surfaces when this is the very first
+                   doc from a previously-unseen sender. The detail page also
+                   shows a fuller verification banner; the pill is the
+                   at-a-glance signal in the inbox. */}
+                {(doc.extracted_fields as Record<string, unknown> | null)?.[
+                  "_first_seen_sender"
+                ] === true && (
+                  <span className="pill bg-amber-100 text-amber-800 shrink-0 text-[10px] font-bold uppercase tracking-wider">
+                    New sender
+                  </span>
+                )}
               </h3>
               <p
                 className={`text-xs truncate mt-0.5 ${

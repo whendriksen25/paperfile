@@ -170,3 +170,35 @@ export async function getSenderHistory(
 }
 
 export { normalizeSender };
+
+/**
+ * Count of prior processed documents from the given sender, scoped to
+ * one user, excluding `excludeDocId` (the one being analysed).
+ *
+ * Returns 0 when this sender has never been seen by the user before —
+ * that's the signal the analyze route uses to mark the doc with a
+ * `_first_seen_sender` flag, which the UI then surfaces as a "please
+ * verify" prompt.
+ */
+export async function countPriorDocsFromSender(
+  admin: SupabaseClient,
+  userId: string,
+  senderRaw: string | null | undefined,
+  excludeDocId: string | null
+): Promise<number> {
+  const sNorm = normalizeSender(senderRaw);
+  if (sNorm.length < 3) return 0;
+  const { data: rows, error } = await admin
+    .from("documents")
+    .select("id, sender, status")
+    .eq("user_id", userId)
+    .eq("status", "processed")
+    .not("sender", "is", null);
+  if (error) return 0;
+  const matching = (rows || []).filter(
+    (r) =>
+      r.id !== excludeDocId &&
+      normalizeSender(r.sender as string) === sNorm
+  );
+  return matching.length;
+}

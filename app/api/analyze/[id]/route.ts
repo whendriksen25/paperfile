@@ -11,6 +11,7 @@ import {
 import {
   getSenderHistory,
   shouldApplyHistoryOverride,
+  countPriorDocsFromSender,
 } from "@/lib/services/sender-history";
 
 const PROFILE_AUTO_ASSIGN_THRESHOLD = 0.7;
@@ -112,6 +113,31 @@ export async function POST(
     // After the two early returns above, `result` is necessarily a
     // DocumentExtraction. TS can't narrow through the in-check, so cast.
     const extraction = result as Exclude<typeof result, { error: string }>;
+
+    // 2.4. First-seen-sender detection. If the user has never had a
+    // processed doc from this sender before, mark this one with a
+    // _first_seen_sender flag. The UI uses it to nudge the user to
+    // verify profile + classification on the first appearance — the
+    // best moment to seed the pattern for all future docs from that
+    // sender.
+    let firstSeenSender = false;
+    try {
+      const priorCount = await countPriorDocsFromSender(
+        admin,
+        user.id,
+        extraction.sender,
+        id
+      );
+      firstSeenSender = priorCount === 0 && !!extraction.sender;
+      if (firstSeenSender) {
+        console.log(
+          "[api/analyze] first time we've seen sender:",
+          extraction.sender
+        );
+      }
+    } catch (e) {
+      console.warn("[api/analyze] first-seen-sender lookup failed", e);
+    }
 
     // 2.5. Sender-history learning: if the user has historically filed
     // multiple docs from this same sender as type X, and Claude just said
@@ -367,6 +393,7 @@ export async function POST(
               }
             : undefined,
           _type_history_override: historyOverride || undefined,
+          _first_seen_sender: firstSeenSender || undefined,
         },
         ocr_text: extraction.ocr_text || null,
         needs_action: needsAction,
