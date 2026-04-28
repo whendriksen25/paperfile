@@ -203,10 +203,17 @@ async function main() {
   if (forceSender) {
     // Targeted force-mode: skip thresholds, just move every matching doc.
     // Trust the user — they're saying "I know what these should be."
+    //
+    // Match strategy: SUBSTRING on the normalised sender, not exact equality.
+    // "BENU" should match "BENU", "BENU Direct", "BENU Apotheek", "BENU
+    // Direct Hulpmiddelenzorg" — they're all the same real-world brand
+    // showing up under different document headers. This is safe in force
+    // mode because the user typed the substring deliberately.
     const targetNorm = normalizeSender(forceSender);
     let matchedSenders = 0;
     for (const [, group] of byUserSender) {
-      if (normalizeSender(group[0].sender) !== targetNorm) continue;
+      const groupNorm = normalizeSender(group[0].sender);
+      if (!groupNorm.includes(targetNorm)) continue;
       matchedSenders++;
       console.log(
         `  sender "${group[0].sender}" — force to ${forceToType} (${group.length} doc(s))`
@@ -225,7 +232,7 @@ async function main() {
     }
     if (matchedSenders === 0) {
       console.log(
-        `  no docs found for sender matching "${forceSender}" (normalised: "${targetNorm}")`
+        `  no docs found for sender containing "${forceSender}" (normalised: "${targetNorm}")`
       );
     }
   } else {
