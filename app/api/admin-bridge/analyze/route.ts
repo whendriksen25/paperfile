@@ -65,8 +65,9 @@ export async function POST(request: NextRequest) {
     const note = [
       "Claude's response wasn't valid JSON.",
       `stop_reason: ${result.stop_reason || "unknown"}`,
-      "First 500 chars:",
-      result.raw_text.slice(0, 500),
+      `Response length: ${result.raw_text.length} chars`,
+      "Raw response (first 4000 chars):",
+      result.raw_text.slice(0, 4000),
     ].join("\n");
     await admin
       .from("documents")

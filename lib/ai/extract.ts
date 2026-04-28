@@ -53,21 +53,101 @@ function stripTrailingCommas(s: string): string {
 }
 
 /**
+ * Walk char-by-char and escape anything inside a string value that JSON.parse
+ * would reject. Specifically: literal newlines, carriage returns, tabs, and
+ * control characters under 0x20 — Claude sometimes preserves these literally
+ * inside long ocr_text values, which JSON forbids.
+ *
+ * Operates only inside string contexts (between unescaped double quotes)
+ * so structural JSON outside strings is untouched.
+ */
+function escapeControlCharsInStrings(s: string): string {
+  let out = "";
+  let inString = false;
+  let escape = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    const code = s.charCodeAt(i);
+    if (escape) {
+      out += c;
+      escape = false;
+      continue;
+    }
+    if (c === "\\" && inString) {
+      out += c;
+      escape = true;
+      continue;
+    }
+    if (c === '"') {
+      inString = !inString;
+      out += c;
+      continue;
+    }
+    if (inString) {
+      if (c === "\n") {
+        out += "\\n";
+        continue;
+      }
+      if (c === "\r") {
+        out += "\\r";
+        continue;
+      }
+      if (c === "\t") {
+        out += "\\t";
+        continue;
+      }
+      if (code < 0x20) {
+        // strip other control chars — JSON forbids them in strings
+        continue;
+      }
+    }
+    out += c;
+  }
+  return out;
+}
+
+/**
+ * Replace smart double-quotes with regular ones GLOBALLY. Risk: corrupts
+ * a string that legitimately contained a curly quote. In practice OCR
+ * text rarely needs them, and the alternative (failed parse) is worse.
+ */
+function normalizeSmartQuotes(s: string): string {
+  return s
+    .replace(/[“”„‟″‶]/g, '"')
+    .replace(/[‘’‚‛′‵]/g, "'")
+    .replace(/^﻿/, ""); // strip BOM if present
+}
+
+/**
  * Try increasingly aggressive parses until one works. We prefer the
  * cleanest input but degrade gracefully:
  *  1. raw text
  *  2. text with code fence removed
  *  3. first balanced {…} sliced out
  *  4. that slice with trailing commas removed
+ *  5. with smart quotes normalised
+ *  6. with control chars escaped inside strings
+ *  7. combo: smart-quote + control-char fix + trailing-comma strip
  * Returns null if everything fails (truncation, gibberish, etc.).
  */
 function safeParseJSON(s: string): Record<string, unknown> | null {
   if (!s) return null;
-  const candidates = [s, stripCodeFence(s)];
-  const obj = extractFirstObject(s) || extractFirstObject(stripCodeFence(s));
+  const fenced = stripCodeFence(s);
+  const obj = extractFirstObject(s) || extractFirstObject(fenced);
+  const candidates: string[] = [s, fenced];
   if (obj) {
     candidates.push(obj);
     candidates.push(stripTrailingCommas(obj));
+    const smartFixed = normalizeSmartQuotes(obj);
+    candidates.push(smartFixed);
+    const ctrlFixed = escapeControlCharsInStrings(obj);
+    candidates.push(ctrlFixed);
+    // Belt + braces: every fix combined.
+    candidates.push(
+      stripTrailingCommas(
+        escapeControlCharsInStrings(normalizeSmartQuotes(obj))
+      )
+    );
   }
   for (const cand of candidates) {
     try {

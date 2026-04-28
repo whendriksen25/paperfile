@@ -93,15 +93,16 @@ export async function POST(
           ? "Claude's response was cut off (max_tokens). Try Re-analyse — the parser now allows 16k tokens."
           : "Claude's response wasn't valid JSON.",
         `stop_reason: ${result.stop_reason || "unknown"}`,
-        "First 500 chars of the response:",
-        result.raw_text.slice(0, 500),
+        `Response length: ${result.raw_text.length} chars`,
+        "Raw response (first 4000 chars):",
+        result.raw_text.slice(0, 4000),
       ].join("\n");
       await admin
         .from("documents")
         .update({
           status: "failed",
           needs_review: true,
-          review_notes: note.slice(0, 4000),
+          review_notes: note.slice(0, 8000),
         })
         .eq("id", id);
       return NextResponse.json(
