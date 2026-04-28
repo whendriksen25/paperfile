@@ -8,8 +8,17 @@
 // intent to every existing CAK doc.
 //
 // Usage:
+//   # Default: apply sender-history rules to all docs (subject to 80%
+//   # threshold, no-generic-winner guard, no-downgrade guard).
 //   node --env-file=.env.local scripts/reclassify-by-sender-history.mjs --dry-run
 //   node --env-file=.env.local scripts/reclassify-by-sender-history.mjs
+//
+//   # Targeted force-mode: skip the threshold and rules entirely, just
+//   # move every doc from the named sender to the given type. Useful for
+//   # senders with too few docs to ever cross 80%, or when you want to
+//   # propagate a one-time correction across the archive.
+//   node --env-file=.env.local scripts/reclassify-by-sender-history.mjs \
+//        --force-sender="CAK" --to-type=medical_bill --dry-run
 //
 // Strictly read-only in dry-run mode.
 
@@ -20,6 +29,15 @@ const args = process.argv.slice(2);
 const dryRun = args.includes("--dry-run");
 const userArg = args.find((a) => a.startsWith("--user="));
 const userEmail = userArg ? userArg.split("=")[1] : null;
+const forceSenderArg = args.find((a) => a.startsWith("--force-sender="));
+const toTypeArg = args.find((a) => a.startsWith("--to-type="));
+const stripQuotes = (s) => s.replace(/^['"]|['"]$/g, "");
+const forceSender = forceSenderArg ? stripQuotes(forceSenderArg.split("=").slice(1).join("=")) : null;
+const forceToType = toTypeArg ? stripQuotes(toTypeArg.split("=").slice(1).join("=")) : null;
+if ((forceSender && !forceToType) || (!forceSender && forceToType)) {
+  console.error("--force-sender and --to-type must be used together");
+  process.exit(1);
+}
 
 function need(k) {
   const v = process.env[k];
@@ -181,39 +199,71 @@ async function main() {
   });
 
   const plans = [];
-  for (const [key, group] of byUserSender) {
-    if (group.length < 2) continue;
 
-    // Tally with double weight for user-confirmed docs
-    const tally = new Map();
-    for (const d of group) {
-      const w = d.needs_review === false ? 2 : 1;
-      tally.set(d.document_type, (tally.get(d.document_type) || 0) + w);
-    }
-    const sorted = Array.from(tally.entries()).sort((a, b) => b[1] - a[1]);
-    const totalVotes = sorted.reduce((s, [, v]) => s + v, 0);
-    const [winnerType, winnerVotes] = sorted[0];
-    const ratio = winnerVotes / totalVotes;
-    if (ratio < HISTORY_RATIO_THRESHOLD) continue;
-    // Don't propagate "other"/"letter" wins — generic types as the winner
-    // mean we'd be degrading classification, not improving it.
-    if (GENERIC_TYPES.has(winnerType)) continue;
-
-    for (const d of group) {
-      if (!shouldApplyOverride(d.document_type, winnerType)) continue;
-      plans.push({
-        doc: d,
-        from_type: d.document_type,
-        to_type: winnerType,
-        sender: d.sender,
-        votes: winnerVotes,
-        total: totalVotes,
-      });
-    }
-    if (plans.some((p) => p.doc.user_id === group[0].user_id && normalizeSender(p.sender) === normalizeSender(group[0].sender))) {
+  if (forceSender) {
+    // Targeted force-mode: skip thresholds, just move every matching doc.
+    // Trust the user — they're saying "I know what these should be."
+    const targetNorm = normalizeSender(forceSender);
+    let matchedSenders = 0;
+    for (const [, group] of byUserSender) {
+      if (normalizeSender(group[0].sender) !== targetNorm) continue;
+      matchedSenders++;
       console.log(
-        `  sender "${group[0].sender}" → ${winnerType} (${winnerVotes}/${totalVotes}); will reclassify ${plans.filter((p) => normalizeSender(p.sender) === normalizeSender(group[0].sender)).length} doc(s)`
+        `  sender "${group[0].sender}" — force to ${forceToType} (${group.length} doc(s))`
       );
+      for (const d of group) {
+        if (d.document_type === forceToType) continue; // already correct
+        plans.push({
+          doc: d,
+          from_type: d.document_type,
+          to_type: forceToType,
+          sender: d.sender,
+          votes: 0,
+          total: 0,
+        });
+      }
+    }
+    if (matchedSenders === 0) {
+      console.log(
+        `  no docs found for sender matching "${forceSender}" (normalised: "${targetNorm}")`
+      );
+    }
+  } else {
+    // Default mode: history-driven, with all the safety guards.
+    for (const [, group] of byUserSender) {
+      if (group.length < 2) continue;
+
+      // Tally with double weight for user-confirmed docs
+      const tally = new Map();
+      for (const d of group) {
+        const w = d.needs_review === false ? 2 : 1;
+        tally.set(d.document_type, (tally.get(d.document_type) || 0) + w);
+      }
+      const sorted = Array.from(tally.entries()).sort((a, b) => b[1] - a[1]);
+      const totalVotes = sorted.reduce((s, [, v]) => s + v, 0);
+      const [winnerType, winnerVotes] = sorted[0];
+      const ratio = winnerVotes / totalVotes;
+      if (ratio < HISTORY_RATIO_THRESHOLD) continue;
+      if (GENERIC_TYPES.has(winnerType)) continue;
+
+      let groupPlanCount = 0;
+      for (const d of group) {
+        if (!shouldApplyOverride(d.document_type, winnerType)) continue;
+        plans.push({
+          doc: d,
+          from_type: d.document_type,
+          to_type: winnerType,
+          sender: d.sender,
+          votes: winnerVotes,
+          total: totalVotes,
+        });
+        groupPlanCount++;
+      }
+      if (groupPlanCount > 0) {
+        console.log(
+          `  sender "${group[0].sender}" → ${winnerType} (${winnerVotes}/${totalVotes}); will reclassify ${groupPlanCount} doc(s)`
+        );
+      }
     }
   }
 
