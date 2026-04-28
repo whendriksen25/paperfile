@@ -107,6 +107,29 @@ function escapeControlCharsInStrings(s: string): string {
 }
 
 /**
+ * Repair Claude's "inline editorial commentary inside an array element"
+ * tic, which produces JSON like:
+ *   "handwritten_notes": ["Voldaan" - handwritten across the document]
+ * The pattern is: a quoted string immediately followed by content that's
+ * NOT valid JSON syntax (comma, close-bracket/brace, colon, whitespace),
+ * eventually followed by a comma or close-bracket. We strip that trailing
+ * commentary, keeping just the quoted string.
+ *
+ * Safe outside arrays too — the "must be followed by , or ] or }" lookahead
+ * means we only match when the text is in an array element position.
+ */
+function repairArrayCommentary(s: string): string {
+  return s.replace(
+    // Group 1: a JSON string literal (handles \" escapes).
+    // Then optional whitespace + a hyphen, em-dash, en-dash or open paren.
+    // Then non-bracket/brace/comma chars (the commentary).
+    // Lookahead: must be followed by a JSON terminator.
+    /("(?:[^"\\]|\\.)*")\s*[-–—(][^,\]}]+(?=[,\]}])/g,
+    "$1"
+  );
+}
+
+/**
  * Replace smart double-quotes with regular ones GLOBALLY. Risk: corrupts
  * a string that legitimately contained a curly quote. In practice OCR
  * text rarely needs them, and the alternative (failed parse) is worse.
@@ -142,10 +165,14 @@ function safeParseJSON(s: string): Record<string, unknown> | null {
     candidates.push(smartFixed);
     const ctrlFixed = escapeControlCharsInStrings(obj);
     candidates.push(ctrlFixed);
+    const arrayFixed = repairArrayCommentary(obj);
+    candidates.push(arrayFixed);
     // Belt + braces: every fix combined.
     candidates.push(
       stripTrailingCommas(
-        escapeControlCharsInStrings(normalizeSmartQuotes(obj))
+        repairArrayCommentary(
+          escapeControlCharsInStrings(normalizeSmartQuotes(obj))
+        )
       )
     );
   }

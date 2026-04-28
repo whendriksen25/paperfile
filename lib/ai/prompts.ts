@@ -93,6 +93,8 @@ ${buildLineItemCategoryBlock()}
 
 - HANDWRITTEN ANNOTATIONS — capture any other handwritten text (notes, signatures, references, names) in extracted_fields.handwritten_notes as an array of short strings, verbatim. This helps the user see what was added by hand on top of the printed document.
 
+- ARRAY ELEMENTS MUST BE VALID JSON. This applies to handwritten_notes, tags, line_items, and every other array. Each element is a plain JSON value — a quoted string, a number, an object — with NO inline editorial commentary outside the quotes. WRONG: ["Voldaan" - handwritten across the document]. RIGHT: ["Voldaan"]  or  ["Voldaan (handwritten across document)"]. If you want to describe HOW the note appears (handwritten, stamped, in red ink, etc.), include that description INSIDE the quoted string, never after the closing quote.
+
 - If a field is not present on the document, use null (or omit from extracted_fields). Never invent data.
 - For languages other than English, translate "title", "summary", and "tags" into English but keep "ocr_text" AND line_items descriptions in the original language.
 - "needs_action" should be true ONLY for documents that imply concrete action by the recipient. Routine confirmations, archived statements, and informational letters should be false.
