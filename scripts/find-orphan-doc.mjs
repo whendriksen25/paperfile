@@ -58,13 +58,14 @@ async function main() {
     fetch: patchedFetch,
   });
 
-  // 1. Find the row
-  let q = supabase
+  // 1. Find the row. UUID columns can't use LIKE directly, so cast to text
+  // via PostgREST's filter syntax. Accepts either a full UUID or a prefix.
+  const q = supabase
     .from("documents")
     .select(
       "id, file_name, file_size_bytes, content_hash, dropbox_path, sender, document_type, document_date, status, created_at"
     )
-    .like("id", `${docArg}%`)
+    .filter("id::text", "like", `${docArg}%`)
     .limit(5);
   const { data: rows, error } = await q;
   if (error) throw error;
