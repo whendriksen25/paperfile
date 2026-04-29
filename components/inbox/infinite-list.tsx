@@ -31,6 +31,7 @@ export function InboxInfiniteList({
     profile_id?: string | null;
     batch?: string | null;
     needs_review?: string | null;
+    q?: string | null;
   };
   /** Map keyed by profile id; serialised as a plain object across the boundary. */
   profilesById: Record<number, ProfileRow>;
@@ -59,6 +60,7 @@ export function InboxInfiniteList({
       if (filters.profile_id) params.set("profile_id", filters.profile_id);
       if (filters.batch) params.set("batch", filters.batch);
       if (filters.needs_review) params.set("needs_review", filters.needs_review);
+      if (filters.q) params.set("q", filters.q);
 
       const res = await fetch(`/api/documents?${params.toString()}`, {
         cache: "no-store",

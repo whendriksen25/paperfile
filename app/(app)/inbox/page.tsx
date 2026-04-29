@@ -7,7 +7,7 @@ import { InboxInfiniteList } from "@/components/inbox/infinite-list";
 import { ProfileSelector } from "@/components/layout/profile-selector";
 import { ExportToDropboxButton } from "@/components/inbox/export-button";
 import { SanityCheckButton } from "@/components/inbox/sanity-check-button";
-import { Search } from "lucide-react";
+import { SearchInput } from "@/components/inbox/search-input";
 import { titleCase } from "@/lib/utils/format";
 import {
   INBOX_CARD_FIELDS,
@@ -29,6 +29,7 @@ export default async function InboxPage({
     type?: string;
     group?: string;
     needs_review?: string;
+    q?: string;
   }>;
 }) {
   const sp = await searchParams;
@@ -66,6 +67,15 @@ export default async function InboxPage({
   if (sp.type) q = q.eq("document_type", sp.type);
   if (triage) {
     q = q.or("primary_profile_id.is.null,needs_review.eq.true");
+  }
+  // Search: uses the existing `fts` GIN index (same machinery as /search).
+  // websearch syntax accepts quoted phrases and AND/OR semantics naturally.
+  const searchQuery = (sp.q || "").trim();
+  if (searchQuery) {
+    q = q.textSearch("fts", searchQuery, {
+      type: "websearch",
+      config: "simple",
+    });
   }
 
   // Category counts come from a server-side GROUP BY function instead of
@@ -211,14 +221,7 @@ export default async function InboxPage({
       )}
 
       <div className="mb-5">
-        <div className="relative">
-          <Search className="h-4 w-4 text-muted-foreground absolute left-4 top-1/2 -translate-y-1/2" />
-          <input
-            placeholder="Search documents…"
-            className="input-pill pl-11"
-            disabled
-          />
-        </div>
+        <SearchInput />
       </div>
 
       {error ? (
@@ -242,7 +245,7 @@ export default async function InboxPage({
         // filter (e.g. Pa → Suus) leaves stale Pa cards on screen even
         // though the server returns the right Suus docs.
         <InboxInfiniteList
-          key={`inbox:${sp.profile_id || "all"}:${sp.type || "all"}:${sp.batch || "all"}:${sp.needs_review || "0"}`}
+          key={`inbox:${sp.profile_id || "all"}:${sp.type || "all"}:${sp.batch || "all"}:${sp.needs_review || "0"}:${searchQuery || "all"}`}
           initialDocs={docs}
           initialNextCursor={initialNextCursor}
           pageSize={INBOX_PAGE_SIZE}
@@ -251,6 +254,7 @@ export default async function InboxPage({
             profile_id: sp.profile_id || null,
             batch: sp.batch || null,
             needs_review: sp.needs_review || null,
+            q: searchQuery || null,
           }}
           profilesById={Object.fromEntries(profilesById)}
         />
