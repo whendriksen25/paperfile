@@ -19,7 +19,9 @@ export async function GET(request: NextRequest) {
 
   let query = supabase
     .from("actions")
-    .select("*, document:documents(id, title, sender, document_type, file_name, dropbox_path)")
+    .select(
+      "*, document:documents(id, title, sender, document_type, file_name, file_type, dropbox_path, amount, currency, extracted_fields)"
+    )
     .order("due_date", { ascending: true, nullsFirst: false })
     .order("created_at", { ascending: false })
     .limit(200);

@@ -17,6 +17,8 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Spinner } from "@/components/ui/spinner";
 import { ProfileSelector } from "@/components/layout/profile-selector";
+import { DocumentPreview } from "@/components/inbox/document-preview";
+import { PaymentHelper } from "@/components/actions/payment-helper";
 import { formatDate, titleCase } from "@/lib/utils/format";
 import type { ActionRow } from "@/types/document";
 
@@ -27,7 +29,11 @@ interface ActionWithDoc extends ActionRow {
     sender: string | null;
     document_type: string | null;
     file_name: string | null;
+    file_type: string | null;
     dropbox_path: string | null;
+    amount: number | null;
+    currency: string | null;
+    extracted_fields: Record<string, unknown> | null;
   } | null;
 }
 
@@ -565,24 +571,67 @@ function FocusedAction({
         </div>
       </div>
 
-      {/* Source preview */}
+      {/* Payment helper — only for `pay` actions, only when we have an
+          IBAN. Lets the user complete the payment without leaving /actions. */}
+      {isPay && action.document && (
+        <PaymentHelper
+          amount={
+            action.document.amount ??
+            (action.document.extracted_fields?.["total_incl"] as number | null) ??
+            null
+          }
+          currency={action.document.currency || "EUR"}
+          iban={
+            (action.document.extracted_fields?.["payment_iban"] as
+              | string
+              | null) ||
+            (action.document.extracted_fields?.["iban"] as string | null) ||
+            null
+          }
+          reference={
+            (action.document.extracted_fields?.["payment_reference"] as
+              | string
+              | null) ||
+            (action.document.extracted_fields?.["invoice_number"] as
+              | string
+              | null) ||
+            null
+          }
+          beneficiary={
+            (action.document.extracted_fields?.["beneficiary"] as
+              | string
+              | null) ||
+            action.document.sender ||
+            null
+          }
+          bic={
+            (action.document.extracted_fields?.["bic"] as string | null) ||
+            null
+          }
+        />
+      )}
+
+      {/* Inline source preview — replaces the old placeholder + navigate-away
+          link. The user can review the actual doc here without leaving. */}
       {action.document && (
-        <div className="surface p-5">
-          <div className="section-label mb-2">Source File</div>
-          <Link
-            href={`/document/${action.document.id}`}
-            className="block group"
-          >
-            <div className="rounded-2xl bg-muted/40 aspect-[4/3] flex items-center justify-center text-muted-foreground text-xs mb-3">
-              Document preview
-            </div>
-            <div className="text-[10px] font-bold uppercase tracking-wider text-brand-purple">
-              Filename
-            </div>
-            <div className="text-sm font-bold truncate group-hover:underline">
-              {action.document.title || action.document.file_name}
-            </div>
-          </Link>
+        <div className="surface p-5 space-y-3">
+          <div className="flex items-center justify-between">
+            <div className="section-label">Source document</div>
+            <Link
+              href={`/document/${action.document.id}`}
+              className="text-xs text-muted-foreground hover:text-foreground"
+            >
+              Open full →
+            </Link>
+          </div>
+          <DocumentPreview
+            id={action.document.id}
+            fileName={action.document.file_name}
+            fileType={action.document.file_type}
+          />
+          <div className="text-sm font-semibold truncate">
+            {action.document.title || action.document.file_name}
+          </div>
         </div>
       )}
 

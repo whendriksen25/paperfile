@@ -301,16 +301,47 @@ export async function POST(
       )
     );
 
-    // Hard server-side override: a doc that has already been paid never
-    // needs a "pay this" action, regardless of what Claude returned. This
-    // covers the case where a handwritten "PAID 27-11-2025" annotation was
-    // captured but the model still flagged needs_action=true out of habit.
+    // Hard server-side overrides on `needs_action`, symmetric on payment_status:
+    //   - paid    → force needs_action=false (handwritten "Voldaan" / "PAID"
+    //               stamps were captured but Claude still flagged needs_action
+    //               out of habit; we silently close it).
+    //   - unpaid  → force needs_action=true (Claude sometimes treats an
+    //               enforcement order or aanmaning as informational and
+    //               returns needs_action=false even though the doc plainly
+    //               says it's not paid).
+    //   - partial → also forces needs_action=true (still owe money).
+    // Anything else (or "unknown") falls back to whatever Claude returned.
     const ef = extraction.extracted_fields || {};
     const paymentStatus = String(
       (ef as Record<string, unknown>)["payment_status"] || ""
     ).toLowerCase();
     const isPaid = paymentStatus === "paid";
-    const needsAction = isPaid ? false : !!extraction.needs_action;
+    const isUnpaid = paymentStatus === "unpaid" || paymentStatus === "partial";
+    const needsAction = isPaid
+      ? false
+      : isUnpaid
+        ? true
+        : !!extraction.needs_action;
+
+    // When we forced needs_action via the unpaid override AND Claude didn't
+    // populate action_summary / action_type, synthesize sensible defaults
+    // from what we have so the to-do list isn't empty for unpaid bills.
+    let effectiveActionType: string | null =
+      extraction.action_type || (needsAction ? "pay" : null);
+    let effectiveActionSummary = extraction.action_summary || null;
+    if (needsAction && !effectiveActionSummary) {
+      const parts: string[] = ["Pay"];
+      if (extraction.amount != null && !Number.isNaN(Number(extraction.amount))) {
+        const amt = Number(extraction.amount).toFixed(2);
+        const cur = extraction.currency || "EUR";
+        parts.push(`${cur} ${amt}`);
+      }
+      if (extraction.sender) parts.push(`to ${extraction.sender}`);
+      if (extraction.due_date) parts.push(`by ${extraction.due_date}`);
+      effectiveActionSummary = parts.join(" ");
+      // Default action_type to "pay" since we derived this from unpaid status
+      if (!effectiveActionType) effectiveActionType = "pay";
+    }
     const isFinancial = [
       "invoice",
       "receipt",
@@ -398,9 +429,9 @@ export async function POST(
         },
         ocr_text: extraction.ocr_text || null,
         needs_action: needsAction,
-        action_type: needsAction ? extraction.action_type || "other" : null,
+        action_type: needsAction ? effectiveActionType || "other" : null,
         due_date: extraction.due_date || null,
-        action_summary: needsAction ? extraction.action_summary || null : null,
+        action_summary: needsAction ? effectiveActionSummary || null : null,
         handoff_status: isFinancial ? "pending" : "not_applicable",
         // Surface for triage when the assignment is provisional (low-confidence
         // AI guess, name-token match, or completely unassigned). Cleared by
@@ -419,16 +450,18 @@ export async function POST(
     //    e.g. "Pay €76.60" AND "Send to bookkeeping". Each is keyed by
     //    (document_id, action_type) thanks to migration 007.
 
-    // 7a. Pay/respond/sign/etc. action from Claude's needs_action signal.
-    if (needsAction && extraction.action_summary) {
-      const payActionType = extraction.action_type || "other";
+    // 7a. Pay/respond/sign/etc. action — use the EFFECTIVE values so
+    //     unpaid-but-Claude-said-no-action docs still get an action row
+    //     with a synthesized summary.
+    if (needsAction && effectiveActionSummary) {
+      const payActionType = effectiveActionType || "other";
       const { error: actionErr } = await admin.from("actions").upsert(
         {
           user_id: user.id,
           document_id: id,
           profile_id: profileId,
           action_type: payActionType,
-          summary: extraction.action_summary,
+          summary: effectiveActionSummary,
           due_date: extraction.due_date || null,
           status: "open",
         },
