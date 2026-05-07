@@ -20,7 +20,40 @@ import { ProfileSelector } from "@/components/layout/profile-selector";
 import { DocumentPreview } from "@/components/inbox/document-preview";
 import { PaymentHelper } from "@/components/actions/payment-helper";
 import { formatDate, titleCase } from "@/lib/utils/format";
+import { useProfiles } from "@/hooks/useProfiles";
 import type { ActionRow } from "@/types/document";
+
+/**
+ * Pull a SEPA IBAN from a doc's extracted_fields.
+ *
+ *  1. Try the canonical keys first (payment_iban / iban / account_iban).
+ *  2. If still nothing, scan ALL string-valued fields for an IBAN-shaped
+ *     token. Catches the case where Claude jammed the IBAN into
+ *     payment_reference (literally seen on B.R. de Klyn invoices) or any
+ *     other unexpected key.
+ *
+ * Returns null when no match is found.
+ */
+function extractIban(ef: Record<string, unknown> | null | undefined): string | null {
+  if (!ef) return null;
+  const direct =
+    (ef["payment_iban"] as string | undefined) ||
+    (ef["iban"] as string | undefined) ||
+    (ef["account_iban"] as string | undefined);
+  if (typeof direct === "string" && /^[A-Z]{2}\d{2}[A-Z0-9]{4,30}$/i.test(direct.replace(/\s+/g, ""))) {
+    return direct.replace(/\s+/g, "").toUpperCase();
+  }
+  // Scan every string-valued field for an IBAN match. Returns the first hit.
+  const ibanRe = /\b[A-Z]{2}\d{2}[A-Z0-9]{4,30}\b/i;
+  for (const v of Object.values(ef)) {
+    if (typeof v === "string") {
+      const compact = v.replace(/\s+/g, "");
+      const m = compact.match(ibanRe);
+      if (m) return m[0].toUpperCase();
+    }
+  }
+  return null;
+}
 
 interface ActionWithDoc extends ActionRow {
   document: {
@@ -48,6 +81,9 @@ export default function ActionsPage() {
   // Whether the user has connected Google Tasks — controls visibility of
   // the "Send to Google Tasks" button on each focused action.
   const [googleConnected, setGoogleConnected] = useState(false);
+  // Active profile from the global selector — re-fetches actions when the
+  // user picks a different profile from the top-right chip. null = "All".
+  const { activeId } = useProfiles();
 
   useEffect(() => {
     fetch("/api/settings")
@@ -58,7 +94,9 @@ export default function ActionsPage() {
 
   async function load() {
     setLoading(true);
-    const res = await fetch(`/api/actions?status=${filter}`);
+    const params = new URLSearchParams({ status: filter });
+    if (activeId) params.set("profile_id", String(activeId));
+    const res = await fetch(`/api/actions?${params.toString()}`);
     const json = await res.json();
     setItems(json.data || []);
     setLoading(false);
@@ -67,7 +105,7 @@ export default function ActionsPage() {
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filter]);
+  }, [filter, activeId]);
 
   async function update(id: string, patch: Record<string, unknown>) {
     setItems((s) =>
@@ -581,13 +619,7 @@ function FocusedAction({
             null
           }
           currency={action.document.currency || "EUR"}
-          iban={
-            (action.document.extracted_fields?.["payment_iban"] as
-              | string
-              | null) ||
-            (action.document.extracted_fields?.["iban"] as string | null) ||
-            null
-          }
+          iban={extractIban(action.document.extracted_fields)}
           reference={
             (action.document.extracted_fields?.["payment_reference"] as
               | string
