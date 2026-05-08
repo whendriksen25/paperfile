@@ -359,15 +359,41 @@ export async function POST(
     let possibleDuplicateOf: string | null = null;
     {
       const senderNorm = (extraction.sender || "").trim();
+      // Transaction-like IDs differentiate genuine duplicates from coincidental
+      // same-day same-amount purchases (two €5 coffees at the same shop).
+      // Try the keys most commonly populated by Claude in order; first hit wins.
+      const txKeys = [
+        "transaction_id",
+        "receipt_number",
+        "invoice_number",
+        "register_id",
+        "reference",
+      ];
+      const getTxId = (
+        ef: Record<string, unknown> | null | undefined
+      ): string | null => {
+        if (!ef) return null;
+        for (const k of txKeys) {
+          const v = ef[k];
+          if (typeof v === "string" && v.trim()) return v.trim();
+          if (typeof v === "number") return String(v);
+        }
+        return null;
+      };
+      const myTxId = getTxId(extraction.extracted_fields as Record<string, unknown>);
+
       if (
         senderNorm &&
         extraction.document_date &&
         extraction.document_type &&
         extraction.amount != null
       ) {
-        const { data: dupRow } = await admin
+        // Pull up to a handful of candidates matching the loose tuple, then
+        // apply the transaction-id rule client-side. Limited to 5 because
+        // realistic dup sets are 1–2 rows; 5 is plenty of headroom.
+        const { data: candidates } = await admin
           .from("documents")
-          .select("id")
+          .select("id, extracted_fields, created_at")
           .eq("user_id", user.id)
           .neq("id", id)
           .eq("sender", senderNorm)
@@ -375,14 +401,26 @@ export async function POST(
           .eq("document_type", extraction.document_type)
           .eq("amount", extraction.amount)
           .order("created_at", { ascending: true })
-          .limit(1)
-          .maybeSingle();
-        if (dupRow) {
-          possibleDuplicateOf = dupRow.id as string;
+          .limit(5);
+        for (const c of candidates || []) {
+          const theirTxId = getTxId(
+            c.extracted_fields as Record<string, unknown>
+          );
+          // Rule: if BOTH docs expose a transaction-like ID and the IDs
+          // DIFFER, this is NOT a duplicate (different purchases that
+          // happened to share the loose tuple). Skip.
+          if (myTxId && theirTxId && myTxId !== theirTxId) continue;
+          // Otherwise (IDs match, or at least one is missing), treat as a
+          // candidate duplicate. Take the first qualifying candidate.
+          possibleDuplicateOf = c.id as string;
           console.log(
             "[api/analyze] possible duplicate detected — soft-linking to",
-            possibleDuplicateOf
+            possibleDuplicateOf,
+            myTxId && theirTxId
+              ? `(transaction id matched: ${myTxId})`
+              : "(no transaction id to disambiguate)"
           );
+          break;
         }
       }
     }
