@@ -50,7 +50,7 @@ Rules:
 - "extracted_fields" should contain type-specific fields that don't fit the flat schema. Examples:
   - medical_bill: provider, service_date, diagnosis_code, patient_number, patient_code, patient_reference, policy_number, insurer, bsn, birth_date, reimbursable_amount, total_excl, total_vat, total_incl, payment_iban, payment_reference, invoice_number
   - insurance_declaration: declaration_number, claim_period, insurer, insured_person, birth_date, policy_number
-  - bank_statement: account_iban, period_start, period_end, opening_balance, closing_balance, account_holder
+  - bank_statement: account_iban, period_start, period_end, opening_balance, closing_balance, account_holder. For each transaction, populate line_items with: description, total (NEGATIVE for debits / outgoing, POSITIVE for credits / incoming), currency, counterparty_name (the OTHER party — payee for debits, payer for credits), counterparty_iban (if shown), reference (the verbatim payment reference / "Omschrijving" / "Mededeling" — copy it exactly), booking_date and value_date (YYYY-MM-DD), transaction_id (the bank's reference number for that line if any). Skip line items for fees the bank charged its own customer (don't try to reconcile those).
   - contract: parties, effective_date, end_date, contract_reference, national_id
   - invoice: invoice_number, due_date, vat_breakdown, total_excl, total_vat, total_incl, payment_iban, payment_reference, customer_reference
 

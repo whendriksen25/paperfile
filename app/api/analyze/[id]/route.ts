@@ -13,6 +13,9 @@ import {
   shouldApplyHistoryOverride,
   countPriorDocsFromSender,
 } from "@/lib/services/sender-history";
+import { looksLikeCamt053, parseCamt053 } from "@/lib/utils/camt-parser";
+import { reconcileBankStatement } from "@/lib/services/bank-reconciliation";
+import type { DocumentExtraction } from "@/types/document";
 
 const PROFILE_AUTO_ASSIGN_THRESHOLD = 0.7;
 
@@ -61,11 +64,79 @@ export async function POST(
     const storage = getStorage(doc.storage_provider);
     const buffer = await storage.downloadFile(doc.dropbox_path);
 
-    // 2. Run Claude extraction
-    const result = await extractDocument(
-      buffer,
-      doc.file_name || "file.pdf"
-    );
+    // 1.5. CAMT.053 fast path — when the file is a CAMT.053 XML bank
+    // statement (every NL bank exports this under "Periodieke afschriften"),
+    // we parse it deterministically without sending to Claude. Faster,
+    // cheaper, and far more accurate than OCR-from-PDF.
+    let result: Awaited<ReturnType<typeof extractDocument>>;
+    if (looksLikeCamt053(buffer)) {
+      try {
+        const xmlText = buffer.toString("utf8");
+        const stmt = parseCamt053(xmlText);
+        const debits = stmt.transactions.filter((t) => t.amount < 0);
+        const credits = stmt.transactions.filter((t) => t.amount > 0);
+        const totalDebit = debits.reduce((s, t) => s + Math.abs(t.amount), 0);
+        const totalCredit = credits.reduce((s, t) => s + t.amount, 0);
+        const synthetic: DocumentExtraction = {
+          document_type: "bank_statement",
+          document_subtype: null,
+          confidence: 1,
+          document_date: stmt.period_end,
+          sender: null,
+          recipient: stmt.account_holder,
+          language: "nl",
+          profile_hint: stmt.account_holder,
+          amount: stmt.closing_balance,
+          currency: stmt.currency || "EUR",
+          purchase_category: null,
+          title: `Bank statement ${stmt.period_start || ""} – ${stmt.period_end || ""}`.trim(),
+          summary: `${stmt.transactions.length} transactions (${debits.length} debits totalling €${totalDebit.toFixed(2)}, ${credits.length} credits totalling €${totalCredit.toFixed(2)}). Closing balance: ${(stmt.closing_balance ?? 0).toFixed(2)} ${stmt.currency || "EUR"}.`,
+          tags: ["bank_statement", "camt053"],
+          extracted_fields: {
+            account_iban: stmt.account_iban,
+            account_holder: stmt.account_holder,
+            period_start: stmt.period_start,
+            period_end: stmt.period_end,
+            opening_balance: stmt.opening_balance,
+            closing_balance: stmt.closing_balance,
+            currency: stmt.currency,
+            line_items: stmt.transactions.map((t) => ({
+              description:
+                [t.counterparty_name, t.reference].filter(Boolean).join(" — ") ||
+                "(unspecified)",
+              category: "other",
+              total: t.amount,
+              currency: t.currency,
+              reference: t.reference,
+              counterparty_name: t.counterparty_name,
+              counterparty_iban: t.counterparty_iban,
+              transaction_id: t.transaction_id,
+              booking_date: t.booking_date,
+              value_date: t.value_date,
+              cdt_dbt: t.cdt_dbt,
+            })),
+          },
+          ocr_text: undefined,
+          needs_action: false,
+          action_type: null,
+          due_date: null,
+          action_summary: null,
+        };
+        result = synthetic as Awaited<ReturnType<typeof extractDocument>>;
+        console.log(
+          `[api/analyze] CAMT fast-path: ${stmt.transactions.length} transactions parsed`
+        );
+      } catch (e) {
+        console.warn(
+          "[api/analyze] CAMT parse failed, falling back to Claude:",
+          e
+        );
+        result = await extractDocument(buffer, doc.file_name || "file.xml");
+      }
+    } else {
+      // 2. Default path — Claude extraction (PDF, image, etc.)
+      result = await extractDocument(buffer, doc.file_name || "file.pdf");
+    }
 
     if (!result) {
       await admin
@@ -556,8 +627,103 @@ export async function POST(
       }
     }
 
-    console.log("[api/analyze] done", id);
-    return NextResponse.json({ ok: true });
+    // 7c. Bank-statement reconciliation — when this doc IS a bank statement,
+    //     loop its line items and try to auto-close open `pay` actions
+    //     whose source bill matches a debit on the statement. The matched
+    //     source documents get marked `payment_status: "paid"` with the
+    //     statement transaction's date as paid_date. Logged to maintenance_log.
+    let reconciliationSummary: {
+      matched: number;
+      ambiguous: number;
+      unmatched: number;
+      considered: number;
+    } | null = null;
+    if (extraction.document_type === "bank_statement") {
+      try {
+        const items =
+          ((extraction.extracted_fields as Record<string, unknown> | null)?.[
+            "line_items"
+          ] as unknown as Array<Record<string, unknown>>) || [];
+        // Normalise into BankTransactionLike shape — handles both the
+        // CAMT-fast-path output and Claude's PDF extraction.
+        const transactions = items
+          .map((it) => {
+            const totalRaw = it["total"];
+            let total =
+              typeof totalRaw === "number" ? totalRaw : Number(totalRaw);
+            if (!Number.isFinite(total)) return null;
+            // For PDF-extracted statements where Claude may have returned
+            // unsigned amounts but a "cdt_dbt" or similar indicator, infer
+            // the sign from the description as a fallback.
+            const cdtDbt = (it["cdt_dbt"] as string | undefined) || null;
+            if (cdtDbt === "DBIT" && total > 0) total = -total;
+            if (cdtDbt === "CRDT" && total < 0) total = -total;
+            return {
+              amount: total,
+              currency: (it["currency"] as string | undefined) || null,
+              booking_date:
+                (it["booking_date"] as string | undefined) ||
+                (it["transaction_date"] as string | undefined) ||
+                null,
+              value_date:
+                (it["value_date"] as string | undefined) ||
+                (it["transaction_date"] as string | undefined) ||
+                null,
+              counterparty_name:
+                (it["counterparty_name"] as string | undefined) ||
+                (it["description"] as string | undefined) ||
+                null,
+              counterparty_iban:
+                (it["counterparty_iban"] as string | undefined) || null,
+              reference:
+                (it["reference"] as string | undefined) ||
+                (it["description"] as string | undefined) ||
+                null,
+              transaction_id:
+                (it["transaction_id"] as string | undefined) || null,
+            };
+          })
+          .filter(
+            (t): t is NonNullable<typeof t> => t !== null
+          );
+        const r = await reconcileBankStatement(
+          admin,
+          user.id,
+          id,
+          transactions
+        );
+        reconciliationSummary = {
+          matched: r.matched,
+          ambiguous: r.ambiguous,
+          unmatched: r.unmatched,
+          considered: r.considered,
+        };
+        // Persist the summary into extracted_fields so the UI can show it.
+        await admin
+          .from("documents")
+          .update({
+            extracted_fields: {
+              ...(extraction.extracted_fields || {}),
+              _reconciliation: {
+                ran_at: new Date().toISOString(),
+                ...r,
+              },
+            },
+          })
+          .eq("id", id);
+      } catch (e) {
+        console.warn("[api/analyze] reconciliation failed", e);
+      }
+    }
+
+    console.log(
+      "[api/analyze] done",
+      id,
+      reconciliationSummary
+        ? `(reconciled ${reconciliationSummary.matched}/${reconciliationSummary.considered})`
+        : ""
+    );
+    return NextResponse.json({ ok: true, reconciliation: reconciliationSummary });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Analyze failed";
     console.error("[api/analyze] error:", msg);

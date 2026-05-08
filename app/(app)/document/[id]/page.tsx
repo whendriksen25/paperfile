@@ -13,6 +13,7 @@ import { RefileWidget } from "@/components/inbox/refile-widget";
 import { RenameFilenameButton } from "@/components/inbox/rename-filename-button";
 import { DuplicateBanner } from "@/components/inbox/duplicate-banner";
 import { DocumentPreview } from "@/components/inbox/document-preview";
+import { ReconciliationPanel } from "@/components/inbox/reconciliation-panel";
 import {
   ProfileMatchPanel,
   type ProfileMatchInfo,
@@ -159,6 +160,34 @@ export default async function DocumentDetail({
         <DuplicateBanner
           currentId={doc.id}
           duplicate={duplicateOf}
+        />
+      )}
+
+      {doc.document_type === "bank_statement" && (
+        <ReconciliationPanel
+          documentId={doc.id}
+          initial={(() => {
+            const r = (doc.extracted_fields as Record<string, unknown> | null)?.[
+              "_reconciliation"
+            ] as
+              | {
+                  ran_at?: string;
+                  matched?: number;
+                  ambiguous?: number;
+                  unmatched?: number;
+                  considered?: number;
+                }
+              | null
+              | undefined;
+            if (!r) return null;
+            return {
+              ran_at: r.ran_at || null,
+              matched: r.matched ?? 0,
+              ambiguous: r.ambiguous ?? 0,
+              unmatched: r.unmatched ?? 0,
+              considered: r.considered ?? 0,
+            };
+          })()}
         />
       )}
 
