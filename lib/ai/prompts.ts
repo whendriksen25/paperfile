@@ -50,7 +50,17 @@ Rules:
 - "extracted_fields" should contain type-specific fields that don't fit the flat schema. Examples:
   - medical_bill: provider, service_date, diagnosis_code, patient_number, patient_code, patient_reference, policy_number, insurer, bsn, birth_date, reimbursable_amount, total_excl, total_vat, total_incl, payment_iban, payment_reference, invoice_number
   - insurance_declaration: declaration_number, claim_period, insurer, insured_person, birth_date, policy_number
-  - bank_statement: account_iban, period_start, period_end, opening_balance, closing_balance, account_holder. For each transaction, populate line_items with: description, total (NEGATIVE for debits / outgoing, POSITIVE for credits / incoming), currency, counterparty_name (the OTHER party — payee for debits, payer for credits), counterparty_iban (if shown), reference (the verbatim payment reference / "Omschrijving" / "Mededeling" — copy it exactly), booking_date and value_date (YYYY-MM-DD), transaction_id (the bank's reference number for that line if any). Skip line items for fees the bank charged its own customer (don't try to reconcile those).
+  - bank_statement: account_iban, period_start, period_end, opening_balance, closing_balance, account_holder. For each transaction, populate line_items with EVERY one of these fields explicitly (do NOT collapse them all into "description"):
+    - description: a short summary of the transaction
+    - total: NEGATIVE for debits / outgoing, POSITIVE for credits / incoming
+    - currency
+    - counterparty_name: the OTHER party — payee for debits, payer for credits. Strip away the prefix labels like "Naam:", "Begunstigde:", "Tegenrekening naar:". Use ONLY the party's actual name (e.g. for "STICHTING DERDENGELDEN BUCKAROO - Lintberg BV: Lintberg Premium" the counterparty_name is "Lintberg BV" because Buckaroo is just the payment processor).
+    - counterparty_iban: any IBAN visible on this transaction line (e.g. "NL12RABO0123456789"). If the CSV/PDF has a "Tegenrekening" column, that's it. Required when present — Claude often dumps the IBAN into "description"; please separate it.
+    - reference: the verbatim payment reference / "Omschrijving" / "Mededeling" — copy it exactly, including any structured payment reference number.
+    - booking_date (YYYY-MM-DD)
+    - value_date (YYYY-MM-DD if different from booking_date)
+    - transaction_id: the bank's per-line reference number, if any
+  Skip line items for fees the bank charged its own customer (don't try to reconcile those).
   - contract: parties, effective_date, end_date, contract_reference, national_id
   - invoice: invoice_number, due_date, vat_breakdown, total_excl, total_vat, total_incl, payment_iban, payment_reference, customer_reference
 

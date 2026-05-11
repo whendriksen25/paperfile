@@ -9,6 +9,10 @@ import {
 } from "@/lib/utils/format";
 import { Badge } from "@/components/ui/badge";
 import { LineItemsSection, type LineItem } from "@/components/inbox/line-items";
+import {
+  BankTransactionsTable,
+  type BankTx,
+} from "@/components/inbox/bank-transactions-table";
 import { RefileWidget } from "@/components/inbox/refile-widget";
 import { RenameFilenameButton } from "@/components/inbox/rename-filename-button";
 import { DuplicateBanner } from "@/components/inbox/duplicate-banner";
@@ -383,12 +387,22 @@ export default async function DocumentDetail({
         );
       })()}
 
-      {/* Line items table — only present for receipts/invoices/etc with itemised charges */}
+      {/* Line items — different shape for bank statements (transactions
+          with date / counterparty / reference / amount) vs receipts and
+          invoices (items with category / qty / unit / total). */}
       {(() => {
         const items = (doc.extracted_fields as Record<string, unknown> | null)?.[
           "line_items"
         ];
         if (!Array.isArray(items) || items.length === 0) return null;
+        if (doc.document_type === "bank_statement") {
+          return (
+            <BankTransactionsTable
+              transactions={items as BankTx[]}
+              currency={doc.currency}
+            />
+          );
+        }
         return (
           <LineItemsSection
             items={items as LineItem[]}
