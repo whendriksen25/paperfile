@@ -15,6 +15,7 @@ import {
 } from "@/lib/services/sender-history";
 import { looksLikeCamt053, parseCamt053 } from "@/lib/utils/camt-parser";
 import { reconcileBankStatement } from "@/lib/services/bank-reconciliation";
+import { replaceStatementTransactions } from "@/lib/services/bank-transactions";
 import type { DocumentExtraction } from "@/types/document";
 
 const PROFILE_AUTO_ASSIGN_THRESHOLD = 0.7;
@@ -681,11 +682,44 @@ export async function POST(
                 null,
               transaction_id:
                 (it["transaction_id"] as string | undefined) || null,
+              description:
+                (it["description"] as string | undefined) || null,
             };
           })
           .filter(
             (t): t is NonNullable<typeof t> => t !== null
           );
+
+        // Persist into the first-class bank_transactions table. This is
+        // now the source of truth; the JSON line_items above stays as a
+        // backup audit trail of what Claude initially returned.
+        try {
+          const r = await replaceStatementTransactions(
+            admin,
+            user.id,
+            id,
+            transactions.map((t) => ({
+              amount: t.amount,
+              currency: t.currency || "EUR",
+              booking_date: t.booking_date,
+              value_date: t.value_date,
+              counterparty_name: t.counterparty_name,
+              counterparty_iban: t.counterparty_iban,
+              description: t.description,
+              reference: t.reference,
+              transaction_id: t.transaction_id,
+            }))
+          );
+          console.log(
+            `[api/analyze] wrote ${r.inserted} rows to bank_transactions`
+          );
+        } catch (e) {
+          console.warn(
+            "[api/analyze] bank_transactions write failed",
+            e
+          );
+        }
+
         const r = await reconcileBankStatement(
           admin,
           user.id,

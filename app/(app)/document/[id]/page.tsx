@@ -77,6 +77,31 @@ export default async function DocumentDetail({
     .maybeSingle();
   action = (a as ActionRow) || null;
 
+  // For bank statements, load the rows from the first-class
+  // bank_transactions table (migration 012). Source of truth, with proper
+  // indexes; the JSON line_items kept on the row is just a backup of
+  // what extraction originally returned.
+  let bankTransactions: Array<{
+    amount: number;
+    currency: string;
+    counterparty_name: string | null;
+    counterparty_iban: string | null;
+    description: string | null;
+    reference: string | null;
+    booking_date: string | null;
+    value_date: string | null;
+  }> = [];
+  if (doc.document_type === "bank_statement") {
+    const { data: txRows } = await supabase
+      .from("bank_transactions")
+      .select(
+        "amount, currency, counterparty_name, counterparty_iban, description, reference, booking_date, value_date, position"
+      )
+      .eq("statement_id", id)
+      .order("position", { ascending: true });
+    bankTransactions = (txRows || []) as typeof bankTransactions;
+  }
+
   // Layer 2 dedup: if analyze flagged this as a possible duplicate of
   // another doc, fetch a tiny summary of that doc so the banner can
   // describe it ("Looks like a duplicate of X from Y on Z").
@@ -387,29 +412,28 @@ export default async function DocumentDetail({
         );
       })()}
 
-      {/* Line items — different shape for bank statements (transactions
-          with date / counterparty / reference / amount) vs receipts and
-          invoices (items with category / qty / unit / total). */}
-      {(() => {
-        const items = (doc.extracted_fields as Record<string, unknown> | null)?.[
-          "line_items"
-        ];
-        if (!Array.isArray(items) || items.length === 0) return null;
-        if (doc.document_type === "bank_statement") {
+      {/* Line items — bank statements pull from the bank_transactions
+          table (first-class rows, indexed). Receipts / invoices still
+          pull from the JSON line_items array on the doc. */}
+      {doc.document_type === "bank_statement" ? (
+        <BankTransactionsTable
+          transactions={bankTransactions as unknown as BankTx[]}
+          currency={doc.currency}
+        />
+      ) : (
+        (() => {
+          const items = (doc.extracted_fields as Record<string, unknown> | null)?.[
+            "line_items"
+          ];
+          if (!Array.isArray(items) || items.length === 0) return null;
           return (
-            <BankTransactionsTable
-              transactions={items as BankTx[]}
+            <LineItemsSection
+              items={items as LineItem[]}
               currency={doc.currency}
             />
           );
-        }
-        return (
-          <LineItemsSection
-            items={items as LineItem[]}
-            currency={doc.currency}
-          />
-        );
-      })()}
+        })()
+      )}
 
       <div className="grid md:grid-cols-2 gap-5 mb-5">
         <div className="surface p-5">
