@@ -349,6 +349,16 @@ export default async function DocumentDetail({
               </Field>
             )}
           </div>
+
+          {/* Refile widget — placed right under the AI suggestions so the
+              user can correct profile / document type without scrolling
+              past the rest of the page. The widget renders its own
+              "Move or re-analyse" header + top border. */}
+          <RefileWidget
+            documentId={doc.id}
+            currentProfileId={doc.primary_profile_id}
+            currentDocumentType={doc.document_type}
+          />
         </div>
       </div>
 
@@ -443,11 +453,6 @@ export default async function DocumentDetail({
           <p className="mt-2 text-[11px] text-muted-foreground font-mono break-all">
             {doc.dropbox_path}
           </p>
-          <RefileWidget
-            documentId={doc.id}
-            currentProfileId={doc.primary_profile_id}
-            currentDocumentType={doc.document_type}
-          />
         </div>
       )}
 
