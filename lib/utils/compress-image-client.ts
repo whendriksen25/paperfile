@@ -141,6 +141,11 @@ export async function compressImageInBrowser(
  */
 export function shouldCompress(file: File, maxBytes = 1_000_000): boolean {
   if (file.type === "application/pdf") return false;
+  // Non-image formats (CSV, XML, plain text — used for bank statement
+  // imports) get uploaded as-is. Compression only ever applied to images.
+  if (file.type && !file.type.startsWith("image/")) return false;
+  // File-extension fallback for browsers that don't fill .type reliably.
+  if (/\.(csv|xml|tsv|txt|json)$/i.test(file.name)) return false;
   if (file.size <= maxBytes) return false;
   return true;
 }

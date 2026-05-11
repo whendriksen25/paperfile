@@ -473,7 +473,7 @@ export function UploadForm() {
         <input
           ref={fileInput}
           type="file"
-          accept="application/pdf,image/*"
+          accept="application/pdf,image/*,text/csv,text/xml,application/xml,.csv,.xml,.tsv,.txt"
           multiple
           className="hidden"
           onChange={(e) => addFiles(e.target.files)}

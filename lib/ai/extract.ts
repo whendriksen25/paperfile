@@ -188,20 +188,30 @@ function safeParseJSON(s: string): Record<string, unknown> | null {
   return null;
 }
 
-function getMimeType(
-  filename: string
-): "image/jpeg" | "image/png" | "image/gif" | "image/webp" | "application/pdf" {
+type SupportedMediaType =
+  | "image/jpeg"
+  | "image/png"
+  | "image/gif"
+  | "image/webp"
+  | "application/pdf"
+  | "text/csv"
+  | "text/plain";
+
+function getMimeType(filename: string): SupportedMediaType {
   const ext = path.extname(filename).toLowerCase();
-  const map: Record<
-    string,
-    "image/jpeg" | "image/png" | "image/gif" | "image/webp" | "application/pdf"
-  > = {
+  const map: Record<string, SupportedMediaType> = {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
     ".png": "image/png",
     ".gif": "image/gif",
     ".webp": "image/webp",
     ".pdf": "application/pdf",
+    // Text formats commonly exported by banks. Sent to Claude as plain
+    // text rather than as an image/document — the extraction prompt is
+    // format-agnostic and Claude reads tabular text just as well.
+    ".csv": "text/csv",
+    ".tsv": "text/csv",
+    ".txt": "text/plain",
   };
   return map[ext] || "image/jpeg";
 }
@@ -224,13 +234,23 @@ export async function extractDocument(
   console.log("[ai/extract] starting extraction for:", filename);
 
   const mimeType = getMimeType(filename);
-  const base64Data = fileBuffer.toString("base64");
 
   const contentBlocks: Anthropic.ContentBlockParam[] = [
     { type: "text", text: DOCUMENT_EXTRACTION_PROMPT },
   ];
 
-  if (mimeType === "application/pdf") {
+  if (mimeType === "text/csv" || mimeType === "text/plain") {
+    // CSV (or any plain-text export) — drop the raw text in as a second
+    // text block. Cheaper + more accurate than asking Claude to OCR a
+    // PDF rendering of the same data. Works for any bank's CSV layout
+    // since the prompt asks for canonical fields by NAME, not by column.
+    const raw = fileBuffer.toString("utf8");
+    contentBlocks.push({
+      type: "text",
+      text: `Below is the raw text export of the document (likely CSV from a bank). Extract per the schema above.\n\n---\n${raw}\n---`,
+    });
+  } else if (mimeType === "application/pdf") {
+    const base64Data = fileBuffer.toString("base64");
     contentBlocks.push({
       type: "document",
       source: {
@@ -240,6 +260,7 @@ export async function extractDocument(
       },
     } as unknown as Anthropic.ContentBlockParam);
   } else {
+    const base64Data = fileBuffer.toString("base64");
     contentBlocks.push({
       type: "image",
       source: {
