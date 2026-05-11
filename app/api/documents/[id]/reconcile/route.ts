@@ -8,13 +8,11 @@ export const maxDuration = 60;
 /**
  * POST /api/documents/[id]/reconcile
  *
- * Re-runs bank-statement reconciliation for the given doc using the
- * line_items already saved in extracted_fields. Use this after refiling,
- * after correcting a mismatched action, or just to retry if more actions
- * have appeared since the original analyze run.
- *
- * Returns the same { matched, ambiguous, unmatched, considered } summary
- * the auto-trigger writes to extracted_fields._reconciliation.
+ * Re-runs bank-statement reconciliation against the latest open `pay`
+ * actions. Reads transactions from `bank_transactions` (the table is
+ * the source of truth — not in-memory state, not the JSON shadow on
+ * the doc). Use after refiling, after correcting a wrong action, or
+ * when new pay actions have appeared since the last run.
  */
 export async function POST(
   _request: NextRequest,
@@ -49,53 +47,14 @@ export async function POST(
       );
     }
 
-    const ef = (doc.extracted_fields || {}) as Record<string, unknown>;
-    const items = ((ef["line_items"] as unknown) ||
-      []) as Array<Record<string, unknown>>;
+    const r = await reconcileBankStatement(admin, user.id, id);
 
-    const transactions = items
-      .map((it) => {
-        const totalRaw = it["total"];
-        let total = typeof totalRaw === "number" ? totalRaw : Number(totalRaw);
-        if (!Number.isFinite(total)) return null;
-        const cdtDbt = (it["cdt_dbt"] as string | undefined) || null;
-        if (cdtDbt === "DBIT" && total > 0) total = -total;
-        if (cdtDbt === "CRDT" && total < 0) total = -total;
-        return {
-          amount: total,
-          currency: (it["currency"] as string | undefined) || null,
-          booking_date:
-            (it["booking_date"] as string | undefined) ||
-            (it["transaction_date"] as string | undefined) ||
-            null,
-          value_date:
-            (it["value_date"] as string | undefined) ||
-            (it["transaction_date"] as string | undefined) ||
-            null,
-          counterparty_name:
-            (it["counterparty_name"] as string | undefined) ||
-            (it["description"] as string | undefined) ||
-            null,
-          counterparty_iban:
-            (it["counterparty_iban"] as string | undefined) || null,
-          reference:
-            (it["reference"] as string | undefined) ||
-            (it["description"] as string | undefined) ||
-            null,
-          transaction_id:
-            (it["transaction_id"] as string | undefined) || null,
-        };
-      })
-      .filter((t): t is NonNullable<typeof t> => t !== null);
-
-    const r = await reconcileBankStatement(admin, user.id, id, transactions);
-
-    // Persist updated summary
+    // Mirror the summary into extracted_fields for the detail-page panel
     await admin
       .from("documents")
       .update({
         extracted_fields: {
-          ...ef,
+          ...(doc.extracted_fields || {}),
           _reconciliation: { ran_at: new Date().toISOString(), ...r },
         },
       })

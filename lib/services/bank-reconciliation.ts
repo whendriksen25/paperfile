@@ -2,39 +2,27 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 
 /**
  * Reconcile a bank statement's transactions against the user's open
- * `pay` actions. For each debit transaction we attempt to find a single
- * unambiguous match — when found, we close the action, mark the source
- * document as paid, and log the match in maintenance_log.
+ * `pay` actions. Reads transactions from the `bank_transactions` table
+ * (NOT from in-memory state) so the database is always the source of
+ * truth — running this after analyze, manually via the Re-reconcile
+ * button, or later via a batch sweep all give the same answer.
  *
- *  Match heuristic (all conjunction):
- *   1. Amount within ±€0.50 (or ±0.5% of the transaction amount,
- *      whichever is greater) — covers rounding + small fees.
+ *  Match heuristic (all conjunctive):
+ *   1. Amount within ±€0.50 or ±0.5% of the transaction (whichever larger).
  *   2. At least ONE strong identifier overlap:
  *        - counterparty_iban === any IBAN extracted from the source doc
  *        - counterparty_name fuzzy-matches the source doc's sender
- *        - reference contains the source doc's invoice/payment_reference
+ *        - reference contains the source doc's invoice / payment_reference
  *
- *  When MULTIPLE actions match the same transaction, we don't auto-close
- *  any of them — ambiguity is unsafe; the user reviews manually.
+ *  When multiple actions match the same transaction → ambiguous (skipped).
+ *  When a unique action matches → close it, mark source doc paid, record
+ *  the match on the bank_transactions row (matched_action_id, matched_at,
+ *  match_reason), log to maintenance_log.
  *
- * The source-doc-side data we use:
- *   - documents.amount (or extracted_fields.total_incl)
- *   - extracted_fields.payment_iban / iban
- *   - documents.sender
- *   - extracted_fields.payment_reference / invoice_number
+ * Re-running clears matched_* on the statement's transactions first, so
+ * the latest reconciliation state always reflects the current set of
+ * open actions.
  */
-
-export interface BankTransactionLike {
-  /** Negative for debit/outgoing. */
-  amount: number;
-  currency?: string | null;
-  booking_date?: string | null;
-  value_date?: string | null;
-  counterparty_name?: string | null;
-  counterparty_iban?: string | null;
-  reference?: string | null;
-  transaction_id?: string | null;
-}
 
 export interface ReconciliationResult {
   considered: number;
@@ -42,12 +30,24 @@ export interface ReconciliationResult {
   ambiguous: number;
   unmatched: number;
   matches: Array<{
-    transaction_index: number;
+    transaction_id: string;
     action_id: string;
     document_id: string;
     amount: number;
     reason: string;
   }>;
+}
+
+interface BankTransactionRow {
+  id: string;
+  amount: number;
+  currency: string | null;
+  booking_date: string | null;
+  value_date: string | null;
+  counterparty_name: string | null;
+  counterparty_iban: string | null;
+  description: string | null;
+  reference: string | null;
 }
 
 interface PendingAction {
@@ -119,31 +119,24 @@ function extractDocReference(
   return null;
 }
 
-/**
- * Score a (transaction, action) pair. Returns a list of human-readable
- * reasons that fired, or an empty array if it doesn't match.
- */
 function matchSignals(
-  tx: BankTransactionLike,
+  tx: BankTransactionRow,
   action: PendingAction
 ): string[] {
   const reasons: string[] = [];
 
-  // 1. Amount tolerance — tx is signed; we only care about debits here
   const txAbs = Math.abs(tx.amount);
   const docAbs =
     action.document?.amount != null
       ? Math.abs(Number(action.document.amount))
       : null;
   if (docAbs == null || !Number.isFinite(docAbs)) return [];
-  const tolerance = Math.max(0.5, txAbs * 0.005); // ±50 cents or 0.5%
+  const tolerance = Math.max(0.5, txAbs * 0.005);
   if (Math.abs(txAbs - docAbs) > tolerance) return [];
   reasons.push(`amount ≈ €${docAbs.toFixed(2)}`);
 
-  // 2. At least one strong identifier overlap
   let strong = false;
 
-  // IBAN
   const docIban = extractDocIban(action.document?.extracted_fields);
   const txIban = ibanNorm(tx.counterparty_iban);
   if (docIban && txIban && docIban === txIban) {
@@ -151,15 +144,17 @@ function matchSignals(
     strong = true;
   }
 
-  // Sender / counterparty fuzzy match
   const senderN = nameNorm(action.document?.sender);
-  const counterN = nameNorm(tx.counterparty_name);
-  if (senderN && counterN && (counterN.includes(senderN) || senderN.includes(counterN))) {
-    reasons.push(`sender ~= "${tx.counterparty_name}"`);
+  const counterN = nameNorm(tx.counterparty_name || tx.description);
+  if (
+    senderN &&
+    counterN &&
+    (counterN.includes(senderN) || senderN.includes(counterN))
+  ) {
+    reasons.push(`sender ~= "${tx.counterparty_name || tx.description}"`);
     strong = true;
   }
 
-  // Reference / invoice number contained in the bank's reference field
   const docRef = extractDocReference(action.document?.extracted_fields);
   if (docRef && tx.reference) {
     const refN = String(docRef).replace(/\s+/g, "").toLowerCase();
@@ -173,17 +168,48 @@ function matchSignals(
   return strong ? reasons : [];
 }
 
+/**
+ * Reconcile a single statement. Reads bank_transactions, queries open
+ * pay actions, applies matches, persists matched_* columns back onto
+ * the bank_transactions rows.
+ *
+ * Idempotent: any prior matched_* values for this statement's
+ * transactions are cleared before re-evaluating, so re-running after
+ * the user has corrected a source doc (or opened new actions) gives
+ * the latest answer.
+ */
 export async function reconcileBankStatement(
   admin: SupabaseClient,
   userId: string,
-  statementDocId: string,
-  transactions: BankTransactionLike[]
+  statementDocId: string
 ): Promise<ReconciliationResult> {
-  // Pull every open `pay` action with its source doc joined in. Limit
-  // scope to the user; profile_id doesn't restrict because a statement
-  // could legitimately settle bills across profiles (Wim paying his
-  // father's CAK from his own account, or vice versa).
-  const { data: actions, error } = await admin
+  // 1. Load transactions from the table (source of truth)
+  const { data: txRowsRaw, error: txErr } = await admin
+    .from("bank_transactions")
+    .select(
+      "id, amount, currency, booking_date, value_date, counterparty_name, counterparty_iban, description, reference"
+    )
+    .eq("user_id", userId)
+    .eq("statement_id", statementDocId)
+    .order("position", { ascending: true });
+  if (txErr) throw txErr;
+  const txRows = (txRowsRaw || []) as BankTransactionRow[];
+
+  // 2. Clear any prior matches on these rows so re-runs reflect today's state
+  if (txRows.length > 0) {
+    await admin
+      .from("bank_transactions")
+      .update({
+        matched_action_id: null,
+        matched_document_id: null,
+        matched_at: null,
+        match_reason: null,
+      })
+      .eq("statement_id", statementDocId);
+  }
+
+  // 3. Load all open pay actions, with source doc joined
+  const { data: actionsRaw, error: aErr } = await admin
     .from("actions")
     .select(
       "id, user_id, document_id, profile_id, action_type, summary, due_date, status, document:documents(id, sender, amount, currency, extracted_fields)"
@@ -191,9 +217,8 @@ export async function reconcileBankStatement(
     .eq("user_id", userId)
     .eq("status", "open")
     .eq("action_type", "pay");
-  if (error) throw error;
-
-  const pending = ((actions || []) as unknown as PendingAction[]).filter(
+  if (aErr) throw aErr;
+  const pending = ((actionsRaw || []) as unknown as PendingAction[]).filter(
     (a) => a.document_id !== statementDocId
   );
 
@@ -205,40 +230,40 @@ export async function reconcileBankStatement(
     matches: [],
   };
 
-  for (let i = 0; i < transactions.length; i++) {
-    const tx = transactions[i];
-    // Only debits — incoming transfers don't settle our pay actions.
-    if (tx.amount >= 0) continue;
+  // 4. Per-transaction matching
+  for (const tx of txRows) {
+    if (tx.amount >= 0) continue; // only debits settle pay actions
     result.considered++;
 
-    const candidateMatches: Array<{
+    const candidates: Array<{
       action: PendingAction;
       reasons: string[];
     }> = [];
     for (const a of pending) {
       const reasons = matchSignals(tx, a);
-      if (reasons.length > 0) candidateMatches.push({ action: a, reasons });
+      if (reasons.length > 0) candidates.push({ action: a, reasons });
     }
 
-    if (candidateMatches.length === 0) {
+    if (candidates.length === 0) {
       result.unmatched++;
       continue;
     }
-    if (candidateMatches.length > 1) {
+    if (candidates.length > 1) {
       result.ambiguous++;
       continue;
     }
 
-    const { action, reasons } = candidateMatches[0];
+    const { action, reasons } = candidates[0];
     const reasonStr = reasons.join(" + ");
     const paidDate = tx.value_date || tx.booking_date || null;
+    const now = new Date().toISOString();
 
     // Close the action
     const { error: closeErr } = await admin
       .from("actions")
       .update({
         status: "done",
-        completed_at: new Date().toISOString(),
+        completed_at: now,
         notes: `Auto-matched to bank transaction (${reasonStr}) on ${paidDate || "unknown date"}.`,
       })
       .eq("id", action.id);
@@ -247,7 +272,7 @@ export async function reconcileBankStatement(
       continue;
     }
 
-    // Mark source doc as paid (merge into extracted_fields)
+    // Mark source doc paid
     const sourceEf = (action.document?.extracted_fields || {}) as Record<
       string,
       unknown
@@ -263,6 +288,17 @@ export async function reconcileBankStatement(
       .update({ extracted_fields: newEf })
       .eq("id", action.document_id);
 
+    // Record the match on the bank_transaction row itself
+    await admin
+      .from("bank_transactions")
+      .update({
+        matched_action_id: action.id,
+        matched_document_id: action.document_id,
+        matched_at: now,
+        match_reason: reasonStr,
+      })
+      .eq("id", tx.id);
+
     await admin.from("maintenance_log").insert({
       user_id: userId,
       document_id: action.document_id,
@@ -270,8 +306,8 @@ export async function reconcileBankStatement(
       reason: `Auto-paid via bank statement: ${reasonStr}`,
       payload: {
         statement_doc_id: statementDocId,
+        bank_transaction_id: tx.id,
         action_id: action.id,
-        transaction_index: i,
         amount: tx.amount,
         counterparty: tx.counterparty_name,
         counterparty_iban: tx.counterparty_iban,
@@ -283,7 +319,7 @@ export async function reconcileBankStatement(
 
     result.matched++;
     result.matches.push({
-      transaction_index: i,
+      transaction_id: tx.id,
       action_id: action.id,
       document_id: action.document_id,
       amount: tx.amount,

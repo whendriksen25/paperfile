@@ -691,8 +691,8 @@ export async function POST(
           );
 
         // Persist into the first-class bank_transactions table. This is
-        // now the source of truth; the JSON line_items above stays as a
-        // backup audit trail of what Claude initially returned.
+        // the source of truth from this point on; the JSON line_items
+        // above stays as a backup audit trail of what extraction returned.
         try {
           const r = await replaceStatementTransactions(
             admin,
@@ -720,12 +720,10 @@ export async function POST(
           );
         }
 
-        const r = await reconcileBankStatement(
-          admin,
-          user.id,
-          id,
-          transactions
-        );
+        // Reconcile reads transactions back FROM the database, so any
+        // partial write above gets surfaced as "missing transactions"
+        // rather than silently miscounted. Source of truth = the table.
+        const r = await reconcileBankStatement(admin, user.id, id);
         reconciliationSummary = {
           matched: r.matched,
           ambiguous: r.ambiguous,
