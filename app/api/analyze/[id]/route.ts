@@ -720,6 +720,36 @@ export async function POST(
           );
         }
 
+        // Compute a tiny summary so the inbox card can show "5 txns,
+        // €294 out, €0 in" at-a-glance without joining bank_transactions.
+        // Stored under extracted_fields._bank_summary; surfaced via the
+        // slim INBOX_CARD_FIELDS projection.
+        const debitTotal = transactions
+          .filter((t) => t.amount < 0)
+          .reduce((s, t) => s + Math.abs(t.amount), 0);
+        const creditTotal = transactions
+          .filter((t) => t.amount > 0)
+          .reduce((s, t) => s + t.amount, 0);
+        const bankSummary = {
+          txn_count: transactions.length,
+          debit_total: Number(debitTotal.toFixed(2)),
+          credit_total: Number(creditTotal.toFixed(2)),
+          currency: extraction.currency || "EUR",
+        };
+        try {
+          await admin
+            .from("documents")
+            .update({
+              extracted_fields: {
+                ...(extraction.extracted_fields || {}),
+                _bank_summary: bankSummary,
+              },
+            })
+            .eq("id", id);
+        } catch (e) {
+          console.warn("[api/analyze] _bank_summary write failed", e);
+        }
+
         // Reconcile reads transactions back FROM the database, so any
         // partial write above gets surfaced as "missing transactions"
         // rather than silently miscounted. Source of truth = the table.

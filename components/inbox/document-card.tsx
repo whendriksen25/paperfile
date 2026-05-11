@@ -137,6 +137,61 @@ export function DocumentCard({
                         ? ` · ${formatDate(doc.document_date)}`
                         : "")}
               </p>
+
+              {/* Bank-statement summary line — tells the user at a glance
+                 what's inside the statement (txn count + flows + reconcile
+                 status) so they don't need to open it to know. */}
+              {!isWorking &&
+                !isFailed &&
+                doc.document_type === "bank_statement" &&
+                (() => {
+                  const ef =
+                    doc.extracted_fields as
+                      | Record<string, unknown>
+                      | null;
+                  const summary = ef?.["_bank_summary"] as
+                    | {
+                        txn_count?: number;
+                        debit_total?: number;
+                        credit_total?: number;
+                        currency?: string;
+                      }
+                    | undefined;
+                  const reconciliation = ef?.["_reconciliation"] as
+                    | {
+                        matched?: number;
+                        considered?: number;
+                      }
+                    | undefined;
+                  if (!summary && !reconciliation) return null;
+                  const cur = summary?.currency || "EUR";
+                  const bits: string[] = [];
+                  if (summary?.txn_count != null) {
+                    bits.push(
+                      `${summary.txn_count} ${summary.txn_count === 1 ? "transaction" : "transactions"}`
+                    );
+                  }
+                  if (summary?.debit_total) {
+                    bits.push(`${formatMoney(summary.debit_total, cur)} out`);
+                  }
+                  if (summary?.credit_total) {
+                    bits.push(`${formatMoney(summary.credit_total, cur)} in`);
+                  }
+                  if (
+                    reconciliation?.considered != null &&
+                    reconciliation?.matched != null
+                  ) {
+                    bits.push(
+                      `${reconciliation.matched}/${reconciliation.considered} reconciled`
+                    );
+                  }
+                  if (bits.length === 0) return null;
+                  return (
+                    <p className="text-xs text-brand-teal font-semibold truncate mt-0.5">
+                      {bits.join(" · ")}
+                    </p>
+                  );
+                })()}
             </div>
             {doc.amount != null && !isWorking && (
               <span className="text-sm font-bold text-foreground shrink-0">
