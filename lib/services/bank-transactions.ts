@@ -87,11 +87,26 @@ export async function replaceStatementTransactions(
     position: i,
   }));
 
-  const { error: insErr } = await admin
-    .from("bank_transactions")
-    .insert(payload);
-  if (insErr) throw insErr;
-  return { inserted: payload.length };
+  // Chunk inserts — Supabase's REST gateway is reliable for ≤500 rows
+  // per call. A full-year Rabobank statement can be 1000+ transactions
+  // and would otherwise blow past payload limits.
+  const CHUNK = 500;
+  let inserted = 0;
+  for (let i = 0; i < payload.length; i += CHUNK) {
+    const slice = payload.slice(i, i + CHUNK);
+    const { error: insErr } = await admin
+      .from("bank_transactions")
+      .insert(slice);
+    if (insErr) {
+      console.error(
+        `[replaceStatementTransactions] chunk insert failed at ${i}/${payload.length}:`,
+        insErr
+      );
+      throw insErr;
+    }
+    inserted += slice.length;
+  }
+  return { inserted };
 }
 
 /** Fetch all transactions for a statement, in original ordering. */
