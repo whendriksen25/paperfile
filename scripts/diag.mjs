@@ -20,6 +20,15 @@
 //   doc <doc-id-or-prefix>
 //     Dump the pertinent columns of a single documents row.
 //
+//   pay-actions [--limit=50]
+//     Open pay-actions with the source doc's amount / IBAN / sender —
+//     the right-hand side of the reconciliation join.
+//
+//   match-debug <tx-id-or-prefix>
+//     Show why a specific bank transaction did or didn't match: amount,
+//     IBAN, counterparty + the list of pay-actions that overlap on any
+//     single signal.
+//
 //   check-deploy
 //     Show local HEAD vs origin/main, any uncommitted changes.
 //
@@ -193,6 +202,44 @@ async function cmdBankStats() {
   }
 }
 
+async function cmdReconcileSummary() {
+  const [idArg] = positional();
+  if (!idArg)
+    throw new Error(
+      "Usage: diag reconcile-summary <statement-id-or-prefix>"
+    );
+  const supabase = admin();
+  const statementId = await resolveId(supabase, "documents", idArg);
+  if (!statementId) {
+    console.error(`No documents row found matching "${idArg}"`);
+    process.exit(1);
+  }
+  const { data, error } = await supabase
+    .from("documents")
+    .select("id, extracted_fields")
+    .eq("id", statementId)
+    .single();
+  if (error) throw error;
+  const summary = data?.extracted_fields?._reconciliation;
+  if (!summary) {
+    console.log(
+      "(no _reconciliation blob on this doc — Re-reconcile hasn't run since the field was added, or the API call failed before persisting)"
+    );
+    return;
+  }
+  console.log(`statement_id: ${statementId}`);
+  console.log(`ran_at:       ${summary.ran_at}`);
+  console.log(`considered:   ${summary.considered}`);
+  console.log(`matched:      ${summary.matched}`);
+  console.log(`ambiguous:    ${summary.ambiguous}`);
+  console.log(`unmatched:    ${summary.unmatched}`);
+  if (summary.back_link_write_failures !== undefined) {
+    console.log(
+      `back_link_write_failures: ${summary.back_link_write_failures}  ${summary.back_link_write_failures > 0 ? "⚠  matches written in memory but NOT persisted to bank_transactions" : ""}`
+    );
+  }
+}
+
 async function cmdLastReconcile() {
   const [idArg] = positional();
   if (!idArg)
@@ -324,6 +371,170 @@ async function cmdDoc() {
   console.log(`created_at:      ${data.created_at}`);
 }
 
+// Pull a pseudo-IBAN out of an extracted_fields blob (same heuristic the
+// matcher uses, kept inline so this script has no app-internal imports).
+function extractIban(ef) {
+  if (!ef || typeof ef !== "object") return null;
+  const direct = ef.payment_iban || ef.iban || ef.account_iban;
+  if (typeof direct === "string") {
+    const c = direct.replace(/\s+/g, "");
+    if (/^[A-Z]{2}\d{2}[A-Z0-9]{4,30}$/i.test(c)) return c.toUpperCase();
+  }
+  const re = /\b[A-Z]{2}\d{2}[A-Z0-9]{4,30}\b/i;
+  for (const v of Object.values(ef)) {
+    if (typeof v === "string") {
+      const m = v.replace(/\s+/g, "").match(re);
+      if (m) return m[0].toUpperCase();
+    }
+  }
+  return null;
+}
+function extractRef(ef) {
+  if (!ef || typeof ef !== "object") return null;
+  for (const k of [
+    "payment_reference",
+    "invoice_number",
+    "reference",
+    "customer_reference",
+  ]) {
+    const v = ef[k];
+    if (typeof v === "string" && v.trim()) return v.trim();
+    if (typeof v === "number") return String(v);
+  }
+  return null;
+}
+function nameNorm(s) {
+  return (s || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/[^a-z0-9]/g, "");
+}
+
+async function cmdPayActions() {
+  const limit = Number(flag("limit", "50"));
+  const supabase = admin();
+  const { data, error } = await supabase
+    .from("actions")
+    .select(
+      "id, document_id, status, action_type, summary, due_date, document:documents(id, sender, amount, currency, extracted_fields)"
+    )
+    .eq("status", "open")
+    .eq("action_type", "pay")
+    .order("due_date", { ascending: true, nullsFirst: false })
+    .limit(limit);
+  if (error) throw error;
+  const rows = data || [];
+  console.log(`Open pay-actions: ${rows.length}\n`);
+  if (rows.length === 0) {
+    console.log(
+      "(0 open pay-actions — that's why nothing matched. Either everything's already done or no pay actions exist.)"
+    );
+    return;
+  }
+  let withAmount = 0,
+    withIban = 0,
+    withRef = 0;
+  for (const a of rows) {
+    const d = a.document;
+    const amt = d?.amount;
+    const iban = extractIban(d?.extracted_fields);
+    const ref = extractRef(d?.extracted_fields);
+    if (amt != null) withAmount++;
+    if (iban) withIban++;
+    if (ref) withRef++;
+    const amtStr = amt != null ? Number(amt).toFixed(2).padStart(10) : "       —";
+    const sender = (d?.sender || "—").slice(0, 28).padEnd(28);
+    const due = (a.due_date || "—").padEnd(10);
+    console.log(
+      `  ${due}  ${amtStr}  ${sender}  ${iban || "(no IBAN)"}  ${ref ? `ref:${ref.slice(0, 16)}` : ""}`
+    );
+  }
+  console.log(
+    `\nSignal coverage:  amount=${withAmount}/${rows.length}  IBAN=${withIban}/${rows.length}  reference=${withRef}/${rows.length}`
+  );
+}
+
+async function cmdMatchDebug() {
+  const [idArg] = positional();
+  if (!idArg)
+    throw new Error("Usage: diag match-debug <tx-id-or-prefix>");
+  const supabase = admin();
+  const txId = await resolveId(supabase, "bank_transactions", idArg);
+  if (!txId) {
+    console.error(`No bank_transactions row matching "${idArg}"`);
+    process.exit(1);
+  }
+  const { data: tx, error: txErr } = await supabase
+    .from("bank_transactions")
+    .select(
+      "id, statement_id, amount, booking_date, counterparty_name, counterparty_iban, description, reference, matched_action_id, match_reason"
+    )
+    .eq("id", txId)
+    .single();
+  if (txErr) throw txErr;
+  console.log(`tx ${txId}`);
+  console.log(`  amount:      ${tx.amount}`);
+  console.log(`  date:        ${tx.booking_date}`);
+  console.log(`  counterparty:${tx.counterparty_name || "—"}`);
+  console.log(`  IBAN:        ${tx.counterparty_iban || "—"}`);
+  console.log(`  reference:   ${tx.reference || "—"}`);
+  console.log(
+    `  matched:     ${tx.matched_action_id || "no"}  ${tx.match_reason ? `(${tx.match_reason})` : ""}`
+  );
+
+  const { data: pending, error: aErr } = await supabase
+    .from("actions")
+    .select(
+      "id, document_id, status, action_type, document:documents(id, sender, amount, extracted_fields)"
+    )
+    .eq("status", "open")
+    .eq("action_type", "pay");
+  if (aErr) throw aErr;
+
+  const txAbs = Math.abs(Number(tx.amount));
+  const tolerance = Math.max(0.5, txAbs * 0.005);
+  const txIbanN = (tx.counterparty_iban || "").toUpperCase().replace(/\s+/g, "");
+  const counterN = nameNorm(tx.counterparty_name || tx.description);
+  const txRefN = (tx.reference || "").replace(/\s+/g, "").toLowerCase();
+
+  console.log(`\nCandidates (any single signal overlap):`);
+  let any = false;
+  for (const a of pending || []) {
+    const d = a.document;
+    const docAbs = d?.amount != null ? Math.abs(Number(d.amount)) : null;
+    const amountHit =
+      docAbs != null && Number.isFinite(docAbs) && Math.abs(txAbs - docAbs) <= tolerance;
+    const ibanDoc = extractIban(d?.extracted_fields);
+    const ibanHit = ibanDoc && txIbanN && ibanDoc === txIbanN;
+    const senderN = nameNorm(d?.sender);
+    const senderHit =
+      senderN && counterN && (counterN.includes(senderN) || senderN.includes(counterN));
+    const refDoc = extractRef(d?.extracted_fields);
+    const refDocN = refDoc ? String(refDoc).replace(/\s+/g, "").toLowerCase() : "";
+    const refHit =
+      refDocN && refDocN.length >= 4 && txRefN.includes(refDocN);
+
+    if (!amountHit && !ibanHit && !senderHit && !refHit) continue;
+    any = true;
+    const sig = [
+      amountHit ? `amount(${docAbs})` : null,
+      ibanHit ? `IBAN` : null,
+      senderHit ? `sender(${d?.sender})` : null,
+      refHit ? `ref(${refDoc})` : null,
+    ]
+      .filter(Boolean)
+      .join(" + ");
+    console.log(
+      `  • action ${a.id.slice(0, 8)}  doc=${a.document_id.slice(0, 8)}  ${sig}`
+    );
+  }
+  if (!any)
+    console.log(
+      "  (none — no open pay-action overlaps on amount, IBAN, sender, or reference)"
+    );
+}
+
 function cmdCheckDeploy() {
   const cwd =
     "/Users/jean/Documents/Personal/Werk/Software/document-archive";
@@ -399,6 +610,9 @@ Subcommands:
   last-reconcile <statement-id-or-prefix>
   transactions   <statement-id-or-prefix> [--limit=N] [--filter=debits|credits|unmatched]
   doc            <doc-id-or-prefix>
+  reconcile-summary <statement-id-or-prefix>
+  pay-actions    [--limit=50]
+  match-debug    <tx-id-or-prefix>
   check-deploy
   orphan         <doc-id-or-prefix> [--fix-with=<path>]
   help
@@ -415,6 +629,9 @@ const dispatch = {
   "last-reconcile": cmdLastReconcile,
   transactions: cmdTransactions,
   doc: cmdDoc,
+  "reconcile-summary": cmdReconcileSummary,
+  "pay-actions": cmdPayActions,
+  "match-debug": cmdMatchDebug,
   "check-deploy": cmdCheckDeploy,
   orphan: cmdOrphan,
   help: cmdHelp,

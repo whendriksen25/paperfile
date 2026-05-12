@@ -29,6 +29,14 @@ export interface ReconciliationResult {
   matched: number;
   ambiguous: number;
   unmatched: number;
+  /**
+   * Count of matches where the in-memory match succeeded (action closed,
+   * doc marked paid) but the back-link write to bank_transactions failed.
+   * Should always be 0; if non-zero, the matcher is "matching" but the
+   * `matched_action_id` column never gets stamped — exactly the symptom
+   * that left bank-stats reporting 0% even with maintenance_log entries.
+   */
+  back_link_write_failures: number;
   matches: Array<{
     transaction_id: string;
     action_id: string;
@@ -212,7 +220,7 @@ export async function reconcileBankStatement(
 
   // 2. Clear any prior matches on these rows so re-runs reflect today's state
   if (txRows.length > 0) {
-    await admin
+    const { error: clearErr } = await admin
       .from("bank_transactions")
       .update({
         matched_action_id: null,
@@ -221,6 +229,12 @@ export async function reconcileBankStatement(
         match_reason: null,
       })
       .eq("statement_id", statementDocId);
+    if (clearErr) {
+      console.error("[reconcile] clear matched_* failed:", clearErr);
+      throw new Error(
+        `bank_transactions clear failed: ${clearErr.message || JSON.stringify(clearErr)}`
+      );
+    }
   }
 
   // 3. Load all open pay actions, with source doc joined
@@ -242,6 +256,7 @@ export async function reconcileBankStatement(
     matched: 0,
     ambiguous: 0,
     unmatched: 0,
+    back_link_write_failures: 0,
     matches: [],
   };
 
@@ -303,8 +318,12 @@ export async function reconcileBankStatement(
       .update({ extracted_fields: newEf })
       .eq("id", action.document_id);
 
-    // Record the match on the bank_transaction row itself
-    await admin
+    // Record the match on the bank_transaction row itself. Loud error
+    // logging here because a silent failure here is invisible: the action
+    // is closed, the doc is marked paid, the maintenance_log gets an entry
+    // — but the bank_transactions row stays unmatched, so `bank-stats`
+    // reports 0 even though everything else worked.
+    const { error: txUpdErr } = await admin
       .from("bank_transactions")
       .update({
         matched_action_id: action.id,
@@ -313,6 +332,15 @@ export async function reconcileBankStatement(
         match_reason: reasonStr,
       })
       .eq("id", tx.id);
+    if (txUpdErr) {
+      console.error(
+        `[reconcile] FAILED to write matched_* on tx ${tx.id} (action ${action.id}):`,
+        JSON.stringify(txUpdErr)
+      );
+      result.back_link_write_failures++;
+      // Don't throw — the action is already closed, no point bailing the
+      // whole run. But surface the count.
+    }
 
     await admin.from("maintenance_log").insert({
       user_id: userId,
