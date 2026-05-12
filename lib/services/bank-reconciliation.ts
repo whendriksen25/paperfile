@@ -183,20 +183,32 @@ export async function reconcileBankStatement(
   userId: string,
   statementDocId: string
 ): Promise<ReconciliationResult> {
-  // 1. Load transactions from the table (source of truth). PostgREST
-  // defaults to 1000 rows per SELECT; full-year statements can have
-  // 1000+ transactions, so explicitly raise the cap.
-  const { data: txRowsRaw, error: txErr } = await admin
-    .from("bank_transactions")
-    .select(
-      "id, amount, currency, booking_date, value_date, counterparty_name, counterparty_iban, description, reference"
-    )
-    .eq("user_id", userId)
-    .eq("statement_id", statementDocId)
-    .order("position", { ascending: true })
-    .range(0, 9999);
-  if (txErr) throw txErr;
-  const txRows = (txRowsRaw || []) as BankTransactionRow[];
+  // 1. Load transactions from the table (source of truth). Supabase's
+  // PostgREST is configured with `db-max-rows: 1000` — `.range()` from
+  // the client can't override that hard cap. Workaround: paginate by
+  // offset until a short page returns. Full-year statements can have
+  // 1000-2000 transactions; pagination guarantees we see them all.
+  const PAGE = 1000;
+  const txRows: BankTransactionRow[] = [];
+  let offset = 0;
+  // Safety bound — refuse to loop more than 50 pages (50k rows). No
+  // realistic personal bank statement gets near this.
+  for (let i = 0; i < 50; i++) {
+    const { data: pageData, error: txErr } = await admin
+      .from("bank_transactions")
+      .select(
+        "id, amount, currency, booking_date, value_date, counterparty_name, counterparty_iban, description, reference"
+      )
+      .eq("user_id", userId)
+      .eq("statement_id", statementDocId)
+      .order("position", { ascending: true })
+      .range(offset, offset + PAGE - 1);
+    if (txErr) throw txErr;
+    const rows = (pageData || []) as BankTransactionRow[];
+    txRows.push(...rows);
+    if (rows.length < PAGE) break;
+    offset += PAGE;
+  }
 
   // 2. Clear any prior matches on these rows so re-runs reflect today's state
   if (txRows.length > 0) {

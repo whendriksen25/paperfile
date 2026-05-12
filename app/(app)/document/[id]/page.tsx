@@ -94,18 +94,25 @@ export default async function DocumentDetail({
     value_date: string | null;
   }> = [];
   if (doc.document_type === "bank_statement") {
-    const { data: txRows } = await supabase
-      .from("bank_transactions")
-      .select(
-        "amount, currency, counterparty_name, counterparty_iban, description, reference, booking_date, value_date, position"
-      )
-      .eq("statement_id", id)
-      .order("position", { ascending: true })
-      // PostgREST defaults to 1000 rows per SELECT. A year-long statement
-      // can easily have 1000+ transactions — override with a generous cap
-      // so we never silently truncate the list.
-      .range(0, 9999);
-    bankTransactions = (txRows || []) as typeof bankTransactions;
+    // Supabase enforces a server-side 1000-row cap. `.range()` can't
+    // override it from the client — only manual pagination works. Loop
+    // in pages of 1000 until a short page comes back.
+    const PAGE = 1000;
+    let offset = 0;
+    for (let i = 0; i < 50; i++) {
+      const { data: pageData } = await supabase
+        .from("bank_transactions")
+        .select(
+          "amount, currency, counterparty_name, counterparty_iban, description, reference, booking_date, value_date, position"
+        )
+        .eq("statement_id", id)
+        .order("position", { ascending: true })
+        .range(offset, offset + PAGE - 1);
+      const rows = (pageData || []) as typeof bankTransactions;
+      bankTransactions.push(...rows);
+      if (rows.length < PAGE) break;
+      offset += PAGE;
+    }
   }
 
   // Layer 2 dedup: if analyze flagged this as a possible duplicate of
