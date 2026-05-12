@@ -52,7 +52,8 @@ export async function POST(request: NextRequest) {
     console.log("[admin-bridge/analyze] downloading", doc.dropbox_path);
     const buffer = await storage.downloadFile(doc.dropbox_path);
     console.log("[admin-bridge/analyze] downloaded", buffer.length, "bytes");
-    const result = await extractDocument(buffer, doc.file_name || "file.jpg");
+    const extractRes = await extractDocument(buffer, doc.file_name || "file.jpg");
+    const result = extractRes.data;
     console.log("[admin-bridge/analyze] extracted", !!result);
   if (!result) {
     await admin

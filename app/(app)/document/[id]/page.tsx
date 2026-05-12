@@ -18,6 +18,8 @@ import { RenameFilenameButton } from "@/components/inbox/rename-filename-button"
 import { DuplicateBanner } from "@/components/inbox/duplicate-banner";
 import { DocumentPreview } from "@/components/inbox/document-preview";
 import { ReconciliationPanel } from "@/components/inbox/reconciliation-panel";
+import { TruncationBanner } from "@/components/inbox/truncation-banner";
+import { estimateAiCostEur, formatAiCostEur } from "@/lib/ai/pricing";
 import {
   ProfileMatchPanel,
   type ProfileMatchInfo,
@@ -192,6 +194,17 @@ export default async function DocumentDetail({
         />
       )}
 
+      {doc.ai_truncated && (
+        <TruncationBanner
+          documentId={doc.id}
+          estimatedExtraCostEur={
+            // Rough extra cost: the additional output tokens needed
+            // beyond the 64k cap, at the output rate. Assume ~30k more.
+            estimateAiCostEur(0, 30_000)
+          }
+        />
+      )}
+
       {doc.document_type === "bank_statement" && (
         <ReconciliationPanel
           documentId={doc.id}
@@ -322,6 +335,24 @@ export default async function DocumentDetail({
               );
             })()}
           </div>
+
+          {/* Per-doc AI cost — only shown when we actually called Claude.
+             Deterministic parsers (CAMT, Rabobank CSV) have 0 tokens. */}
+          {(doc.ai_input_tokens || doc.ai_output_tokens) ? (
+            <div className="text-[11px] text-muted-foreground mb-3">
+              AI cost:{" "}
+              <span className="font-bold">
+                {formatAiCostEur(
+                  estimateAiCostEur(
+                    doc.ai_input_tokens,
+                    doc.ai_output_tokens
+                  )
+                )}
+              </span>{" "}
+              · {doc.ai_input_tokens?.toLocaleString() || 0} in /{" "}
+              {doc.ai_output_tokens?.toLocaleString() || 0} out tokens
+            </div>
+          ) : null}
 
           <div className="space-y-4">
             <Field label="Belongs To Profile">

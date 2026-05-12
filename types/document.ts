@@ -80,6 +80,13 @@ export interface DocumentRow {
   content_hash: string | null;          // SHA-256 of the uploaded buffer
   possible_duplicate_of: string | null; // FK to another documents.id
 
+  // AI usage tracking (migration 013)
+  ai_input_tokens: number | null;
+  ai_output_tokens: number | null;
+  ai_truncated: boolean;
+  ai_stop_reason: string | null;
+  ai_max_tokens_cap: number | null;
+
   uploaded_by: string | null;
   created_at: string;
   updated_at: string;

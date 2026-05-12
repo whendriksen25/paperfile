@@ -14,6 +14,10 @@ import {
   countPriorDocsFromSender,
 } from "@/lib/services/sender-history";
 import { looksLikeCamt053, parseCamt053 } from "@/lib/utils/camt-parser";
+import {
+  looksLikeRabobankCsv,
+  parseRabobankCsv,
+} from "@/lib/utils/rabobank-csv-parser";
 import { reconcileBankStatement } from "@/lib/services/bank-reconciliation";
 import { replaceStatementTransactions } from "@/lib/services/bank-transactions";
 import type { DocumentExtraction } from "@/types/document";
@@ -69,7 +73,12 @@ export async function POST(
     // statement (every NL bank exports this under "Periodieke afschriften"),
     // we parse it deterministically without sending to Claude. Faster,
     // cheaper, and far more accurate than OCR-from-PDF.
-    let result: Awaited<ReturnType<typeof extractDocument>>;
+    let result: DocumentExtraction | { error: string; raw_text: string; stop_reason: string | null } | null = null;
+    // AI usage gets recorded so the user can see what each doc cost.
+    // Set to zeros for the deterministic parser branches.
+    let aiUsage = { input_tokens: 0, output_tokens: 0 };
+    let aiStopReason: string | null = "end_turn";
+    let aiMaxCap = 0;
     if (looksLikeCamt053(buffer)) {
       try {
         const xmlText = buffer.toString("utf8");
@@ -123,7 +132,7 @@ export async function POST(
           due_date: null,
           action_summary: null,
         };
-        result = synthetic as Awaited<ReturnType<typeof extractDocument>>;
+        result = synthetic;
         console.log(
           `[api/analyze] CAMT fast-path: ${stmt.transactions.length} transactions parsed`
         );
@@ -132,11 +141,98 @@ export async function POST(
           "[api/analyze] CAMT parse failed, falling back to Claude:",
           e
         );
-        result = await extractDocument(buffer, doc.file_name || "file.xml");
+        const ex = await extractDocument(buffer, doc.file_name || "file.xml");
+        result = ex.data;
+        aiUsage = ex.usage;
+        aiStopReason = ex.stop_reason;
+        aiMaxCap = ex.max_tokens_cap;
+      }
+    } else if (looksLikeRabobankCsv(buffer)) {
+      // 1.6. Rabobank CSV fast path — same idea as CAMT.053 but for the
+      // bank's CSV exports. Parses every row deterministically, so we
+      // never hit Claude's 16k-token JSON-output cap (which silently
+      // truncates large statements). Detected by sniffing column headers
+      // (IBAN/BBAN + Bedrag + Datum + at least one of the Rabobank
+      // Dutch-only columns).
+      try {
+        const csvText = buffer.toString("utf8");
+        const stmt = parseRabobankCsv(csvText);
+        const debits = stmt.transactions.filter((t) => t.amount < 0);
+        const credits = stmt.transactions.filter((t) => t.amount > 0);
+        const totalDebit = debits.reduce((s, t) => s + Math.abs(t.amount), 0);
+        const totalCredit = credits.reduce((s, t) => s + t.amount, 0);
+        const synthetic: DocumentExtraction = {
+          document_type: "bank_statement",
+          document_subtype: null,
+          confidence: 1,
+          document_date: stmt.period_end,
+          sender: "Rabobank",
+          recipient: null,
+          language: "nl",
+          profile_hint: null,
+          amount: null,
+          currency: stmt.currency || "EUR",
+          purchase_category: null,
+          title: `Rabobank statement ${stmt.period_start || ""} – ${stmt.period_end || ""}`.trim(),
+          summary: `${stmt.transactions.length} transactions (${debits.length} debits totalling €${totalDebit.toFixed(2)}, ${credits.length} credits totalling €${totalCredit.toFixed(2)}).`,
+          tags: ["bank_statement", "rabobank", "csv"],
+          extracted_fields: {
+            account_iban: stmt.account_iban,
+            period_start: stmt.period_start,
+            period_end: stmt.period_end,
+            currency: stmt.currency,
+            line_items: stmt.transactions.map((t) => ({
+              description: t.description || t.counterparty_name || "(unspecified)",
+              category: "other",
+              total: t.amount,
+              currency: t.currency,
+              reference: t.reference,
+              counterparty_name: t.counterparty_name,
+              counterparty_iban: t.counterparty_iban,
+              transaction_id: t.transaction_id,
+              booking_date: t.booking_date,
+              value_date: t.value_date,
+            })),
+          },
+          ocr_text: undefined,
+          needs_action: false,
+          action_type: null,
+          due_date: null,
+          action_summary: null,
+        };
+        result = synthetic;
+        console.log(
+          `[api/analyze] Rabobank CSV fast-path: ${stmt.transactions.length} transactions parsed`
+        );
+      } catch (e) {
+        console.warn(
+          "[api/analyze] Rabobank CSV parse failed, falling back to Claude:",
+          e
+        );
+        const ex = await extractDocument(buffer, doc.file_name || "file.csv");
+        result = ex.data;
+        aiUsage = ex.usage;
+        aiStopReason = ex.stop_reason;
+        aiMaxCap = ex.max_tokens_cap;
       }
     } else {
       // 2. Default path — Claude extraction (PDF, image, etc.)
-      result = await extractDocument(buffer, doc.file_name || "file.pdf");
+      // Allow the caller to opt into the extended 128k cap via
+      // ?max_cap=extended (used by the "Retry full" button after a
+      // truncation).
+      const wantExtended =
+        request.nextUrl.searchParams.get("max_cap") === "extended";
+      const ex = await extractDocument(
+        buffer,
+        doc.file_name || "file.pdf",
+        wantExtended
+          ? { maxTokens: 131072, useExtendedOutput: true }
+          : undefined
+      );
+      result = ex.data;
+      aiUsage = ex.usage;
+      aiStopReason = ex.stop_reason;
+      aiMaxCap = ex.max_tokens_cap;
     }
 
     if (!result) {
@@ -547,6 +643,13 @@ export async function POST(
         // AI guess, name-token match, or completely unassigned). Cleared by
         // the user via the per-card Confirm button or the RefileWidget.
         needs_review: !profileId || provisional,
+        // AI usage tracking (migration 013) — lets the UI show per-doc
+        // cost and lets the user retry at the 128k cap when truncated.
+        ai_input_tokens: aiUsage.input_tokens || null,
+        ai_output_tokens: aiUsage.output_tokens || null,
+        ai_stop_reason: aiStopReason,
+        ai_max_tokens_cap: aiMaxCap || null,
+        ai_truncated: aiStopReason === "max_tokens",
         status: "processed",
       })
       .eq("id", id);

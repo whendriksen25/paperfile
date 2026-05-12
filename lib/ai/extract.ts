@@ -1,6 +1,11 @@
 import Anthropic from "@anthropic-ai/sdk";
 import * as path from "path";
 import { DOCUMENT_EXTRACTION_PROMPT } from "./prompts";
+import {
+  AI_MAX_TOKENS_DEFAULT,
+  AI_MAX_TOKENS_EXTENDED,
+  AI_EXTENDED_BETA_HEADER,
+} from "./pricing";
 import type { DocumentExtraction } from "@/types/document";
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -227,10 +232,32 @@ export interface ExtractionFailure {
   stop_reason: string | null;
 }
 
+/**
+ * Result envelope: extraction payload + usage metadata. Usage stays even
+ * on failed parses so we can still surface the cost + flag truncation
+ * to the user.
+ */
+export interface ExtractResult {
+  data: DocumentExtraction | ExtractionFailure | null;
+  usage: { input_tokens: number; output_tokens: number };
+  stop_reason: string | null;
+  max_tokens_cap: number;
+}
+
+export interface ExtractOptions {
+  /** Override the default 64k output cap. Pass AI_MAX_TOKENS_EXTENDED
+   *  (~128k) for the "Retry full" path. */
+  maxTokens?: number;
+  /** When true, sends the Sonnet 4 extended-output beta header so the
+   *  model is allowed to actually emit up to ~128k tokens. */
+  useExtendedOutput?: boolean;
+}
+
 export async function extractDocument(
   fileBuffer: Buffer,
-  filename: string
-): Promise<DocumentExtraction | ExtractionFailure | null> {
+  filename: string,
+  opts: ExtractOptions = {}
+): Promise<ExtractResult> {
   console.log("[ai/extract] starting extraction for:", filename);
 
   const mimeType = getMimeType(filename);
@@ -271,15 +298,25 @@ export async function extractDocument(
     });
   }
 
-  const response = await client.messages.create({
-    model: "claude-sonnet-4-20250514",
-    // 16k tokens — comfortably fits a multi-page bill with full OCR text +
-    // line items. The previous 8k limit was the most common cause of
-    // truncated-mid-JSON failures on long receipts.
-    max_tokens: 16384,
-    temperature: 0,
-    messages: [{ role: "user", content: contentBlocks }],
-  });
+  const maxTokens = opts.maxTokens ?? AI_MAX_TOKENS_DEFAULT;
+  const useExtended =
+    opts.useExtendedOutput || maxTokens > AI_MAX_TOKENS_DEFAULT;
+  const response = await client.messages.create(
+    {
+      model: "claude-sonnet-4-20250514",
+      // Default 64k tokens covers ~250-transaction bank statements,
+      // ~80 pages of dense text, any realistic receipt/invoice.
+      // Caller can opt into the 128k extended cap (with the beta header)
+      // via opts.maxTokens + opts.useExtendedOutput — used by the
+      // "Retry full" path after a truncation.
+      max_tokens: maxTokens,
+      temperature: 0,
+      messages: [{ role: "user", content: contentBlocks }],
+    },
+    useExtended
+      ? { headers: { "anthropic-beta": AI_EXTENDED_BETA_HEADER } }
+      : undefined
+  );
 
   const textBlock = response.content.find((b) => b.type === "text");
   const rawText = textBlock && "text" in textBlock ? textBlock.text : "";
@@ -290,14 +327,35 @@ export async function extractDocument(
     filename,
     "stop:",
     response.stop_reason,
+    "in:",
+    response.usage?.input_tokens,
+    "out:",
+    response.usage?.output_tokens,
     "parsed?",
     !!parsed
   );
 
-  if (parsed) return parsed as unknown as DocumentExtraction;
+  const usage = {
+    input_tokens: response.usage?.input_tokens || 0,
+    output_tokens: response.usage?.output_tokens || 0,
+  };
+
+  if (parsed) {
+    return {
+      data: parsed as unknown as DocumentExtraction,
+      usage,
+      stop_reason: response.stop_reason || null,
+      max_tokens_cap: maxTokens,
+    };
+  }
   return {
-    error: "parse_failed",
-    raw_text: rawText,
+    data: {
+      error: "parse_failed",
+      raw_text: rawText,
+      stop_reason: response.stop_reason || null,
+    } as ExtractionFailure,
+    usage,
     stop_reason: response.stop_reason || null,
+    max_tokens_cap: maxTokens,
   };
 }
