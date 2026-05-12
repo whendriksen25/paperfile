@@ -817,10 +817,28 @@ export async function POST(
             `[api/analyze] wrote ${r.inserted} rows to bank_transactions`
           );
         } catch (e) {
-          console.warn(
-            "[api/analyze] bank_transactions write failed",
-            e
-          );
+          const msg =
+            e instanceof Error ? e.message : String(e);
+          console.warn("[api/analyze] bank_transactions write failed", e);
+          // Surface the failure in the UI so the user sees WHY their
+          // statement looks empty — instead of an empty Reconciliation
+          // panel with no explanation. Doesn't fail the whole analyze:
+          // the doc is still useful (extracted_fields has line_items as
+          // a backup); we just couldn't index them into the table.
+          try {
+            await admin
+              .from("documents")
+              .update({
+                needs_review: true,
+                review_notes: `bank_transactions write failed (${transactions.length} transactions): ${msg.slice(0, 500)}`,
+              })
+              .eq("id", id);
+          } catch (e2) {
+            console.warn(
+              "[api/analyze] also failed to record review_notes",
+              e2
+            );
+          }
         }
 
         // Compute a tiny summary so the inbox card can show "5 txns,
