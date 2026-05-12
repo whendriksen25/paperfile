@@ -102,7 +102,24 @@ export async function replaceStatementTransactions(
         `[replaceStatementTransactions] chunk insert failed at ${i}/${payload.length}:`,
         insErr
       );
-      throw insErr;
+      // PostgrestError isn't a real Error instance — wrap it so the
+      // caller's `e instanceof Error` + e.message handling works and
+      // the user sees a useful string in review_notes, not [object Object].
+      const e = insErr as {
+        message?: string;
+        code?: string;
+        details?: string;
+        hint?: string;
+      };
+      const parts = [
+        e.message || JSON.stringify(insErr),
+        e.code ? `(code ${e.code})` : null,
+        e.details ? `details: ${e.details}` : null,
+        e.hint ? `hint: ${e.hint}` : null,
+      ].filter(Boolean);
+      throw new Error(
+        `bank_transactions insert failed at row ${i}/${payload.length}: ${parts.join(" — ")}`
+      );
     }
     inserted += slice.length;
   }

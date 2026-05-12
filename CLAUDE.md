@@ -96,6 +96,31 @@ describe each key/setting in one plain sentence. Concise. Less is more.
 
 ---
 
+# Time-stamping (always)
+
+Every time Claude **adds** something — a file, a code change, a migration, a script,
+a commit instruction, a chat reply that lays out work to be deployed — Claude
+prefixes a timestamp so the chat doubles as a dated activity log.
+
+Format: `[YYYY-MM-DD HH:MM:SS TZ]`, e.g. `[2026-05-12 14:32:10 CEST]`.
+
+How Claude gets the current time:
+
+```
+date "+%Y-%m-%d %H:%M:%S %Z"
+```
+
+When the timestamp goes in:
+- At the top of the response when a new file/change is added.
+- At the top of every Bash command Claude runs (already enforced by
+  `project_specs.md`'s working-log convention).
+- In commit messages when handy (not required — git already timestamps).
+
+Skip the timestamp only for pure-conversation replies (no file edits, no
+commands, no work being shipped).
+
+---
+
 # Tech Stack
 
 - **Language:** TypeScript

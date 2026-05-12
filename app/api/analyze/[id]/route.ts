@@ -817,8 +817,24 @@ export async function POST(
             `[api/analyze] wrote ${r.inserted} rows to bank_transactions`
           );
         } catch (e) {
-          const msg =
-            e instanceof Error ? e.message : String(e);
+          // Defensive: handle real Errors, Supabase PostgrestError plain
+          // objects, and unknown shapes. The plain-object case is what
+          // produced "[object Object]" in earlier review_notes.
+          let msg: string;
+          if (e instanceof Error) {
+            msg = e.message;
+          } else if (e && typeof e === "object") {
+            const o = e as Record<string, unknown>;
+            const parts = [
+              typeof o.message === "string" ? o.message : null,
+              typeof o.code === "string" ? `(code ${o.code})` : null,
+              typeof o.details === "string" ? `details: ${o.details}` : null,
+              typeof o.hint === "string" ? `hint: ${o.hint}` : null,
+            ].filter(Boolean) as string[];
+            msg = parts.length ? parts.join(" — ") : JSON.stringify(e).slice(0, 500);
+          } else {
+            msg = String(e);
+          }
           console.warn("[api/analyze] bank_transactions write failed", e);
           // Surface the failure in the UI so the user sees WHY their
           // statement looks empty — instead of an empty Reconciliation
