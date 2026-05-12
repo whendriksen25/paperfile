@@ -183,7 +183,9 @@ export async function reconcileBankStatement(
   userId: string,
   statementDocId: string
 ): Promise<ReconciliationResult> {
-  // 1. Load transactions from the table (source of truth)
+  // 1. Load transactions from the table (source of truth). PostgREST
+  // defaults to 1000 rows per SELECT; full-year statements can have
+  // 1000+ transactions, so explicitly raise the cap.
   const { data: txRowsRaw, error: txErr } = await admin
     .from("bank_transactions")
     .select(
@@ -191,7 +193,8 @@ export async function reconcileBankStatement(
     )
     .eq("user_id", userId)
     .eq("statement_id", statementDocId)
-    .order("position", { ascending: true });
+    .order("position", { ascending: true })
+    .range(0, 9999);
   if (txErr) throw txErr;
   const txRows = (txRowsRaw || []) as BankTransactionRow[];
 

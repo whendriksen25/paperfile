@@ -100,7 +100,11 @@ export default async function DocumentDetail({
         "amount, currency, counterparty_name, counterparty_iban, description, reference, booking_date, value_date, position"
       )
       .eq("statement_id", id)
-      .order("position", { ascending: true });
+      .order("position", { ascending: true })
+      // PostgREST defaults to 1000 rows per SELECT. A year-long statement
+      // can easily have 1000+ transactions — override with a generous cap
+      // so we never silently truncate the list.
+      .range(0, 9999);
     bankTransactions = (txRows || []) as typeof bankTransactions;
   }
 

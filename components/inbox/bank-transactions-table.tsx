@@ -5,12 +5,16 @@ import { formatDate, formatMoney } from "@/lib/utils/format";
  * Different shape than receipt/invoice line items — bank lines have
  * date / counterparty / reference / amount instead of qty / unit / total.
  *
- * Each transaction comes from `extracted_fields.line_items` and is
- * expected to carry: total (signed), counterparty_name, counterparty_iban,
- * reference, description, booking_date / value_date.
+ * Transactions come from the bank_transactions table (canonical column
+ * name: `amount`). Older callers that pass `total` (e.g. when transactions
+ * are pulled from extracted_fields.line_items in legacy code paths) are
+ * still supported via the alias.
  */
 export interface BankTx {
   description?: string | null;
+  /** Canonical signed amount column from bank_transactions. */
+  amount?: number | null;
+  /** Backward-compat alias for older callers passing line_items shape. */
   total?: number | null;
   currency?: string | null;
   counterparty_name?: string | null;
@@ -20,6 +24,12 @@ export interface BankTx {
   value_date?: string | null;
   transaction_id?: string | null;
   cdt_dbt?: string | null;
+}
+
+/** Pull the signed amount from a transaction regardless of which field carries it. */
+function amountOf(t: BankTx): number {
+  const v = t.amount ?? t.total;
+  return typeof v === "number" ? v : Number(v);
 }
 
 export function BankTransactionsTable({
@@ -42,7 +52,7 @@ export function BankTransactionsTable({
 
   const totals = transactions.reduce(
     (acc, t) => {
-      const amt = Number(t.total);
+      const amt = amountOf(t);
       if (!Number.isFinite(amt)) return acc;
       if (amt < 0) acc.debit += Math.abs(amt);
       else if (amt > 0) acc.credit += amt;
@@ -88,7 +98,7 @@ export function BankTransactionsTable({
           </thead>
           <tbody>
             {transactions.map((t, i) => {
-              const amt = Number(t.total);
+              const amt = amountOf(t);
               const isDebit = Number.isFinite(amt) && amt < 0;
               const dateStr =
                 t.booking_date || t.value_date || null;
