@@ -372,10 +372,14 @@ export async function reconcileBankStatement(
 
     if (candidates.length === 0) {
       result.unmatched++;
-      await admin
-        .from("bank_transactions")
-        .update({ match_status: "unmatched" })
-        .eq("id", tx.id);
+      // Intentionally NO per-row UPDATE here: with 800+ unmatched debits
+      // per statement, the round-trip latency to Supabase (30-50ms × 800)
+      // alone blows past Vercel's 60s function limit before the AI pass
+      // even starts. The panel treats NULL match_status as unmatched, so
+      // leaving it NULL is identical visually and saves the entire
+      // bottleneck. Re-runs clear matched_* + match_status in one bulk
+      // UPDATE at the top, so there's no stale "matched" state to worry
+      // about.
       continue;
     }
     if (candidates.length > 1) {

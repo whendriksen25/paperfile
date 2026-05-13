@@ -103,6 +103,20 @@ export function ReconciliationPanel({
       const res = await fetch(`/api/documents/${documentId}/reconcile`, {
         method: "POST",
       });
+      // Vercel's function-timeout error page is HTML starting with "An
+      // error occurred..." — JSON.parse on that throws "Unexpected
+      // token A", which is unhelpful. Detect by content-type and read
+      // as text instead so the user sees what actually happened.
+      const ct = res.headers.get("content-type") || "";
+      if (!ct.includes("application/json")) {
+        const txt = await res.text();
+        const snippet = txt.slice(0, 120).replace(/\s+/g, " ").trim();
+        throw new Error(
+          res.status === 504 || /timeout|gateway/i.test(snippet)
+            ? "Reconcile timed out (function exceeded 60s). The AI pass was likely too long — try again, or contact support."
+            : `Reconcile failed (${res.status}): ${snippet}`
+        );
+      }
       const json = await res.json();
       if (!res.ok) throw new Error(json.error || "Reconcile failed");
       setData({ ran_at: new Date().toISOString(), ...json.result });

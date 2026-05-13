@@ -177,8 +177,16 @@ function extractRef(
 /**
  * Pre-filter unmatched debits to plausible candidates for each bill,
  * then build the union so the AI sees a manageable set. This is what
- * keeps the prompt cheap regardless of statement size.
+ * keeps the prompt cheap (and the AI call fast) regardless of statement
+ * size.
+ *
+ * Hard cap: PER_BILL_CAP candidates per bill. With 50+ bills on a
+ * full-year statement, an unbounded ±30% window can otherwise sweep in
+ * 800+ debits and the prompt balloons past Vercel's 60s timeout.
  */
+const PER_BILL_CAP = 25;
+const TOTAL_CANDIDATE_CAP = 250;
+
 function filterCandidateDebits(
   bills: UnmatchedBill[],
   allDebits: UnmatchedDebit[]
@@ -187,39 +195,42 @@ function filterCandidateDebits(
   for (const bill of bills) {
     if (bill.amount == null) continue;
     const billAbs = Math.abs(bill.amount);
-    // Amount window: ±30% or ±€10 — catches late fees, partial pay,
-    // and amount ranges that suggest "combined payment that includes
-    // this bill". Tighter than that risks missing real adjustments.
-    const lo = billAbs * 0.7 - 10;
-    const hi = billAbs * 1.3 + 10;
-    // Date window: ±90 days from the bill's reference date.
+    // Amount window: ±20% or ±€5 — tight enough to keep prompts cheap,
+    // wide enough to catch late fees and minor adjustments.
+    const lo = billAbs * 0.8 - 5;
+    const hi = billAbs * 1.2 + 5;
+    // Date window: ±60 days from the bill's reference date.
     const ref = bill.document_date || bill.due_date;
+    type Scored = { id: string; score: number };
+    const scored: Scored[] = [];
     for (const tx of allDebits) {
       const txAbs = Math.abs(tx.amount);
       if (txAbs < lo || txAbs > hi) continue;
+      let score = 1;
       if (ref && tx.booking_date) {
         const dDays =
           Math.abs(
             new Date(ref).getTime() - new Date(tx.booking_date).getTime()
           ) / 86400000;
-        if (dDays > 90) continue;
+        if (dDays > 60) continue;
+        score = 1 - dDays / 60; // closer date = higher score
       }
-      keep.add(tx.id);
-    }
-    // Also keep debits to the same IBAN regardless of amount — covers
-    // refund pairs and vendor-relationship matches.
-    if (bill.iban) {
-      for (const tx of allDebits) {
-        if (
-          (tx.counterparty_iban || "").toUpperCase().replace(/\s+/g, "") ===
+      // Same-IBAN bumps score
+      if (
+        bill.iban &&
+        (tx.counterparty_iban || "").toUpperCase().replace(/\s+/g, "") ===
           bill.iban
-        ) {
-          keep.add(tx.id);
-        }
+      ) {
+        score += 1;
       }
+      scored.push({ id: tx.id, score });
     }
+    // Keep top PER_BILL_CAP candidates per bill by score.
+    scored.sort((a, b) => b.score - a.score);
+    for (const s of scored.slice(0, PER_BILL_CAP)) keep.add(s.id);
   }
-  return allDebits.filter((t) => keep.has(t.id));
+  // Apply total cap so a runaway statement can't blow the prompt.
+  return allDebits.filter((t) => keep.has(t.id)).slice(0, TOTAL_CANDIDATE_CAP);
 }
 
 export async function aiReconcileLeftovers(
@@ -321,18 +332,30 @@ export async function aiReconcileLeftovers(
     2
   );
 
+  // Hard 35s timeout — Vercel functions cap at 60s on Hobby; we need
+  // headroom for the deterministic pass that's already run + the per-
+  // match DB writes that follow. If the AI takes longer than this we
+  // record the leftovers as suspicions on the next click rather than
+  // crashing the function.
   let resp;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 35_000);
   try {
-    resp = await client.messages.create({
-      model: MODEL,
-      max_tokens: 16384,
-      system: SYSTEM_PROMPT,
-      messages: [{ role: "user", content: userMsg }],
-    });
+    resp = await client.messages.create(
+      {
+        model: MODEL,
+        max_tokens: 8192,
+        system: SYSTEM_PROMPT,
+        messages: [{ role: "user", content: userMsg }],
+      },
+      { signal: controller.signal }
+    );
   } catch (e) {
     out.ai_call_skipped = true;
     out.skip_reason = `AI call failed: ${e instanceof Error ? e.message : String(e)}`;
     return out;
+  } finally {
+    clearTimeout(timeoutId);
   }
 
   const text =
