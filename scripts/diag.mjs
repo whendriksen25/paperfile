@@ -217,6 +217,155 @@ async function cmdBankStats() {
 // (cascading away the matched_* state). The action side is still done; this
 // command restores the orphan back-links so the statement detail page and
 // bank-stats agree with reality.
+// Dump every maintenance_log entry for a statement (kind = bank_reconcile).
+// Shows action_id + bank_transaction_id + amount + timestamp so we can tell
+// double-run-on-same-rows from over-matched-one-action-to-many-txs.
+// Honest "bills paid via this statement" report.
+//
+// Avoids the misleading "0.5% of debits matched" headline by counting only:
+//   - distinct pay-actions settled by this statement (matched_action_id),
+//   - the total € paid against those bills,
+// then contrasted with bills that were OPEN at any point during the
+// statement period, so the percentage reflects payable bills only, not
+// every routine debit.
+async function cmdBillsPaid() {
+  const [idArg] = positional();
+  if (!idArg) throw new Error("Usage: diag bills-paid <statement-id-or-prefix>");
+  const supabase = admin();
+  const statementId = await resolveId(supabase, "documents", idArg);
+  if (!statementId) {
+    console.error(`No documents row found matching "${idArg}"`);
+    process.exit(1);
+  }
+
+  // Statement period (min/max booking_date of its transactions).
+  const dateRows = await fetchAll(supabase, (from, to) =>
+    supabase
+      .from("bank_transactions")
+      .select("booking_date, amount, matched_action_id, matched_document_id")
+      .eq("statement_id", statementId)
+      .range(from, to)
+  );
+  let minDate = null,
+    maxDate = null;
+  let paidAmount = 0;
+  const matchedActionIds = new Set();
+  for (const r of dateRows) {
+    const d = r.booking_date;
+    if (d) {
+      if (!minDate || d < minDate) minDate = d;
+      if (!maxDate || d > maxDate) maxDate = d;
+    }
+    if (r.matched_action_id) {
+      matchedActionIds.add(r.matched_action_id);
+      paidAmount += Math.abs(Number(r.amount) || 0);
+    }
+  }
+  if (!minDate) {
+    console.log("(statement has no dated transactions)");
+    return;
+  }
+
+  // Bills (pay-actions) that were open during the statement period —
+  // i.e. created on or before maxDate, and either still open OR closed
+  // with completed_at on or after minDate.
+  const { data: actions, error: aErr } = await supabase
+    .from("actions")
+    .select(
+      "id, status, completed_at, created_at, due_date, document:documents(amount, sender)"
+    )
+    .eq("action_type", "pay")
+    .lte("created_at", maxDate + "T23:59:59")
+    .limit(2000);
+  if (aErr) throw aErr;
+
+  let openInPeriod = 0,
+    totalOwed = 0;
+  for (const a of actions || []) {
+    const closedInWindow =
+      a.status !== "open" && (!a.completed_at || a.completed_at >= minDate);
+    if (a.status === "open" || closedInWindow) {
+      openInPeriod++;
+      const amt = a.document?.amount;
+      if (amt != null) totalOwed += Math.abs(Number(amt));
+    }
+  }
+
+  const pct =
+    openInPeriod > 0 ? ((matchedActionIds.size / openInPeriod) * 100).toFixed(1) : "—";
+  const pctMoney =
+    totalOwed > 0 ? ((paidAmount / totalOwed) * 100).toFixed(1) : "—";
+
+  console.log(`statement_id: ${statementId}`);
+  console.log(`period:       ${minDate}  →  ${maxDate}`);
+  console.log("");
+  console.log(`Bills paid via this statement:    ${matchedActionIds.size}`);
+  console.log(`Bills open during this period:    ${openInPeriod}`);
+  console.log(`  → ${pct}% of payable bills settled`);
+  console.log("");
+  console.log(`€ paid against tracked bills:     ${fmtMoney(paidAmount)}`);
+  console.log(`€ owed across open bills:         ${fmtMoney(totalOwed)}`);
+  console.log(`  → ${pctMoney}% of tracked invoice value settled`);
+  console.log("");
+  console.log(
+    "(The other debits in this statement are routine spend — POS, fuel,"
+  );
+  console.log(
+    " subs, transfers — with no Paperfile invoice to reconcile against.)"
+  );
+}
+
+async function cmdReconcileLog() {
+  const [idArg] = positional();
+  if (!idArg)
+    throw new Error("Usage: diag reconcile-log <statement-id-or-prefix>");
+  const supabase = admin();
+  const statementId = await resolveId(supabase, "documents", idArg);
+  if (!statementId) {
+    console.error(`No documents row found matching "${idArg}"`);
+    process.exit(1);
+  }
+  const { data, error } = await supabase
+    .from("maintenance_log")
+    .select("id, payload, created_at, reason")
+    .eq("kind", "bank_reconcile")
+    .order("created_at", { ascending: true })
+    .limit(2000);
+  if (error) throw error;
+  const rows = (data || []).filter(
+    (r) => r.payload?.statement_doc_id === statementId
+  );
+  console.log(`statement_id: ${statementId}`);
+  console.log(`bank_reconcile entries: ${rows.length}\n`);
+  if (rows.length === 0) {
+    console.log("(no entries)");
+    return;
+  }
+  const actionIds = new Set();
+  const txIds = new Set();
+  for (const r of rows) {
+    const p = r.payload || {};
+    actionIds.add(p.action_id);
+    txIds.add(p.bank_transaction_id);
+    const ts = r.created_at.slice(11, 19);
+    console.log(
+      `  ${r.created_at.slice(0, 10)} ${ts}  action=${String(p.action_id || "").slice(0, 8)}  tx=${String(p.bank_transaction_id || "").slice(0, 8)}  ${Number(p.amount).toFixed(2)}  ${p.counterparty || "—"}`
+    );
+  }
+  console.log(
+    `\nDistinct action_ids: ${actionIds.size}   distinct bank_transaction_ids: ${txIds.size}`
+  );
+  if (rows.length > actionIds.size && txIds.size === actionIds.size) {
+    console.log(
+      "  → reconcile fired twice on identical bank_transactions state (double-run); back-links were idempotent."
+    );
+  } else if (txIds.size > actionIds.size) {
+    console.log(
+      "  → one action was matched to multiple bank transactions (over-matching). Need a many-to-one guard in the matcher."
+    );
+  }
+}
+
 async function cmdRepairMatches() {
   const [idArg] = positional();
   const dryRun = rest.includes("--dry-run");
@@ -743,6 +892,8 @@ Subcommands:
   transactions   <statement-id-or-prefix> [--limit=N] [--filter=debits|credits|unmatched]
   doc            <doc-id-or-prefix>
   reconcile-summary <statement-id-or-prefix>
+  reconcile-log  <statement-id-or-prefix>
+  bills-paid     <statement-id-or-prefix>
   repair-matches <statement-id-or-prefix> [--dry-run]
   pay-actions    [--limit=50]
   match-debug    <tx-id-or-prefix>
@@ -763,6 +914,8 @@ const dispatch = {
   transactions: cmdTransactions,
   doc: cmdDoc,
   "reconcile-summary": cmdReconcileSummary,
+  "reconcile-log": cmdReconcileLog,
+  "bills-paid": cmdBillsPaid,
   "repair-matches": cmdRepairMatches,
   "pay-actions": cmdPayActions,
   "match-debug": cmdMatchDebug,
