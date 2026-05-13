@@ -619,14 +619,43 @@ async function cmdReconcileSummary() {
   }
   console.log(`statement_id: ${statementId}`);
   console.log(`ran_at:       ${summary.ran_at}`);
-  console.log(`considered:   ${summary.considered}`);
-  console.log(`matched:      ${summary.matched}`);
-  console.log(`ambiguous:    ${summary.ambiguous}`);
-  console.log(`unmatched:    ${summary.unmatched}`);
+  console.log("");
+  console.log("Deterministic pass:");
+  console.log(`  considered:  ${summary.considered}`);
+  console.log(`  matched:     ${summary.matched}`);
+  console.log(`  ambiguous:   ${summary.ambiguous}`);
+  console.log(`  unmatched:   ${summary.unmatched}`);
   if (summary.back_link_write_failures !== undefined) {
     console.log(
-      `back_link_write_failures: ${summary.back_link_write_failures}  ${summary.back_link_write_failures > 0 ? "⚠  matches written in memory but NOT persisted to bank_transactions" : ""}`
+      `  back_link_write_failures: ${summary.back_link_write_failures}  ${summary.back_link_write_failures > 0 ? "⚠  matches written in memory but NOT persisted to bank_transactions" : ""}`
     );
+  }
+  if (summary.reset) {
+    console.log("");
+    console.log("Reset sub-block (Reset button was used):");
+    console.log(`  reopened_actions: ${summary.reset.reopened_actions}`);
+    console.log(`  restored_docs:    ${summary.reset.restored_docs}`);
+  }
+  if (summary.ai) {
+    console.log("");
+    console.log("AI pass:");
+    if (summary.ai.error) {
+      console.log(`  error:               ${summary.ai.error}`);
+    } else if (summary.ai.ai_call_skipped) {
+      console.log(`  ai_call_skipped:     true`);
+      console.log(`  skip_reason:         ${summary.ai.skip_reason}`);
+      console.log(`  considered_bills:    ${summary.ai.considered_bills}`);
+      console.log(`  considered_debits:   ${summary.ai.considered_debits}`);
+    } else {
+      console.log(`  considered_bills:    ${summary.ai.considered_bills}`);
+      console.log(`  considered_debits:   ${summary.ai.considered_debits}`);
+      console.log(`  matches_applied:     ${summary.ai.ai_matches_applied}  (confidence ≥ 80%, silent)`);
+      console.log(`  matches_flagged:     ${summary.ai.ai_matches_flagged}  (confidence 50–79%, "verify" tag)`);
+      console.log(`  suspicions_recorded: ${summary.ai.ai_suspicions_recorded}  (< 50%, awaiting confirm/dismiss)`);
+    }
+  } else {
+    console.log("");
+    console.log("AI pass: (no record — either pre-AI-pass code, or skipped without writing)");
   }
 }
 
