@@ -6,6 +6,7 @@ import {
   CheckCircle2,
   AlertTriangle,
   RefreshCw,
+  RotateCcw,
   Loader2,
   ChevronDown,
   ChevronUp,
@@ -70,6 +71,7 @@ export function ReconciliationPanel({
   const router = useRouter();
   const [data, setData] = useState(initial);
   const [running, setRunning] = useState(false);
+  const [resetting, setResetting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [openBucket, setOpenBucket] = useState<Bucket | null>(null);
 
@@ -95,6 +97,43 @@ export function ReconciliationPanel({
     }
     return { matched: m, ambiguous: a, unmatched: u, suspicions: s };
   }, [transactions]);
+
+  async function reset() {
+    const confirmed = window.confirm(
+      "Reset and re-reconcile: this will reopen every pay-action this " +
+        "statement previously closed, clear their paid status on the " +
+        "source bills, and re-run the full matcher pass (deterministic + " +
+        "AI). Actions closed by other statements or manually are not " +
+        "touched.\n\nContinue?"
+    );
+    if (!confirmed) return;
+    setResetting(true);
+    setError(null);
+    try {
+      const res = await fetch(
+        `/api/documents/${documentId}/reconcile-reset`,
+        { method: "POST" }
+      );
+      const ct = res.headers.get("content-type") || "";
+      if (!ct.includes("application/json")) {
+        const txt = await res.text();
+        const snippet = txt.slice(0, 120).replace(/\s+/g, " ").trim();
+        throw new Error(
+          res.status === 504 || /timeout|gateway/i.test(snippet)
+            ? "Reset timed out (function exceeded 60s)."
+            : `Reset failed (${res.status}): ${snippet}`
+        );
+      }
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error || "Reset failed");
+      setData({ ran_at: new Date().toISOString(), ...json.result });
+      router.refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Network error");
+    } finally {
+      setResetting(false);
+    }
+  }
 
   async function reconcile() {
     setRunning(true);
@@ -139,19 +178,35 @@ export function ReconciliationPanel({
           <CheckCircle2 className="h-4 w-4 text-brand-teal" />
           <div className="text-sm font-bold">Reconciliation</div>
         </div>
-        <button
-          type="button"
-          onClick={reconcile}
-          disabled={running}
-          className="text-xs font-semibold text-brand-teal hover:opacity-80 inline-flex items-center gap-1 disabled:opacity-50"
-        >
-          {running ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-          ) : (
-            <RefreshCw className="h-3.5 w-3.5" />
-          )}
-          Re-reconcile
-        </button>
+        <div className="flex items-center gap-3">
+          <button
+            type="button"
+            onClick={reset}
+            disabled={running || resetting}
+            title="Reopen all previously-matched bills from this statement and start over"
+            className="text-xs font-semibold text-rose-700 hover:opacity-80 inline-flex items-center gap-1 disabled:opacity-50"
+          >
+            {resetting ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <RotateCcw className="h-3.5 w-3.5" />
+            )}
+            Reset
+          </button>
+          <button
+            type="button"
+            onClick={reconcile}
+            disabled={running || resetting}
+            className="text-xs font-semibold text-brand-teal hover:opacity-80 inline-flex items-center gap-1 disabled:opacity-50"
+          >
+            {running ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <RefreshCw className="h-3.5 w-3.5" />
+            )}
+            Re-reconcile
+          </button>
+        </div>
       </div>
 
       {data ? (
