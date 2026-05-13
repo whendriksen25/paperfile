@@ -5,6 +5,11 @@
 //
 // Usage:
 //   node --env-file=.env.local scripts/diag.mjs <subcommand> [args...]
+//   npm run diag <subcommand> [args...]
+//
+// Note: when going through `npm run`, any --flag arguments need to come
+// after a literal `--` separator, otherwise npm eats them:
+//   npm run diag repair-matches 337361aa -- --dry-run
 //
 // Subcommands:
 //   bank-stats <statement-id-or-prefix>
@@ -729,6 +734,8 @@ diag — diagnostic CLI for document-archive
 
 Usage:
   node --env-file=.env.local scripts/diag.mjs <subcommand> [args...]
+  npm run diag <subcommand> [args...]
+  npm run diag <subcommand> <args> -- --flag    (npm eats --flags without --)
 
 Subcommands:
   bank-stats     <statement-id-or-prefix>
