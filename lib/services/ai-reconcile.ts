@@ -201,27 +201,36 @@ function extractRef(
 
 /**
  * Pre-filter unmatched debits to plausible candidates for a small set
- * of bills (one chunk). With chunking we keep the per-call prompt small,
- * so we can afford a generous per-bill candidate cap.
+ * of bills (one chunk). Two layers of cap:
+ *   - PER_BILL_CAP: top N highest-scored debits per individual bill
+ *   - TOTAL_PER_CHUNK_CAP: hard ceiling on the union (post-dedup) sent
+ *     to the AI per chunk. Without this the set can balloon when bills
+ *     share IBANs/amount ranges (real data: 88 candidates in one chunk
+ *     timed Haiku out at 15s).
+ *
+ * Scoring is the same per-bill (date proximity + IBAN bonus). The chunk-
+ * level cap keeps the prompt small enough for Haiku to finish in <10s.
  */
-const PER_BILL_CAP = 20;
+const PER_BILL_CAP = 8;
+const TOTAL_PER_CHUNK_CAP = 30;
 
 function filterCandidateDebits(
   bills: UnmatchedBill[],
   allDebits: UnmatchedDebit[],
   excludeDebitIds?: Set<string>
 ): UnmatchedDebit[] {
-  const keep = new Set<string>();
+  // Build a per-debit BEST score across all bills in this chunk.
+  // We keep the top TOTAL_PER_CHUNK_CAP debits by best-score, after
+  // first applying the per-bill cap as a sanity filter.
+  type Scored = { id: string; score: number };
+  const billPicks: Scored[][] = [];
   for (const bill of bills) {
     if (bill.amount == null) continue;
     const billAbs = Math.abs(bill.amount);
-    // Amount window: ±20% or ±€5 — tight enough to keep prompts cheap,
-    // wide enough to catch late fees and minor adjustments.
-    const lo = billAbs * 0.8 - 5;
-    const hi = billAbs * 1.2 + 5;
-    // Date window: ±60 days from the bill's reference date.
+    // Amount window: ±15% or ±€5.
+    const lo = billAbs * 0.85 - 5;
+    const hi = billAbs * 1.15 + 5;
     const ref = bill.document_date || bill.due_date;
-    type Scored = { id: string; score: number };
     const scored: Scored[] = [];
     for (const tx of allDebits) {
       if (excludeDebitIds && excludeDebitIds.has(tx.id)) continue;
@@ -233,10 +242,9 @@ function filterCandidateDebits(
           Math.abs(
             new Date(ref).getTime() - new Date(tx.booking_date).getTime()
           ) / 86400000;
-        if (dDays > 60) continue;
-        score = 1 - dDays / 60; // closer date = higher score
+        if (dDays > 45) continue; // tighter date window: ±45 days
+        score = 1 - dDays / 45;
       }
-      // Same-IBAN bumps score
       if (
         bill.iban &&
         (tx.counterparty_iban || "").toUpperCase().replace(/\s+/g, "") ===
@@ -247,8 +255,22 @@ function filterCandidateDebits(
       scored.push({ id: tx.id, score });
     }
     scored.sort((a, b) => b.score - a.score);
-    for (const s of scored.slice(0, PER_BILL_CAP)) keep.add(s.id);
+    billPicks.push(scored.slice(0, PER_BILL_CAP));
   }
+  // Merge per-bill picks, keeping best score per debit.
+  const bestScore = new Map<string, number>();
+  for (const list of billPicks) {
+    for (const { id, score } of list) {
+      const prev = bestScore.get(id);
+      if (prev == null || score > prev) bestScore.set(id, score);
+    }
+  }
+  // Sort by best score and take the top TOTAL_PER_CHUNK_CAP.
+  const top = Array.from(bestScore.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, TOTAL_PER_CHUNK_CAP)
+    .map(([id]) => id);
+  const keep = new Set(top);
   return allDebits.filter((t) => keep.has(t.id));
 }
 
