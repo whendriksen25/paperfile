@@ -74,6 +74,54 @@ export function ReconciliationPanel({
   const [resetting, setResetting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [openBucket, setOpenBucket] = useState<Bucket | null>(null);
+  const [aiProgress, setAiProgress] = useState<{
+    total: number;
+    completed: number;
+    matches: number;
+    suspicions: number;
+  } | null>(null);
+
+  // Drive the AI pass by polling /api/reconcile-step/[job_id] until done.
+  // Each POST processes one chunk (~6-10s on Haiku); we poll ~every 2s
+  // so the next chunk fires as soon as the previous finished. The panel
+  // shows a progress bar while running.
+  async function driveAiJob(jobId: string, totalChunks: number) {
+    setAiProgress({ total: totalChunks, completed: 0, matches: 0, suspicions: 0 });
+    let safetyCounter = 0;
+    const MAX_STEPS = totalChunks + 5; // headroom for retries/idle steps
+    while (safetyCounter++ < MAX_STEPS) {
+      try {
+        const res = await fetch(`/api/reconcile-step/${jobId}`, {
+          method: "POST",
+        });
+        if (!res.ok) break;
+        const json = (await res.json()) as {
+          status: "pending" | "processing" | "done" | "failed";
+          completed_chunks: number;
+          total_chunks: number;
+          just_processed?: {
+            matches: number;
+            suspicions: number;
+          };
+        };
+        setAiProgress((prev) => ({
+          total: json.total_chunks,
+          completed: json.completed_chunks,
+          matches: (prev?.matches || 0) + (json.just_processed?.matches || 0),
+          suspicions:
+            (prev?.suspicions || 0) + (json.just_processed?.suspicions || 0),
+        }));
+        if (json.status === "done" || json.status === "failed") break;
+      } catch (e) {
+        console.warn("[reconcile-panel] step polling error:", e);
+        break;
+      }
+      // Small breather so we don't hammer; chunks take ~6-10s anyway.
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    setAiProgress(null);
+    router.refresh();
+  }
 
   const buckets = useMemo(() => {
     const m: PanelTransaction[] = [];
@@ -128,6 +176,10 @@ export function ReconciliationPanel({
       if (!res.ok) throw new Error(json.error || "Reset failed");
       setData({ ran_at: new Date().toISOString(), ...json.result });
       router.refresh();
+      // Kick off the AI pass via the job worker if one was created.
+      if (json.ai_job?.job_id && json.ai_job?.total_chunks > 0) {
+        driveAiJob(json.ai_job.job_id, json.ai_job.total_chunks);
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Network error");
     } finally {
@@ -160,6 +212,10 @@ export function ReconciliationPanel({
       if (!res.ok) throw new Error(json.error || "Reconcile failed");
       setData({ ran_at: new Date().toISOString(), ...json.result });
       router.refresh();
+      // Same AI driver as Reset — fires only if the route created a job.
+      if (json.ai_job?.job_id && json.ai_job?.total_chunks > 0) {
+        driveAiJob(json.ai_job.job_id, json.ai_job.total_chunks);
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Network error");
     } finally {
@@ -242,6 +298,27 @@ export function ReconciliationPanel({
               active={openBucket === "suspicions"}
             />
           </div>
+
+          {aiProgress && (
+            <div className="mt-3 border-t border-border pt-3">
+              <div className="flex items-center justify-between text-xs mb-1">
+                <span className="font-bold text-indigo-700">
+                  AI matching running… chunk {aiProgress.completed} of {aiProgress.total}
+                </span>
+                <span className="text-muted-foreground">
+                  +{aiProgress.matches} matches, +{aiProgress.suspicions} suspicions so far
+                </span>
+              </div>
+              <div className="h-1.5 bg-muted rounded overflow-hidden">
+                <div
+                  className="h-full bg-indigo-600 transition-all duration-300"
+                  style={{
+                    width: `${(aiProgress.completed / Math.max(1, aiProgress.total)) * 100}%`,
+                  }}
+                />
+              </div>
+            </div>
+          )}
 
           {openBucket && (
             <TransactionList

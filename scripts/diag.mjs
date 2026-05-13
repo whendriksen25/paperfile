@@ -667,6 +667,35 @@ async function cmdReconcileSummary() {
         }
       }
     }
+  } else if (summary.ai_job) {
+    console.log("");
+    console.log("AI background job:");
+    if (summary.ai_job.error) {
+      console.log(`  error: ${summary.ai_job.error}`);
+    } else if (summary.ai_job.status === "skipped") {
+      console.log(`  status: skipped  (${summary.ai_job.skipped})`);
+    } else {
+      console.log(`  job_id:        ${summary.ai_job.job_id}`);
+      console.log(`  total_chunks:  ${summary.ai_job.total_chunks}`);
+      console.log(`  status:        ${summary.ai_job.status}`);
+      // Pull live job state.
+      const { data: job } = await supabase
+        .from("reconciliation_jobs")
+        .select(
+          "status, completed_chunks, total_chunks, ai_matches_applied, ai_matches_flagged, ai_suspicions_recorded, error"
+        )
+        .eq("id", summary.ai_job.job_id)
+        .maybeSingle();
+      if (job) {
+        console.log(`  live state:`);
+        console.log(`    status:              ${job.status}`);
+        console.log(`    completed_chunks:    ${job.completed_chunks} / ${job.total_chunks}`);
+        console.log(`    ai_matches_applied:  ${job.ai_matches_applied}  (>=80%)`);
+        console.log(`    ai_matches_flagged:  ${job.ai_matches_flagged}  (50-79%)`);
+        console.log(`    ai_suspicions_recorded: ${job.ai_suspicions_recorded}  (<50%)`);
+        if (job.error) console.log(`    error: ${job.error}`);
+      }
+    }
   } else {
     console.log("");
     console.log("AI pass: (no record — either pre-AI-pass code, or skipped without writing)");

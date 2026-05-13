@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient, createServiceClient } from "@/lib/supabase/server";
 import { reconcileBankStatement } from "@/lib/services/bank-reconciliation";
-import { aiReconcileLeftovers } from "@/lib/services/ai-reconcile";
+import { prepareAiReconcileJob } from "@/lib/services/ai-reconcile";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -121,16 +121,16 @@ export async function POST(
       `[reconcile-reset] reopened ${reopenedActions} actions, restored ${restoredDocs} docs`
     );
 
-    // 4. Now run the regular reconcile flow — it clears matched_* on
-    // bank_transactions at the top, then evaluates against the freshly
-    // re-opened pay-action pool.
+    // 4. Run deterministic reconcile (fast) + prepare the AI background
+    // job (does NOT run AI here — the panel drives the per-chunk
+    // worker route after this returns).
     const r = await reconcileBankStatement(admin, user.id, id);
-    let aiR;
+    let aiJob;
     try {
-      aiR = await aiReconcileLeftovers(admin, user.id, id);
+      aiJob = await prepareAiReconcileJob(admin, user.id, id);
     } catch (e) {
-      console.warn("[reconcile-reset] AI pass failed (continuing):", e);
-      aiR = { error: e instanceof Error ? e.message : String(e) };
+      console.warn("[reconcile-reset] AI job prepare failed (continuing):", e);
+      aiJob = { error: e instanceof Error ? e.message : String(e), job_id: null, total_chunks: 0 };
     }
 
     // 5. Mirror the summary into extracted_fields like the regular route.
@@ -142,7 +142,12 @@ export async function POST(
           _reconciliation: {
             ran_at: new Date().toISOString(),
             ...r,
-            ai: aiR,
+            ai_job: aiJob && "job_id" in aiJob ? {
+              job_id: aiJob.job_id,
+              total_chunks: aiJob.total_chunks,
+              status: aiJob.job_id ? "pending" : "skipped",
+              skipped: "skipped" in aiJob ? aiJob.skipped : undefined,
+            } : aiJob,
             reset: {
               reopened_actions: reopenedActions,
               restored_docs: restoredDocs,
@@ -157,7 +162,7 @@ export async function POST(
       reopened_actions: reopenedActions,
       restored_docs: restoredDocs,
       result: r,
-      ai: aiR,
+      ai_job: aiJob,
     });
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : "Reset failed";

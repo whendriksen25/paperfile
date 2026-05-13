@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient, createServiceClient } from "@/lib/supabase/server";
 import { reconcileBankStatement } from "@/lib/services/bank-reconciliation";
-import { aiReconcileLeftovers } from "@/lib/services/ai-reconcile";
+import { prepareAiReconcileJob } from "@/lib/services/ai-reconcile";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -50,19 +50,22 @@ export async function POST(
 
     const r = await reconcileBankStatement(admin, user.id, id);
 
-    // Second pass: AI matcher on whatever the deterministic pass left
-    // open. Handles late fees, combined/split payments, refunds, and
-    // notes "suspicions" the user should eyeball. Failures here don't
-    // fail the whole reconcile — the deterministic result is still good.
-    let aiR;
+    // Prepare the AI background job — does NOT run the AI here. The
+    // job tracker is created with all chunks pending, and the panel
+    // drives the per-chunk processing via /api/reconcile-step/[id]
+    // polling. This is the only way to stay inside Vercel's 60s
+    // function limit on real statements (>30 bills, hundreds of
+    // candidate debits).
+    let aiJob;
     try {
-      aiR = await aiReconcileLeftovers(admin, user.id, id);
+      aiJob = await prepareAiReconcileJob(admin, user.id, id);
     } catch (e) {
-      console.warn("[reconcile] AI pass failed (continuing):", e);
-      aiR = { error: e instanceof Error ? e.message : String(e) };
+      console.warn("[reconcile] AI job prepare failed (continuing):", e);
+      aiJob = { error: e instanceof Error ? e.message : String(e), job_id: null, total_chunks: 0 };
     }
 
-    // Mirror the summary into extracted_fields for the detail-page panel
+    // Mirror the deterministic summary into extracted_fields. The AI
+    // sub-block gets filled in when the job's last chunk completes.
     await admin
       .from("documents")
       .update({
@@ -71,13 +74,18 @@ export async function POST(
           _reconciliation: {
             ran_at: new Date().toISOString(),
             ...r,
-            ai: aiR,
+            ai_job: aiJob && "job_id" in aiJob ? {
+              job_id: aiJob.job_id,
+              total_chunks: aiJob.total_chunks,
+              status: aiJob.job_id ? "pending" : "skipped",
+              skipped: "skipped" in aiJob ? aiJob.skipped : undefined,
+            } : aiJob,
           },
         },
       })
       .eq("id", id);
 
-    return NextResponse.json({ ok: true, result: r, ai: aiR });
+    return NextResponse.json({ ok: true, result: r, ai_job: aiJob });
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : "Reconcile failed";
     console.error("[api/documents/[id]/reconcile] error:", msg);
