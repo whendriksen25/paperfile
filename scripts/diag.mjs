@@ -652,6 +652,20 @@ async function cmdReconcileSummary() {
       console.log(`  matches_applied:     ${summary.ai.ai_matches_applied}  (confidence ≥ 80%, silent)`);
       console.log(`  matches_flagged:     ${summary.ai.ai_matches_flagged}  (confidence 50–79%, "verify" tag)`);
       console.log(`  suspicions_recorded: ${summary.ai.ai_suspicions_recorded}  (< 50%, awaiting confirm/dismiss)`);
+      if (Array.isArray(summary.ai.chunks) && summary.ai.chunks.length > 0) {
+        console.log(`  chunks: ${summary.ai.chunks.length}`);
+        const counts = { ok: 0, timeout: 0, parse_error: 0, api_error: 0 };
+        for (const c of summary.ai.chunks) counts[c.status] = (counts[c.status] || 0) + 1;
+        console.log(
+          `    ok=${counts.ok}  timeout=${counts.timeout}  parse_error=${counts.parse_error}  api_error=${counts.api_error}`
+        );
+        for (const c of summary.ai.chunks) {
+          const tag = c.status === "ok" ? "✓" : "✗";
+          console.log(
+            `    ${tag} ${c.status.padEnd(11)}  bills=${c.bills} candidates=${c.candidates}  matches=${c.matches ?? "-"} suspicions=${c.suspicions ?? "-"}  ${c.error ? "err: " + c.error.slice(0, 60) : ""}`
+          );
+        }
+      }
     }
   } else {
     console.log("");

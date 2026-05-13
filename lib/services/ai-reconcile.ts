@@ -27,6 +27,14 @@ const MODEL = "claude-sonnet-4-20250514";
 const CONFIDENCE_AUTO_APPLY = 0.8;
 const CONFIDENCE_REVIEW = 0.5;
 
+/** Number of bills sent per Claude call. Small enough to fit a 5-10s
+ * response budget; large enough to still let the model reason about
+ * cross-bill patterns (combined payments, vendor-relationship matches).
+ * On a typical 50-bill statement, this produces ~6 chunks × ~8s = ~50s
+ * total — within Vercel's 60s function limit. */
+const BILL_CHUNK_SIZE = 8;
+const PER_CHUNK_TIMEOUT_MS = 25_000;
+
 interface UnmatchedBill {
   id: string; // action_id
   document_id: string;
@@ -75,8 +83,17 @@ export interface AiReconcileResult {
   ai_suspicions_recorded: number;
   ai_call_skipped: boolean;
   skip_reason?: string;
-  /** Returned for logging / debug. */
-  raw?: AiResult;
+  /** One entry per chunk attempted: ok | timeout | parse_error | api_error,
+   * plus how many bills/candidates were in the prompt. Helps diagnose
+   * partial failures (some chunks succeeded, others timed out). */
+  chunks?: Array<{
+    bills: number;
+    candidates: number;
+    status: "ok" | "timeout" | "parse_error" | "api_error";
+    matches?: number;
+    suspicions?: number;
+    error?: string;
+  }>;
 }
 
 const SYSTEM_PROMPT = `You are an autonomous bank reconciliation assistant for a personal finance app.
@@ -175,21 +192,16 @@ function extractRef(
 }
 
 /**
- * Pre-filter unmatched debits to plausible candidates for each bill,
- * then build the union so the AI sees a manageable set. This is what
- * keeps the prompt cheap (and the AI call fast) regardless of statement
- * size.
- *
- * Hard cap: PER_BILL_CAP candidates per bill. With 50+ bills on a
- * full-year statement, an unbounded ±30% window can otherwise sweep in
- * 800+ debits and the prompt balloons past Vercel's 60s timeout.
+ * Pre-filter unmatched debits to plausible candidates for a small set
+ * of bills (one chunk). With chunking we keep the per-call prompt small,
+ * so we can afford a generous per-bill candidate cap.
  */
-const PER_BILL_CAP = 25;
-const TOTAL_CANDIDATE_CAP = 250;
+const PER_BILL_CAP = 20;
 
 function filterCandidateDebits(
   bills: UnmatchedBill[],
-  allDebits: UnmatchedDebit[]
+  allDebits: UnmatchedDebit[],
+  excludeDebitIds?: Set<string>
 ): UnmatchedDebit[] {
   const keep = new Set<string>();
   for (const bill of bills) {
@@ -204,6 +216,7 @@ function filterCandidateDebits(
     type Scored = { id: string; score: number };
     const scored: Scored[] = [];
     for (const tx of allDebits) {
+      if (excludeDebitIds && excludeDebitIds.has(tx.id)) continue;
       const txAbs = Math.abs(tx.amount);
       if (txAbs < lo || txAbs > hi) continue;
       let score = 1;
@@ -225,12 +238,50 @@ function filterCandidateDebits(
       }
       scored.push({ id: tx.id, score });
     }
-    // Keep top PER_BILL_CAP candidates per bill by score.
     scored.sort((a, b) => b.score - a.score);
     for (const s of scored.slice(0, PER_BILL_CAP)) keep.add(s.id);
   }
-  // Apply total cap so a runaway statement can't blow the prompt.
-  return allDebits.filter((t) => keep.has(t.id)).slice(0, TOTAL_CANDIDATE_CAP);
+  return allDebits.filter((t) => keep.has(t.id));
+}
+
+/** Call Claude on one bill chunk. Returns parsed AiResult or null. */
+async function callChunkAi(
+  client: Anthropic,
+  chunkBills: UnmatchedBill[],
+  candidateDebits: UnmatchedDebit[]
+): Promise<{ result: AiResult | null; error?: string; timedOut?: boolean }> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), PER_CHUNK_TIMEOUT_MS);
+  try {
+    const userMsg = JSON.stringify(
+      { BILLS: chunkBills, DEBITS: candidateDebits },
+      null,
+      2
+    );
+    const resp = await client.messages.create(
+      {
+        model: MODEL,
+        max_tokens: 4096,
+        system: SYSTEM_PROMPT,
+        messages: [{ role: "user", content: userMsg }],
+      },
+      { signal: controller.signal }
+    );
+    const text =
+      resp.content
+        .filter((b) => b.type === "text")
+        .map((b) => (b as { text: string }).text)
+        .join("\n") || "";
+    const parsed = tryParseJson(text);
+    if (!parsed) return { result: null, error: "parse_error" };
+    return { result: parsed };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    const timedOut = /abort/i.test(msg);
+    return { result: null, error: msg, timedOut };
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 export async function aiReconcileLeftovers(
@@ -316,64 +367,92 @@ export async function aiReconcileLeftovers(
     return out;
   }
 
-  // 3. Pre-filter candidates so the prompt stays cheap.
-  const candidateDebits = filterCandidateDebits(bills, allDebits);
-  if (candidateDebits.length === 0) {
-    out.ai_call_skipped = true;
-    out.skip_reason = "no plausible candidate debits after pre-filter";
-    return out;
-  }
-
-  // 4. Call Claude.
+  // 3. Chunk the bills into small batches and call Claude per batch.
+  // Sequential, so later chunks can see which debits earlier chunks
+  // already claimed (we exclude them from candidate filtering).
   const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-  const userMsg = JSON.stringify(
-    { BILLS: bills, DEBITS: candidateDebits },
-    null,
-    2
-  );
+  const usedDebitIds = new Set<string>();
+  const usedBillIds = new Set<string>();
+  const aggregatedMatches: AiMatch[] = [];
+  const aggregatedSuspicions: AiSuspicion[] = [];
+  out.chunks = [];
 
-  // Hard 35s timeout — Vercel functions cap at 60s on Hobby; we need
-  // headroom for the deterministic pass that's already run + the per-
-  // match DB writes that follow. If the AI takes longer than this we
-  // record the leftovers as suspicions on the next click rather than
-  // crashing the function.
-  let resp;
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 35_000);
-  try {
-    resp = await client.messages.create(
-      {
-        model: MODEL,
-        max_tokens: 8192,
-        system: SYSTEM_PROMPT,
-        messages: [{ role: "user", content: userMsg }],
-      },
-      { signal: controller.signal }
+  for (let i = 0; i < bills.length; i += BILL_CHUNK_SIZE) {
+    const chunkBills = bills.slice(i, i + BILL_CHUNK_SIZE).filter((b) => !usedBillIds.has(b.id));
+    if (chunkBills.length === 0) continue;
+    const chunkCandidates = filterCandidateDebits(
+      chunkBills,
+      allDebits,
+      usedDebitIds
     );
-  } catch (e) {
-    out.ai_call_skipped = true;
-    out.skip_reason = `AI call failed: ${e instanceof Error ? e.message : String(e)}`;
-    return out;
-  } finally {
-    clearTimeout(timeoutId);
+    if (chunkCandidates.length === 0) {
+      out.chunks.push({
+        bills: chunkBills.length,
+        candidates: 0,
+        status: "ok",
+        matches: 0,
+        suspicions: 0,
+      });
+      continue;
+    }
+
+    const { result, error, timedOut } = await callChunkAi(
+      client,
+      chunkBills,
+      chunkCandidates
+    );
+    if (!result) {
+      out.chunks.push({
+        bills: chunkBills.length,
+        candidates: chunkCandidates.length,
+        status: timedOut ? "timeout" : error === "parse_error" ? "parse_error" : "api_error",
+        error: error || undefined,
+      });
+      continue;
+    }
+
+    // Aggregate results from this chunk.
+    let m = 0,
+      s = 0;
+    for (const match of result.matches) {
+      if (usedBillIds.has(match.bill_id)) continue;
+      aggregatedMatches.push(match);
+      usedBillIds.add(match.bill_id);
+      for (const did of match.debit_ids) usedDebitIds.add(did);
+      m++;
+    }
+    for (const susp of result.suspicions) {
+      if (usedDebitIds.has(susp.debit_id)) continue; // skip if already matched
+      aggregatedSuspicions.push(susp);
+      s++;
+    }
+    out.chunks.push({
+      bills: chunkBills.length,
+      candidates: chunkCandidates.length,
+      status: "ok",
+      matches: m,
+      suspicions: s,
+    });
   }
 
-  const text =
-    resp.content
-      .filter((b) => b.type === "text")
-      .map((b) => (b as { text: string }).text)
-      .join("\n") || "";
-  const parsed = tryParseJson(text);
-  if (!parsed) {
+  // If every chunk failed and no useful output, mark skipped overall.
+  if (
+    aggregatedMatches.length === 0 &&
+    aggregatedSuspicions.length === 0 &&
+    out.chunks.every((c) => c.status !== "ok")
+  ) {
     out.ai_call_skipped = true;
-    out.skip_reason = "AI response was not parseable JSON";
+    out.skip_reason = "all chunks failed (timeout/api/parse)";
     return out;
   }
-  out.raw = parsed;
 
-  // 5. Apply matches & record suspicions.
+  // 4. Apply matches & record suspicions.
+  const parsed: AiResult = {
+    matches: aggregatedMatches,
+    suspicions: aggregatedSuspicions,
+  };
   const billsById = new Map(bills.map((b) => [b.id, b]));
-  const debitsById = new Map(candidateDebits.map((t) => [t.id, t]));
+  const debitsById = new Map(allDebits.map((t) => [t.id, t]));
   const now = new Date().toISOString();
 
   // Track per-debit suspicions so the same debit doesn't get multiple
