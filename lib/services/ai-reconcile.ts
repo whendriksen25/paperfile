@@ -41,7 +41,16 @@ const CONFIDENCE_REVIEW = 0.5;
  * a typical statement in one reconcile run. Each chunk is ~5-10k tokens
  * input, ~1k output → Haiku finishes in 2-4s. */
 const BILL_CHUNK_SIZE = 6;
-const PER_CHUNK_TIMEOUT_MS = 15_000;
+const PER_CHUNK_TIMEOUT_MS = 18_000;
+/** Concurrency cap on parallel chunk calls. Each chunk is a separate
+ * Anthropic call; firing them in parallel collapses wall-clock from
+ * sequential 8 × ~10s = 80s to ~10-15s per wave. Concurrency=3 stays
+ * well clear of Anthropic's per-minute rate limits at our volume. */
+const PARALLEL_CONCURRENCY = 3;
+/** Retry once on a timed-out chunk — production data shows intermittent
+ * Anthropic latency where a 14-candidate chunk can fail while a
+ * 23-candidate chunk succeeds. One quick retry catches the transient. */
+const RETRIES_ON_TIMEOUT = 1;
 
 interface UnmatchedBill {
   id: string; // action_id
@@ -274,6 +283,24 @@ function filterCandidateDebits(
   return allDebits.filter((t) => keep.has(t.id));
 }
 
+/** Call Claude on one bill chunk, retrying once on a timeout. */
+async function callChunkAiWithRetry(
+  client: Anthropic,
+  chunkBills: UnmatchedBill[],
+  candidateDebits: UnmatchedDebit[]
+): Promise<{ result: AiResult | null; error?: string; timedOut?: boolean; attempts: number }> {
+  let attempt = 0;
+  let last;
+  while (attempt <= RETRIES_ON_TIMEOUT) {
+    attempt++;
+    last = await callChunkAi(client, chunkBills, candidateDebits);
+    if (last.result) return { ...last, attempts: attempt };
+    if (!last.timedOut) return { ...last, attempts: attempt }; // non-retryable
+    // else: timeout — retry
+  }
+  return { ...last!, attempts: attempt };
+}
+
 /** Call Claude on one bill chunk. Returns parsed AiResult or null. */
 async function callChunkAi(
   client: Anthropic,
@@ -407,78 +434,96 @@ export async function aiReconcileLeftovers(
   const aggregatedSuspicions: AiSuspicion[] = [];
   out.chunks = [];
 
-  // Hard wall-clock budget for the whole AI pass. Vercel's function
-  // limit is 60s; the deterministic pass + DB writes ahead of this
-  // consumed some of that, and the per-match writes that come AFTER
-  // this loop also need time. 40s leaves headroom on both sides.
-  const overallStart = Date.now();
-  const OVERALL_BUDGET_MS = 40_000;
-
+  // Pre-compute chunks WITHOUT pre-filtering candidates (filter is done
+  // per-wave once we know which debits earlier waves already claimed).
+  const billChunks: UnmatchedBill[][] = [];
   for (let i = 0; i < bills.length; i += BILL_CHUNK_SIZE) {
+    billChunks.push(bills.slice(i, i + BILL_CHUNK_SIZE));
+  }
+
+  // Hard wall-clock budget. Vercel's function limit is 60s; deterministic
+  // + DB writes consume some; the per-match writes that come after this
+  // loop also need time. 45s leaves headroom on both sides for parallel
+  // execution with retries.
+  const overallStart = Date.now();
+  const OVERALL_BUDGET_MS = 45_000;
+
+  // Process chunks in parallel waves. Within a wave we exclude already-
+  // used debits, but two parallel chunks may still both target the same
+  // debit — we resolve that at apply time (the first match-applied for
+  // a debit wins; subsequent ones are demoted to suspicion).
+  for (let waveStart = 0; waveStart < billChunks.length; waveStart += PARALLEL_CONCURRENCY) {
     if (Date.now() - overallStart > OVERALL_BUDGET_MS) {
+      const remaining = billChunks.length - waveStart;
       out.chunks.push({
         bills: 0,
         candidates: 0,
         status: "timeout",
-        error: "overall budget exhausted; remaining chunks skipped",
+        error: `overall budget exhausted; ${remaining} chunks skipped`,
       });
       break;
     }
-    const chunkBills = bills.slice(i, i + BILL_CHUNK_SIZE).filter((b) => !usedBillIds.has(b.id));
-    if (chunkBills.length === 0) continue;
-    const chunkCandidates = filterCandidateDebits(
-      chunkBills,
-      allDebits,
-      usedDebitIds
-    );
-    if (chunkCandidates.length === 0) {
-      out.chunks.push({
-        bills: chunkBills.length,
-        candidates: 0,
-        status: "ok",
-        matches: 0,
-        suspicions: 0,
-      });
-      continue;
-    }
-
-    const { result, error, timedOut } = await callChunkAi(
-      client,
-      chunkBills,
-      chunkCandidates
-    );
-    if (!result) {
-      out.chunks.push({
-        bills: chunkBills.length,
-        candidates: chunkCandidates.length,
-        status: timedOut ? "timeout" : error === "parse_error" ? "parse_error" : "api_error",
-        error: error || undefined,
-      });
-      continue;
-    }
-
-    // Aggregate results from this chunk.
-    let m = 0,
-      s = 0;
-    for (const match of result.matches) {
-      if (usedBillIds.has(match.bill_id)) continue;
-      aggregatedMatches.push(match);
-      usedBillIds.add(match.bill_id);
-      for (const did of match.debit_ids) usedDebitIds.add(did);
-      m++;
-    }
-    for (const susp of result.suspicions) {
-      if (usedDebitIds.has(susp.debit_id)) continue; // skip if already matched
-      aggregatedSuspicions.push(susp);
-      s++;
-    }
-    out.chunks.push({
-      bills: chunkBills.length,
-      candidates: chunkCandidates.length,
-      status: "ok",
-      matches: m,
-      suspicions: s,
+    const waveChunks = billChunks.slice(waveStart, waveStart + PARALLEL_CONCURRENCY);
+    const wavePayloads = waveChunks.map((chunkBills) => {
+      const filtered = chunkBills.filter((b) => !usedBillIds.has(b.id));
+      const candidates = filtered.length > 0
+        ? filterCandidateDebits(filtered, allDebits, usedDebitIds)
+        : [];
+      return { bills: filtered, candidates };
     });
+
+    // Fire the wave in parallel.
+    type WaveResult = { result: AiResult | null; error?: string; timedOut?: boolean; attempts: number };
+    const waveResults: WaveResult[] = await Promise.all(
+      wavePayloads.map((p): Promise<WaveResult> => {
+        if (p.bills.length === 0 || p.candidates.length === 0) {
+          return Promise.resolve({
+            result: { matches: [], suspicions: [] } as AiResult,
+            attempts: 0,
+          });
+        }
+        return callChunkAiWithRetry(client, p.bills, p.candidates);
+      })
+    );
+
+    // Aggregate results sequentially so usedDebitIds/usedBillIds reflect
+    // earlier chunks within the same wave (conflict resolution).
+    for (let i = 0; i < waveChunks.length; i++) {
+      const payload = wavePayloads[i];
+      const { result, error, timedOut } = waveResults[i];
+      if (!result) {
+        out.chunks.push({
+          bills: payload.bills.length,
+          candidates: payload.candidates.length,
+          status: timedOut ? "timeout" : error === "parse_error" ? "parse_error" : "api_error",
+          error: error || undefined,
+        });
+        continue;
+      }
+      let m = 0,
+        s = 0;
+      for (const match of result.matches) {
+        if (usedBillIds.has(match.bill_id)) continue;
+        // Skip if a parallel chunk already claimed any of these debits.
+        if (match.debit_ids?.some((did) => usedDebitIds.has(did))) continue;
+        aggregatedMatches.push(match);
+        usedBillIds.add(match.bill_id);
+        for (const did of match.debit_ids) usedDebitIds.add(did);
+        m++;
+      }
+      for (const susp of result.suspicions) {
+        if (usedDebitIds.has(susp.debit_id)) continue;
+        aggregatedSuspicions.push(susp);
+        s++;
+      }
+      out.chunks.push({
+        bills: payload.bills.length,
+        candidates: payload.candidates.length,
+        status: "ok",
+        matches: m,
+        suspicions: s,
+      });
+    }
   }
 
   // If every chunk failed and no useful output, mark skipped overall.
