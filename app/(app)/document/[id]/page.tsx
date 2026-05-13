@@ -83,7 +83,12 @@ export default async function DocumentDetail({
   // bank_transactions table (migration 012). Source of truth, with proper
   // indexes; the JSON line_items kept on the row is just a backup of
   // what extraction originally returned.
+  // Extended to also carry the reconciliation columns (match_status,
+  // match_reason, matched_*) so the ReconciliationPanel can drill-down
+  // into matched / ambiguous / unmatched lists from the same dataset
+  // the BankTransactionsTable already renders.
   let bankTransactions: Array<{
+    id: string;
     amount: number;
     currency: string;
     counterparty_name: string | null;
@@ -92,6 +97,20 @@ export default async function DocumentDetail({
     reference: string | null;
     booking_date: string | null;
     value_date: string | null;
+    match_status: string | null;
+    match_reason: string | null;
+    matched_action_id: string | null;
+    matched_document_id: string | null;
+    match_method: string | null;
+    match_confidence: number | null;
+    suspicions:
+      | Array<{
+          possible_action_ids?: string[];
+          possible_doc_ids?: string[];
+          reasoning: string;
+          confidence: number;
+        }>
+      | null;
   }> = [];
   if (doc.document_type === "bank_statement") {
     // Supabase enforces a server-side 1000-row cap. `.range()` can't
@@ -103,7 +122,7 @@ export default async function DocumentDetail({
       const { data: pageData } = await supabase
         .from("bank_transactions")
         .select(
-          "amount, currency, counterparty_name, counterparty_iban, description, reference, booking_date, value_date, position"
+          "id, amount, currency, counterparty_name, counterparty_iban, description, reference, booking_date, value_date, position, match_status, match_reason, matched_action_id, matched_document_id, match_method, match_confidence, suspicions"
         )
         .eq("statement_id", id)
         .order("position", { ascending: true })
@@ -219,6 +238,7 @@ export default async function DocumentDetail({
       {doc.document_type === "bank_statement" && (
         <ReconciliationPanel
           documentId={doc.id}
+          transactions={bankTransactions}
           initial={(() => {
             const r = (doc.extracted_fields as Record<string, unknown> | null)?.[
               "_reconciliation"

@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient, createServiceClient } from "@/lib/supabase/server";
 import { reconcileBankStatement } from "@/lib/services/bank-reconciliation";
+import { aiReconcileLeftovers } from "@/lib/services/ai-reconcile";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -49,18 +50,34 @@ export async function POST(
 
     const r = await reconcileBankStatement(admin, user.id, id);
 
+    // Second pass: AI matcher on whatever the deterministic pass left
+    // open. Handles late fees, combined/split payments, refunds, and
+    // notes "suspicions" the user should eyeball. Failures here don't
+    // fail the whole reconcile — the deterministic result is still good.
+    let aiR;
+    try {
+      aiR = await aiReconcileLeftovers(admin, user.id, id);
+    } catch (e) {
+      console.warn("[reconcile] AI pass failed (continuing):", e);
+      aiR = { error: e instanceof Error ? e.message : String(e) };
+    }
+
     // Mirror the summary into extracted_fields for the detail-page panel
     await admin
       .from("documents")
       .update({
         extracted_fields: {
           ...(doc.extracted_fields || {}),
-          _reconciliation: { ran_at: new Date().toISOString(), ...r },
+          _reconciliation: {
+            ran_at: new Date().toISOString(),
+            ...r,
+            ai: aiR,
+          },
         },
       })
       .eq("id", id);
 
-    return NextResponse.json({ ok: true, result: r });
+    return NextResponse.json({ ok: true, result: r, ai: aiR });
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : "Reconcile failed";
     console.error("[api/documents/[id]/reconcile] error:", msg);
