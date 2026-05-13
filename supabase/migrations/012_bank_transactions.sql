@@ -70,12 +70,15 @@ CREATE INDEX IF NOT EXISTS bank_transactions_iban_idx
 CREATE INDEX IF NOT EXISTS bank_transactions_amount_idx
   ON public.bank_transactions (user_id, amount);
 
--- Per-statement dedup on re-analyse: same statement + same bank tx id
--- can only exist once. transaction_id can be NULL when the bank didn't
--- emit one (some PDF statements), so the unique index is partial.
-CREATE UNIQUE INDEX IF NOT EXISTS bank_transactions_statement_txn_uniq
-  ON public.bank_transactions (statement_id, transaction_id)
-  WHERE transaction_id IS NOT NULL;
+-- NOTE (intentionally removed): a (statement_id, transaction_id) partial
+-- UNIQUE index was originally created here. Migration 014 dropped it
+-- because Rabobank's SDD batches share Transactiereferentie across batch
+-- members, which violated the constraint on real data. Removing the
+-- CREATE statement from this file (rather than relying on 014 to undo
+-- it later) makes the apply-migrations script — which has no tracking
+-- table and re-runs every file every invocation — idempotent against
+-- populated data. End state is identical: no unique index on
+-- (statement_id, transaction_id).
 
 -- RLS: every read/write is scoped to the calling user
 ALTER TABLE public.bank_transactions ENABLE ROW LEVEL SECURITY;

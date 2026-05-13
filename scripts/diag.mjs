@@ -315,6 +315,117 @@ async function cmdBillsPaid() {
   );
 }
 
+// For each open pay-action, scan this statement's debits for any
+// candidate overlap (amount within tolerance OR IBAN OR sender). Three
+// outcomes per bill:
+//   - "no candidate" → bill genuinely unpaid in this period
+//   - "1 candidate"  → matcher SHOULD have caught this (heuristic too tight?)
+//   - "N candidates" → ambiguous, would need disambiguation
+async function cmdUnmatchedBills() {
+  const [idArg] = positional();
+  if (!idArg)
+    throw new Error("Usage: diag unmatched-bills <statement-id-or-prefix>");
+  const supabase = admin();
+  const statementId = await resolveId(supabase, "documents", idArg);
+  if (!statementId) {
+    console.error(`No documents row found matching "${idArg}"`);
+    process.exit(1);
+  }
+
+  // Load all open pay-actions with their source doc.
+  const { data: actions, error: aErr } = await supabase
+    .from("actions")
+    .select(
+      "id, document_id, due_date, document:documents(amount, sender, document_date, extracted_fields)"
+    )
+    .eq("action_type", "pay")
+    .eq("status", "open")
+    .limit(500);
+  if (aErr) throw aErr;
+
+  // Same window the matcher uses (lib/services/bank-reconciliation.ts).
+  const DATE_WINDOW_DAYS = 35;
+  const dayDiff = (a, b) => {
+    const ta = new Date(a).getTime();
+    const tb = new Date(b).getTime();
+    if (!Number.isFinite(ta) || !Number.isFinite(tb)) return Infinity;
+    return Math.abs(ta - tb) / 86400000;
+  };
+
+  // Load all debits on this statement (signed amount < 0).
+  const txs = await fetchAll(supabase, (from, to) =>
+    supabase
+      .from("bank_transactions")
+      .select("id, amount, booking_date, counterparty_name, counterparty_iban, reference, description")
+      .eq("statement_id", statementId)
+      .lt("amount", 0)
+      .range(from, to)
+  );
+
+  const buckets = { zero: 0, one: 0, many: 0 };
+  const reportable = [];
+  for (const a of actions || []) {
+    const d = a.document;
+    if (!d || d.amount == null) {
+      buckets.zero++;
+      continue;
+    }
+    const docAbs = Math.abs(Number(d.amount));
+    const tolerance = Math.max(0.5, docAbs * 0.005);
+    const docIban = extractIban(d.extracted_fields);
+    const senderN = nameNorm(d.sender);
+    const refDate = d.document_date || a.due_date;
+    const candidates = [];
+    for (const tx of txs) {
+      const txAbs = Math.abs(Number(tx.amount));
+      const amountHit = Math.abs(txAbs - docAbs) <= tolerance;
+      const ibanHit = docIban && tx.counterparty_iban && docIban === (tx.counterparty_iban || "").toUpperCase().replace(/\s+/g, "");
+      const counterN = nameNorm(tx.counterparty_name || tx.description);
+      const senderHit = senderN && counterN && (counterN.includes(senderN) || senderN.includes(counterN));
+      if (!amountHit || !(ibanHit || senderHit)) continue;
+      const txDate = tx.booking_date;
+      const inWindow =
+        refDate && txDate ? dayDiff(refDate, txDate) <= DATE_WINDOW_DAYS : true;
+      candidates.push({ tx, inWindow, days: refDate && txDate ? dayDiff(refDate, txDate) : null });
+    }
+    // Only count candidates the matcher would actually consider (inside
+    // the date window when dates are known on both sides).
+    const matchable = candidates.filter((c) => c.inWindow);
+    if (matchable.length === 0) buckets.zero++;
+    else if (matchable.length === 1) {
+      buckets.one++;
+      reportable.push({ action: a, candidates: matchable, all: candidates });
+    } else {
+      buckets.many++;
+      reportable.push({ action: a, candidates: matchable, all: candidates });
+    }
+  }
+
+  console.log(`Open pay-actions:          ${(actions || []).length}`);
+  console.log(`  no candidate debit:      ${buckets.zero}   → genuinely unpaid in this period`);
+  console.log(`  exactly 1 candidate:     ${buckets.one}   → matcher missed these`);
+  console.log(`  multiple candidates:     ${buckets.many}   → ambiguous`);
+  if (reportable.length > 0) {
+    console.log("\nDetail (candidates the matcher could have / should have caught):");
+    console.log("Candidates marked ✗ are amount+vendor matches OUTSIDE the 35-day window — the matcher correctly rejects these.\n");
+    for (const r of reportable.slice(0, 50)) {
+      const a = r.action;
+      const d = a.document;
+      const refDate = d?.document_date || a.due_date || "—";
+      console.log(
+        `  • action ${a.id.slice(0, 8)}  ${d?.sender || "—"}  ${d?.amount ? Number(d.amount).toFixed(2) : "—"}  refDate=${refDate}  due=${a.due_date || "—"}`
+      );
+      for (const c of r.all.slice(0, 5)) {
+        const mark = c.inWindow ? "✓" : "✗";
+        const daysStr = c.days != null ? `${c.days.toFixed(0)}d` : "?";
+        console.log(
+          `      ${mark} tx ${c.tx.id.slice(0, 8)}  ${c.tx.booking_date}  ${Number(c.tx.amount).toFixed(2)}  ${c.tx.counterparty_name || "—"}  (${daysStr} away)`
+        );
+      }
+    }
+  }
+}
+
 async function cmdReconcileLog() {
   const [idArg] = positional();
   if (!idArg)
@@ -668,19 +779,46 @@ function extractIban(ef) {
   }
   return null;
 }
-function extractRef(ef) {
-  if (!ef || typeof ef !== "object") return null;
-  for (const k of [
-    "payment_reference",
-    "invoice_number",
-    "reference",
-    "customer_reference",
-  ]) {
+// Kept matching the app's lib/services/bank-reconciliation.ts. If you
+// add a key there, add it here too.
+const REF_KEYS = [
+  "payment_reference",
+  "invoice_number",
+  "factuurnummer",
+  "factuur_number",
+  "reference",
+  "customer_reference",
+  "customer_number",
+  "klantnummer",
+  "mandate_reference",
+  "betalingskenmerk",
+  "mededeling",
+  "payment_id",
+  "kenmerk",
+  "dossier_number",
+  "ovi_number",
+  "transaction_reference",
+];
+function extractRefs(ef) {
+  if (!ef || typeof ef !== "object") return [];
+  const found = [];
+  for (const k of REF_KEYS) {
     const v = ef[k];
-    if (typeof v === "string" && v.trim()) return v.trim();
-    if (typeof v === "number") return String(v);
+    if (v == null) continue;
+    const s = typeof v === "number" ? String(v) : String(v).trim();
+    if (s.length >= 4) found.push(s);
   }
-  return null;
+  // Catch-all: any 6+ digit run in any string field.
+  for (const v of Object.values(ef)) {
+    if (typeof v !== "string") continue;
+    const matches = v.match(/\b\d{6,}\b/g);
+    if (matches) found.push(...matches);
+  }
+  const seen = new Set();
+  return found.filter((x) => (seen.has(x) ? false : (seen.add(x), true)));
+}
+function extractRef(ef) {
+  return extractRefs(ef)[0] || null;
 }
 function nameNorm(s) {
   return (s || "")
@@ -894,6 +1032,7 @@ Subcommands:
   reconcile-summary <statement-id-or-prefix>
   reconcile-log  <statement-id-or-prefix>
   bills-paid     <statement-id-or-prefix>
+  unmatched-bills <statement-id-or-prefix>
   repair-matches <statement-id-or-prefix> [--dry-run]
   pay-actions    [--limit=50]
   match-debug    <tx-id-or-prefix>
@@ -916,6 +1055,7 @@ const dispatch = {
   "reconcile-summary": cmdReconcileSummary,
   "reconcile-log": cmdReconcileLog,
   "bills-paid": cmdBillsPaid,
+  "unmatched-bills": cmdUnmatchedBills,
   "repair-matches": cmdRepairMatches,
   "pay-actions": cmdPayActions,
   "match-debug": cmdMatchDebug,

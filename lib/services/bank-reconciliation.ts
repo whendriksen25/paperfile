@@ -72,6 +72,8 @@ interface PendingAction {
     sender: string | null;
     amount: number | null;
     currency: string | null;
+    /** Date the invoice/bill was issued — strongest temporal anchor. */
+    document_date: string | null;
     extracted_fields: Record<string, unknown> | null;
   } | null;
 }
@@ -110,21 +112,78 @@ function extractDocIban(
   return null;
 }
 
-function extractDocReference(
+/**
+ * Pull EVERY plausible reference identifier the AI extracted into a list.
+ * Different doc types use different field names:
+ *   - invoices: invoice_number, factuurnummer, factuur_number
+ *   - direct-debit mandates: mandate_reference, payment_reference,
+ *     betalingskenmerk (Dutch structured payment ref), mededeling
+ *   - utility bills: customer_number, klantnummer, customer_reference
+ *   - tax/parking/etc: payment_id, kenmerk, dossier_number
+ *
+ * Plus any pure-digit run of length ≥ 6 hiding inside a string-valued
+ * extracted field (catches cases where AI dumped the whole footer line
+ * into `reference` without parsing it apart).
+ */
+function extractDocReferences(
   ef: Record<string, unknown> | null | undefined
-): string | null {
-  if (!ef) return null;
-  const candidates = [
-    ef["payment_reference"],
-    ef["invoice_number"],
-    ef["reference"],
-    ef["customer_reference"],
+): string[] {
+  if (!ef) return [];
+  const KEYS = [
+    "payment_reference",
+    "invoice_number",
+    "factuurnummer",
+    "factuur_number",
+    "reference",
+    "customer_reference",
+    "customer_number",
+    "klantnummer",
+    "mandate_reference",
+    "betalingskenmerk",
+    "mededeling",
+    "payment_id",
+    "kenmerk",
+    "dossier_number",
+    "ovi_number",
+    "transaction_reference",
   ];
-  for (const v of candidates) {
-    if (typeof v === "string" && v.trim()) return v.trim();
-    if (typeof v === "number") return String(v);
+  const found: string[] = [];
+  const push = (s: string | number | null | undefined) => {
+    if (s == null) return;
+    const v = typeof s === "number" ? String(s) : String(s).trim();
+    if (v && v.length >= 4) found.push(v);
+  };
+  for (const k of KEYS) push(ef[k] as string | number | undefined);
+  // Catch-all: hunt for digit-only runs ≥ 6 in any string field.
+  const digitRe = /\b\d{6,}\b/g;
+  for (const v of Object.values(ef)) {
+    if (typeof v !== "string") continue;
+    let m;
+    while ((m = digitRe.exec(v)) !== null) found.push(m[0]);
   }
-  return null;
+  // De-dup while preserving order.
+  const seen = new Set<string>();
+  return found.filter((x) => (seen.has(x) ? false : (seen.add(x), true)));
+}
+
+/** Aggressive normalisation — keep only [a-z0-9], so "F-2026/0042" and
+ * "F 2026 0042" both collapse to "f20260042". */
+function refNorm(s: string | null | undefined): string {
+  return (s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+/** Window (in days) for date proximity between a bill's reference date
+ * (invoice date or due date) and a bank transaction's booking date.
+ * 35d covers a monthly billing cycle plus typical late-pay slack; tighter
+ * than this risks rejecting late payments, wider risks the Frank Energie
+ * "1 invoice ↔ 5 monthly debits" over-match. Calibrate later if needed. */
+const DATE_WINDOW_DAYS = 35;
+
+function dayDiff(a: string, b: string): number {
+  const ta = new Date(a).getTime();
+  const tb = new Date(b).getTime();
+  if (!Number.isFinite(ta) || !Number.isFinite(tb)) return Number.POSITIVE_INFINITY;
+  return Math.abs(ta - tb) / 86400000;
 }
 
 function matchSignals(
@@ -142,6 +201,22 @@ function matchSignals(
   const tolerance = Math.max(0.5, txAbs * 0.005);
   if (Math.abs(txAbs - docAbs) > tolerance) return [];
   reasons.push(`amount ≈ €${docAbs.toFixed(2)}`);
+
+  // Temporal proximity. When BOTH a transaction date and an action
+  // reference date are present, require them to be within
+  // DATE_WINDOW_DAYS. This is what stops a single Feb invoice for
+  // €272.57 from matching the Jan/Mar/Apr/May €272.57 direct-debit
+  // charges to the same vendor. We prefer document_date (invoice
+  // issued) > due_date (computed from terms); both are sensible
+  // anchors. If either side is missing we skip this check — better
+  // to fall back to amount+identifier than reject silently.
+  const txDate = tx.booking_date || tx.value_date;
+  const refDate = action.document?.document_date || action.due_date;
+  if (txDate && refDate) {
+    const days = dayDiff(txDate, refDate);
+    if (days > DATE_WINDOW_DAYS) return [];
+    reasons.push(`date ≈ ${days.toFixed(0)}d`);
+  }
 
   let strong = false;
 
@@ -163,13 +238,23 @@ function matchSignals(
     strong = true;
   }
 
-  const docRef = extractDocReference(action.document?.extracted_fields);
-  if (docRef && tx.reference) {
-    const refN = String(docRef).replace(/\s+/g, "").toLowerCase();
-    const txRefN = tx.reference.replace(/\s+/g, "").toLowerCase();
-    if (refN.length >= 4 && txRefN.includes(refN)) {
+  // Reference matching: try every extracted identifier against tx.reference
+  // AND tx.description (bank tx structured-ref vs human-readable description
+  // — many statements split the data across both). Both sides are
+  // aggressively normalised so formatting differences ("F-2026-0042" vs
+  // "F20260042") don't defeat substring matching. Match is bidirectional:
+  // the tx can contain the doc's ref OR the doc's ref can contain the tx
+  // ref (covers cases where the tx string is just an embedded fragment).
+  const docRefs = extractDocReferences(action.document?.extracted_fields);
+  const txRefBlob =
+    refNorm(tx.reference) + " " + refNorm(tx.description);
+  for (const docRef of docRefs) {
+    const refN = refNorm(docRef);
+    if (refN.length < 4) continue;
+    if (txRefBlob.includes(refN) || refN.includes(refNorm(tx.reference))) {
       reasons.push(`reference "${docRef}"`);
       strong = true;
+      break;
     }
   }
 
@@ -218,7 +303,9 @@ export async function reconcileBankStatement(
     offset += PAGE;
   }
 
-  // 2. Clear any prior matches on these rows so re-runs reflect today's state
+  // 2. Clear any prior matches on these rows so re-runs reflect today's state.
+  // Also reset match_status so old verdicts ('matched'/'ambiguous'/'unmatched')
+  // don't leak through.
   if (txRows.length > 0) {
     const { error: clearErr } = await admin
       .from("bank_transactions")
@@ -227,6 +314,7 @@ export async function reconcileBankStatement(
         matched_document_id: null,
         matched_at: null,
         match_reason: null,
+        match_status: null,
       })
       .eq("statement_id", statementDocId);
     if (clearErr) {
@@ -241,7 +329,7 @@ export async function reconcileBankStatement(
   const { data: actionsRaw, error: aErr } = await admin
     .from("actions")
     .select(
-      "id, user_id, document_id, profile_id, action_type, summary, due_date, status, document:documents(id, sender, amount, currency, extracted_fields)"
+      "id, user_id, document_id, profile_id, action_type, summary, due_date, status, document:documents(id, sender, amount, currency, document_date, extracted_fields)"
     )
     .eq("user_id", userId)
     .eq("status", "open")
@@ -260,6 +348,13 @@ export async function reconcileBankStatement(
     matches: [],
   };
 
+  // Track which actions have already been settled in THIS run so we
+  // don't stamp a single open pay-action onto multiple bank transactions.
+  // Without this, a monthly direct-debit (5 €272.57 Frank Energie charges
+  // in the period) all match the one open invoice for €272.57, and the
+  // matcher cheerfully back-links the action to every one of them.
+  const matchedThisRun = new Set<string>();
+
   // 4. Per-transaction matching
   for (const tx of txRows) {
     if (tx.amount >= 0) continue; // only debits settle pay actions
@@ -270,16 +365,31 @@ export async function reconcileBankStatement(
       reasons: string[];
     }> = [];
     for (const a of pending) {
+      if (matchedThisRun.has(a.id)) continue; // many-to-one guard
       const reasons = matchSignals(tx, a);
       if (reasons.length > 0) candidates.push({ action: a, reasons });
     }
 
     if (candidates.length === 0) {
       result.unmatched++;
+      await admin
+        .from("bank_transactions")
+        .update({ match_status: "unmatched" })
+        .eq("id", tx.id);
       continue;
     }
     if (candidates.length > 1) {
       result.ambiguous++;
+      const labels = candidates
+        .map((c) => `${c.action.id.slice(0, 8)} (${c.reasons.join(",")})`)
+        .join(" | ");
+      await admin
+        .from("bank_transactions")
+        .update({
+          match_status: "ambiguous",
+          match_reason: `Ambiguous: ${labels}`,
+        })
+        .eq("id", tx.id);
       continue;
     }
 
@@ -330,6 +440,7 @@ export async function reconcileBankStatement(
         matched_document_id: action.document_id,
         matched_at: now,
         match_reason: reasonStr,
+        match_status: "matched",
       })
       .eq("id", tx.id);
     if (txUpdErr) {
@@ -361,6 +472,7 @@ export async function reconcileBankStatement(
     });
 
     result.matched++;
+    matchedThisRun.add(action.id);
     result.matches.push({
       transaction_id: tx.id,
       action_id: action.id,

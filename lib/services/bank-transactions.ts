@@ -35,6 +35,8 @@ export interface BankTransactionRow {
   matched_document_id: string | null;
   matched_at: string | null;
   match_reason: string | null;
+  /** Reconcile verdict: 'matched' | 'ambiguous' | 'unmatched' | null */
+  match_status: string | null;
 
   created_at: string;
   updated_at: string;
@@ -81,7 +83,7 @@ export async function replaceStatementTransactions(
   const { data: prior, error: snapErr } = await admin
     .from("bank_transactions")
     .select(
-      "amount, booking_date, counterparty_iban, reference, transaction_id, matched_action_id, matched_document_id, matched_at, match_reason"
+      "amount, booking_date, counterparty_iban, reference, transaction_id, matched_action_id, matched_document_id, matched_at, match_reason, match_status"
     )
     .eq("statement_id", statementId)
     .not("matched_action_id", "is", null);
@@ -107,6 +109,7 @@ export async function replaceStatementTransactions(
       matched_document_id: string | null;
       matched_at: string | null;
       match_reason: string | null;
+      match_status: string | null;
     }
   >();
   for (const r of prior || []) {
@@ -115,6 +118,7 @@ export async function replaceStatementTransactions(
       matched_document_id: r.matched_document_id as string | null,
       matched_at: r.matched_at as string | null,
       match_reason: r.match_reason as string | null,
+      match_status: (r as Record<string, unknown>).match_status as string | null,
     });
   }
 
@@ -199,6 +203,7 @@ export async function replaceStatementTransactions(
           match_reason: snap.match_reason
             ? `${snap.match_reason} (restored after re-analyze)`
             : "restored after re-analyze",
+          match_status: snap.match_status || "matched",
         })
         .eq("id", cands[0].id);
       if (!stampErr) restored_matches++;
