@@ -22,18 +22,26 @@ import type { SupabaseClient } from "@supabase/supabase-js";
  * count. Skip entirely when there's nothing to match.
  */
 
-const MODEL = "claude-sonnet-4-20250514";
+/** Haiku 4.5 chosen over Sonnet for the reconcile pass because:
+ *  - the task is mostly pattern-matching (amount × vendor × date window),
+ *    well inside Haiku's reasoning envelope
+ *  - per-call latency is ~3× lower → we can fit ~8 chunks in Vercel's
+ *    60s function budget without parallelising
+ *  - cost is ~$0.05 instead of $0.20 per full reconcile session
+ *
+ * If we later see Haiku miss nuanced cases (combined payments, refund
+ * pairs) we can route the harder chunks to Sonnet, but for now Haiku
+ * is the right default. */
+const MODEL = "claude-haiku-4-5-20251001";
 
 const CONFIDENCE_AUTO_APPLY = 0.8;
 const CONFIDENCE_REVIEW = 0.5;
 
-/** Number of bills sent per Claude call. Small enough to fit a 5-10s
- * response budget; large enough to still let the model reason about
- * cross-bill patterns (combined payments, vendor-relationship matches).
- * On a typical 50-bill statement, this produces ~6 chunks × ~8s = ~50s
- * total — within Vercel's 60s function limit. */
-const BILL_CHUNK_SIZE = 8;
-const PER_CHUNK_TIMEOUT_MS = 25_000;
+/** Number of bills per Claude call. 6 × 8 chunks = 48 bills, fitting
+ * a typical statement in one reconcile run. Each chunk is ~5-10k tokens
+ * input, ~1k output → Haiku finishes in 2-4s. */
+const BILL_CHUNK_SIZE = 6;
+const PER_CHUNK_TIMEOUT_MS = 15_000;
 
 interface UnmatchedBill {
   id: string; // action_id
@@ -261,7 +269,7 @@ async function callChunkAi(
     const resp = await client.messages.create(
       {
         model: MODEL,
-        max_tokens: 4096,
+        max_tokens: 2048,
         system: SYSTEM_PROMPT,
         messages: [{ role: "user", content: userMsg }],
       },
@@ -377,7 +385,23 @@ export async function aiReconcileLeftovers(
   const aggregatedSuspicions: AiSuspicion[] = [];
   out.chunks = [];
 
+  // Hard wall-clock budget for the whole AI pass. Vercel's function
+  // limit is 60s; the deterministic pass + DB writes ahead of this
+  // consumed some of that, and the per-match writes that come AFTER
+  // this loop also need time. 40s leaves headroom on both sides.
+  const overallStart = Date.now();
+  const OVERALL_BUDGET_MS = 40_000;
+
   for (let i = 0; i < bills.length; i += BILL_CHUNK_SIZE) {
+    if (Date.now() - overallStart > OVERALL_BUDGET_MS) {
+      out.chunks.push({
+        bills: 0,
+        candidates: 0,
+        status: "timeout",
+        error: "overall budget exhausted; remaining chunks skipped",
+      });
+      break;
+    }
     const chunkBills = bills.slice(i, i + BILL_CHUNK_SIZE).filter((b) => !usedBillIds.has(b.id));
     if (chunkBills.length === 0) continue;
     const chunkCandidates = filterCandidateDebits(
