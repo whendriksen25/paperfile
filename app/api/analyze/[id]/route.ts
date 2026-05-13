@@ -814,7 +814,7 @@ export async function POST(
             }))
           );
           console.log(
-            `[api/analyze] wrote ${r.inserted} rows to bank_transactions`
+            `[api/analyze] wrote ${r.inserted} rows to bank_transactions; restored ${r.restored_matches} matched_* back-links`
           );
         } catch (e) {
           // Defensive: handle real Errors, Supabase PostgrestError plain

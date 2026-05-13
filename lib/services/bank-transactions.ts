@@ -57,28 +57,74 @@ export interface BankTransactionInsert {
 
 /**
  * Replace ALL transactions for a given statement with a fresh set.
- * Used during analyze (initial + re-analyse). DELETE-then-INSERT, in
- * that order, so we're idempotent.
+ * Used during analyze (initial + re-analyse). DELETE-then-INSERT.
  *
- * Keeps `matched_*` columns intentionally NULL on the new rows — a
- * subsequent reconciliation pass fills them in. If you want to preserve
- * an existing match across a re-analyse, snapshot it before calling here
- * and re-apply after (we don't do that yet — re-analyse re-runs
- * reconciliation anyway).
+ * Preserves `matched_*` columns across the replace: before DELETE we
+ * snapshot rows that already have a reconciliation back-link, then after
+ * INSERT we re-stamp the same back-link onto the new row that carries
+ * the same signature (amount + booking_date + counterparty_iban +
+ * reference + transaction_id). Why: when a re-analyse runs after a
+ * reconcile that closed pay-actions, the closed actions are filtered out
+ * of any subsequent reconcile (status='open' only), so without snapshot+
+ * restore the back-link is silently lost and bank-stats reports 0% even
+ * though the actions side is correctly closed.
  */
 export async function replaceStatementTransactions(
   admin: SupabaseClient,
   userId: string,
   statementId: string,
   rows: Omit<BankTransactionInsert, "user_id" | "statement_id" | "position">[]
-): Promise<{ inserted: number }> {
+): Promise<{ inserted: number; restored_matches: number }> {
+  // 0. Snapshot any existing matched_* state keyed by transaction signature.
+  // We rely on amount + booking_date + counterparty_iban + reference +
+  // transaction_id being effectively unique within a statement.
+  const { data: prior, error: snapErr } = await admin
+    .from("bank_transactions")
+    .select(
+      "amount, booking_date, counterparty_iban, reference, transaction_id, matched_action_id, matched_document_id, matched_at, match_reason"
+    )
+    .eq("statement_id", statementId)
+    .not("matched_action_id", "is", null);
+  if (snapErr) throw snapErr;
+  const sigOf = (r: {
+    amount: number | string;
+    booking_date: string | null;
+    counterparty_iban: string | null;
+    reference: string | null;
+    transaction_id: string | null;
+  }) =>
+    [
+      Number(r.amount).toFixed(2),
+      r.booking_date || "",
+      r.counterparty_iban || "",
+      r.reference || "",
+      r.transaction_id || "",
+    ].join("|");
+  const snapshot = new Map<
+    string,
+    {
+      matched_action_id: string;
+      matched_document_id: string | null;
+      matched_at: string | null;
+      match_reason: string | null;
+    }
+  >();
+  for (const r of prior || []) {
+    snapshot.set(sigOf(r), {
+      matched_action_id: r.matched_action_id as string,
+      matched_document_id: r.matched_document_id as string | null,
+      matched_at: r.matched_at as string | null,
+      match_reason: r.match_reason as string | null,
+    });
+  }
+
   const { error: delErr } = await admin
     .from("bank_transactions")
     .delete()
     .eq("statement_id", statementId);
   if (delErr) throw delErr;
 
-  if (rows.length === 0) return { inserted: 0 };
+  if (rows.length === 0) return { inserted: 0, restored_matches: 0 };
 
   const payload: BankTransactionInsert[] = rows.map((r, i) => ({
     ...r,
@@ -123,7 +169,46 @@ export async function replaceStatementTransactions(
     }
     inserted += slice.length;
   }
-  return { inserted };
+
+  // Restore matched_* on the new rows by signature. Done in one shot per
+  // signature: query the fresh row's id, then update it. We only restore
+  // when exactly one new row matches the signature — ties are skipped
+  // and left for the user's `diag repair-matches` to resolve manually.
+  let restored_matches = 0;
+  if (snapshot.size > 0) {
+    for (const [sig, snap] of Array.from(snapshot.entries())) {
+      const [amountStr, bookingDate, iban, reference, txid] = sig.split("|");
+      let q = admin
+        .from("bank_transactions")
+        .select("id")
+        .eq("statement_id", statementId)
+        .eq("amount", Number(amountStr));
+      if (bookingDate) q = q.eq("booking_date", bookingDate);
+      if (iban) q = q.eq("counterparty_iban", iban);
+      if (reference) q = q.eq("reference", reference);
+      if (txid) q = q.eq("transaction_id", txid);
+      const { data: cands, error: findErr } = await q.limit(2);
+      if (findErr) continue;
+      if (!cands || cands.length !== 1) continue;
+      const { error: stampErr } = await admin
+        .from("bank_transactions")
+        .update({
+          matched_action_id: snap.matched_action_id,
+          matched_document_id: snap.matched_document_id,
+          matched_at: snap.matched_at,
+          match_reason: snap.match_reason
+            ? `${snap.match_reason} (restored after re-analyze)`
+            : "restored after re-analyze",
+        })
+        .eq("id", cands[0].id);
+      if (!stampErr) restored_matches++;
+    }
+    console.log(
+      `[replaceStatementTransactions] restored ${restored_matches}/${snapshot.size} matched_* back-links across re-analyze`
+    );
+  }
+
+  return { inserted, restored_matches };
 }
 
 /** Fetch all transactions for a statement, in original ordering. */

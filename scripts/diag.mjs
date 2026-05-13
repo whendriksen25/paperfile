@@ -202,6 +202,131 @@ async function cmdBankStats() {
   }
 }
 
+// Walk maintenance_log entries (kind = bank_reconcile) for a statement
+// and re-stamp the bank_transactions back-link (matched_action_id,
+// matched_document_id, matched_at, match_reason) on the *current* row
+// matching each entry's signature (amount + booking_date + IBAN + reference).
+//
+// Use case: an earlier reconcile closed actions and wrote to bank_transactions,
+// but a subsequent re-analyze DELETE-INSERTed the bank_transactions rows
+// (cascading away the matched_* state). The action side is still done; this
+// command restores the orphan back-links so the statement detail page and
+// bank-stats agree with reality.
+async function cmdRepairMatches() {
+  const [idArg] = positional();
+  const dryRun = rest.includes("--dry-run");
+  if (!idArg)
+    throw new Error(
+      "Usage: diag repair-matches <statement-id-or-prefix> [--dry-run]"
+    );
+  const supabase = admin();
+  const statementId = await resolveId(supabase, "documents", idArg);
+  if (!statementId) {
+    console.error(`No documents row found matching "${idArg}"`);
+    process.exit(1);
+  }
+
+  // Pull all bank_reconcile log entries for this statement.
+  const { data: logRows, error: logErr } = await supabase
+    .from("maintenance_log")
+    .select("id, payload, created_at")
+    .eq("kind", "bank_reconcile")
+    .order("created_at", { ascending: false })
+    .limit(2000);
+  if (logErr) throw logErr;
+  const forStatement = (logRows || []).filter(
+    (r) => r.payload?.statement_doc_id === statementId
+  );
+
+  // De-dup by action_id (latest entry wins).
+  const byAction = new Map();
+  for (const r of forStatement) {
+    const aid = r.payload?.action_id;
+    if (!aid) continue;
+    if (!byAction.has(aid)) byAction.set(aid, r);
+  }
+  console.log(`statement_id: ${statementId}`);
+  console.log(`unique closed-action log entries: ${byAction.size}`);
+  if (byAction.size === 0) {
+    console.log("(nothing to repair)");
+    return;
+  }
+
+  // For each, find the current bank_transactions row by signature.
+  let stamped = 0,
+    skippedAmbiguous = 0,
+    skippedMissing = 0;
+  for (const [actionId, log] of byAction.entries()) {
+    const p = log.payload;
+    let q = supabase
+      .from("bank_transactions")
+      .select("id, amount, booking_date, counterparty_iban, reference")
+      .eq("statement_id", statementId)
+      .eq("amount", p.amount);
+    if (p.booking_date) q = q.eq("booking_date", p.booking_date);
+    if (p.counterparty_iban) q = q.eq("counterparty_iban", p.counterparty_iban);
+    const { data: candidates, error: cErr } = await q.limit(5);
+    if (cErr) throw cErr;
+    let rows = candidates || [];
+    // If still >1, narrow by reference.
+    if (rows.length > 1 && p.reference) {
+      const tight = rows.filter((r) => r.reference === p.reference);
+      if (tight.length > 0) rows = tight;
+    }
+    if (rows.length === 0) {
+      skippedMissing++;
+      console.log(
+        `  ✗ action ${actionId.slice(0, 8)}  amount=${p.amount}  date=${p.booking_date}  iban=${p.counterparty_iban || "—"}  → no current bank_tx row matches`
+      );
+      continue;
+    }
+    if (rows.length > 1) {
+      skippedAmbiguous++;
+      console.log(
+        `  ⚠ action ${actionId.slice(0, 8)}  amount=${p.amount}  → ${rows.length} bank_tx rows tie, skipping`
+      );
+      continue;
+    }
+    const tx = rows[0];
+    // Look up action.document_id (matched_document_id needs it).
+    const { data: actRow } = await supabase
+      .from("actions")
+      .select("document_id")
+      .eq("id", actionId)
+      .maybeSingle();
+    const docId = actRow?.document_id || null;
+
+    if (dryRun) {
+      console.log(
+        `  • DRY action ${actionId.slice(0, 8)}  →  tx ${tx.id.slice(0, 8)}  ${p.amount}  ${p.booking_date}`
+      );
+    } else {
+      const { error: upErr } = await supabase
+        .from("bank_transactions")
+        .update({
+          matched_action_id: actionId,
+          matched_document_id: docId,
+          matched_at: log.created_at,
+          match_reason: `Repaired from maintenance_log: ${log.payload.bank_transaction_id ? "was tx " + String(log.payload.bank_transaction_id).slice(0, 8) : ""}`,
+        })
+        .eq("id", tx.id);
+      if (upErr) {
+        console.log(
+          `  ✗ action ${actionId.slice(0, 8)}  →  update failed: ${upErr.message || JSON.stringify(upErr)}`
+        );
+        continue;
+      }
+      stamped++;
+      console.log(
+        `  ✓ action ${actionId.slice(0, 8)}  →  tx ${tx.id.slice(0, 8)}  ${p.amount}  ${p.booking_date}`
+      );
+    }
+  }
+  console.log(
+    `\nDone. stamped=${stamped}  ambiguous=${skippedAmbiguous}  missing=${skippedMissing}${dryRun ? "  (dry-run — no writes)" : ""}`
+  );
+}
+
 async function cmdReconcileSummary() {
   const [idArg] = positional();
   if (!idArg)
@@ -611,6 +736,7 @@ Subcommands:
   transactions   <statement-id-or-prefix> [--limit=N] [--filter=debits|credits|unmatched]
   doc            <doc-id-or-prefix>
   reconcile-summary <statement-id-or-prefix>
+  repair-matches <statement-id-or-prefix> [--dry-run]
   pay-actions    [--limit=50]
   match-debug    <tx-id-or-prefix>
   check-deploy
@@ -630,6 +756,7 @@ const dispatch = {
   transactions: cmdTransactions,
   doc: cmdDoc,
   "reconcile-summary": cmdReconcileSummary,
+  "repair-matches": cmdRepairMatches,
   "pay-actions": cmdPayActions,
   "match-debug": cmdMatchDebug,
   "check-deploy": cmdCheckDeploy,
