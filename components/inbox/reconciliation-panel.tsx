@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   CheckCircle2,
@@ -57,6 +57,7 @@ export function ReconciliationPanel({
   documentId,
   initial,
   transactions = [],
+  activeAiJob,
 }: {
   documentId: string;
   initial: {
@@ -67,6 +68,10 @@ export function ReconciliationPanel({
     considered: number;
   } | null;
   transactions?: PanelTransaction[];
+  /** If a reconcile job is pending/processing for this statement on
+   * page load, resume polling automatically so a tab refresh or a
+   * brief network glitch can't strand a job. */
+  activeAiJob?: { job_id: string; total_chunks: number } | null;
 }) {
   const router = useRouter();
   const [data, setData] = useState(initial);
@@ -80,6 +85,18 @@ export function ReconciliationPanel({
     matches: number;
     suspicions: number;
   } | null>(null);
+
+  // Auto-resume polling on mount if a pending/processing job exists for
+  // this statement. This is the safety net that fixes "polling stopped
+  // after chunk 1" — if a previous tab session was interrupted (refresh,
+  // navigation, network blip), the next render of this panel picks the
+  // job back up and drives it to completion.
+  useEffect(() => {
+    if (activeAiJob?.job_id && activeAiJob.total_chunks > 0) {
+      driveAiJob(activeAiJob.job_id, activeAiJob.total_chunks);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeAiJob?.job_id]);
 
   // Drive the AI pass by polling /api/reconcile-step/[job_id] until done.
   // Each POST processes one chunk (~6-10s on Haiku); we poll ~every 2s
@@ -175,10 +192,13 @@ export function ReconciliationPanel({
       const json = await res.json();
       if (!res.ok) throw new Error(json.error || "Reset failed");
       setData({ ran_at: new Date().toISOString(), ...json.result });
-      router.refresh();
-      // Kick off the AI pass via the job worker if one was created.
+      // Defer router.refresh until polling completes — refreshing now
+      // would re-fetch the server component mid-flight and could
+      // interrupt the polling loop.
       if (json.ai_job?.job_id && json.ai_job?.total_chunks > 0) {
         driveAiJob(json.ai_job.job_id, json.ai_job.total_chunks);
+      } else {
+        router.refresh();
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Network error");
@@ -211,10 +231,11 @@ export function ReconciliationPanel({
       const json = await res.json();
       if (!res.ok) throw new Error(json.error || "Reconcile failed");
       setData({ ran_at: new Date().toISOString(), ...json.result });
-      router.refresh();
-      // Same AI driver as Reset — fires only if the route created a job.
+      // Same defer-refresh-until-polling-done pattern as reset().
       if (json.ai_job?.job_id && json.ai_job?.total_chunks > 0) {
         driveAiJob(json.ai_job.job_id, json.ai_job.total_chunks);
+      } else {
+        router.refresh();
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Network error");

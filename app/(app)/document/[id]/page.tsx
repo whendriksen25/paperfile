@@ -134,6 +134,27 @@ export default async function DocumentDetail({
     }
   }
 
+  // Look up an active AI reconcile job for this statement so the panel
+  // can auto-resume polling if a previous session was interrupted
+  // (tab refresh, navigation, network blip).
+  let activeAiJob: { job_id: string; total_chunks: number } | null = null;
+  if (doc.document_type === "bank_statement") {
+    const { data: jobRow } = await supabase
+      .from("reconciliation_jobs")
+      .select("id, total_chunks, status")
+      .eq("statement_id", id)
+      .in("status", ["pending", "processing"])
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (jobRow) {
+      activeAiJob = {
+        job_id: (jobRow as { id: string }).id,
+        total_chunks: (jobRow as { total_chunks: number }).total_chunks,
+      };
+    }
+  }
+
   // Layer 2 dedup: if analyze flagged this as a possible duplicate of
   // another doc, fetch a tiny summary of that doc so the banner can
   // describe it ("Looks like a duplicate of X from Y on Z").
@@ -239,6 +260,7 @@ export default async function DocumentDetail({
         <ReconciliationPanel
           documentId={doc.id}
           transactions={bankTransactions}
+          activeAiJob={activeAiJob}
           initial={(() => {
             const r = (doc.extracted_fields as Record<string, unknown> | null)?.[
               "_reconciliation"
