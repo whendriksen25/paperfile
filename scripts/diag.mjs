@@ -426,6 +426,79 @@ async function cmdUnmatchedBills() {
   }
 }
 
+// Re-run extraction on every document stuck in status='failed'. Hits the
+// localhost-only admin-bridge/analyze endpoint, which runs the full
+// pipeline as the document's real owner. Use after fixing an extraction
+// bug (e.g. the messages.create → messages.stream change) to recover a
+// batch of failed docs without clicking each one.
+//
+//   npm run diag retry-failed              # process all failed docs
+//   npm run diag retry-failed -- --limit=5 # just the first 5
+async function cmdRetryFailed() {
+  const limit = Number(flag("limit", "0")) || 0;
+  const base = process.env.DEV_BASE_URL || "http://localhost:3002";
+  const supabase = admin();
+
+  const { data, error } = await supabase
+    .from("documents")
+    .select("id, file_name, status, created_at")
+    .eq("status", "failed")
+    .order("created_at", { ascending: true });
+  if (error) throw error;
+  let docs = data || [];
+  if (docs.length === 0) {
+    console.log("No documents in status='failed'. Nothing to do.");
+    return;
+  }
+  if (limit > 0) docs = docs.slice(0, limit);
+  console.log(`Found ${docs.length} failed document(s) to retry via ${base}\n`);
+
+  // Dev-login to get a session cookie. admin-bridge/analyze still
+  // processes each doc as its true owner, so the dev session is only
+  // a gate, not an identity.
+  const cookieJar = [];
+  try {
+    const loginRes = await fetch(`${base}/api/auth/dev-login`, {
+      redirect: "manual",
+    });
+    const setCookie = loginRes.headers.get("set-cookie");
+    if (setCookie) cookieJar.push(setCookie.split(";")[0]);
+  } catch (e) {
+    console.error(`Could not reach dev server at ${base}: ${e.message}`);
+    console.error("Start it with `npm run dev` first.");
+    process.exit(1);
+  }
+  const cookieHeader = cookieJar.join("; ");
+
+  let ok = 0,
+    failed = 0;
+  for (const doc of docs) {
+    process.stdout.write(`  ${doc.id.slice(0, 8)}  ${doc.file_name}  ... `);
+    try {
+      const res = await fetch(`${base}/api/admin-bridge/analyze`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Cookie: cookieHeader,
+        },
+        body: JSON.stringify({ document_id: doc.id }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (res.ok) {
+        ok++;
+        console.log(`✓ ${json.status || "done"}`);
+      } else {
+        failed++;
+        console.log(`✗ ${res.status}: ${json.error || "unknown"}`);
+      }
+    } catch (e) {
+      failed++;
+      console.log(`✗ ${e.message}`);
+    }
+  }
+  console.log(`\nDone. ${ok} re-analyzed, ${failed} still failing.`);
+}
+
 async function cmdReconcileLog() {
   const [idArg] = positional();
   if (!idArg)
@@ -1106,6 +1179,7 @@ Subcommands:
   bills-paid     <statement-id-or-prefix>
   unmatched-bills <statement-id-or-prefix>
   repair-matches <statement-id-or-prefix> [--dry-run]
+  retry-failed   [--limit=N]
   pay-actions    [--limit=50]
   match-debug    <tx-id-or-prefix>
   check-deploy
@@ -1129,6 +1203,7 @@ const dispatch = {
   "bills-paid": cmdBillsPaid,
   "unmatched-bills": cmdUnmatchedBills,
   "repair-matches": cmdRepairMatches,
+  "retry-failed": cmdRetryFailed,
   "pay-actions": cmdPayActions,
   "match-debug": cmdMatchDebug,
   "check-deploy": cmdCheckDeploy,

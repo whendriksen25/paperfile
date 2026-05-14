@@ -301,7 +301,15 @@ export async function extractDocument(
   const maxTokens = opts.maxTokens ?? AI_MAX_TOKENS_DEFAULT;
   const useExtended =
     opts.useExtendedOutput || maxTokens > AI_MAX_TOKENS_DEFAULT;
-  const response = await client.messages.create(
+  // IMPORTANT: must use streaming, not messages.create(). With a 64k+
+  // max_tokens, Sonnet's worst-case response time exceeds 10 minutes,
+  // and the SDK's non-streaming guard throws ("Streaming is strongly
+  // recommended for operations that may take longer than 10 minutes")
+  // BEFORE the request is even sent — so every extraction failed.
+  // .stream() has no such guard; .finalMessage() returns the identical
+  // Message object once the stream completes, so everything downstream
+  // (content, stop_reason, usage) is unchanged.
+  const stream = client.messages.stream(
     {
       model: "claude-sonnet-4-20250514",
       // Default 64k tokens covers ~250-transaction bank statements,
@@ -317,6 +325,7 @@ export async function extractDocument(
       ? { headers: { "anthropic-beta": AI_EXTENDED_BETA_HEADER } }
       : undefined
   );
+  const response = await stream.finalMessage();
 
   const textBlock = response.content.find((b) => b.type === "text");
   const rawText = textBlock && "text" in textBlock ? textBlock.text : "";
