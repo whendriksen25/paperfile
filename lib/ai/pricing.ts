@@ -35,11 +35,21 @@ export function formatAiCostEur(eur: number): string {
 }
 
 /**
- * Output-cap presets:
- *   - DEFAULT: 64k — generous default; handles ~250-transaction PDFs.
- *   - EXTENDED: 128k — Sonnet 4 beta cap, requires the extended-output
- *     beta header. Used by the "Retry full" button when a doc truncated.
+ * Output-cap presets.
+ *
+ * claude-sonnet-4-20250514's hard ceiling is 64,000 output tokens — the
+ * API rejects anything above that with an invalid_request_error. The
+ * 128k extended-output beta (`output-128k-2025-02-19`) applies only to
+ * claude-3-7-sonnet, NOT Sonnet 4, so there is no "extended" cap to
+ * reach for on this model.
+ *
+ *   - DEFAULT:  64,000 — the model's max; handles ~250-transaction PDFs.
+ *               max_tokens is a ceiling, not a target — generation stops
+ *               when the JSON is complete, usually well under 20k.
+ *   - EXTENDED: same as DEFAULT on Sonnet 4. Kept as a named constant so
+ *               the "Retry full" code path still compiles; it just no
+ *               longer requests more than the model allows.
  */
-export const AI_MAX_TOKENS_DEFAULT = 65_536;
-export const AI_MAX_TOKENS_EXTENDED = 131_072;
+export const AI_MAX_TOKENS_DEFAULT = 64_000;
+export const AI_MAX_TOKENS_EXTENDED = 64_000;
 export const AI_EXTENDED_BETA_HEADER = "output-128k-2025-02-19";
