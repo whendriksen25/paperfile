@@ -162,34 +162,43 @@ function safeParseJSON(s: string): Record<string, unknown> | null {
   if (!s) return null;
   const fenced = stripCodeFence(s);
   const obj = extractFirstObject(s) || extractFirstObject(fenced);
-  const candidates: string[] = [s, fenced];
+  const candidates: Array<{ label: string; text: string }> = [
+    { label: "raw", text: s },
+    { label: "fenced", text: fenced },
+  ];
   if (obj) {
-    candidates.push(obj);
-    candidates.push(stripTrailingCommas(obj));
-    const smartFixed = normalizeSmartQuotes(obj);
-    candidates.push(smartFixed);
-    const ctrlFixed = escapeControlCharsInStrings(obj);
-    candidates.push(ctrlFixed);
-    const arrayFixed = repairArrayCommentary(obj);
-    candidates.push(arrayFixed);
-    // Belt + braces: every fix combined.
-    candidates.push(
-      stripTrailingCommas(
+    candidates.push({ label: "obj", text: obj });
+    candidates.push({ label: "obj+stripCommas", text: stripTrailingCommas(obj) });
+    candidates.push({ label: "obj+smartQuotes", text: normalizeSmartQuotes(obj) });
+    candidates.push({ label: "obj+ctrlChars", text: escapeControlCharsInStrings(obj) });
+    candidates.push({ label: "obj+arrayCommentary", text: repairArrayCommentary(obj) });
+    candidates.push({
+      label: "obj+all",
+      text: stripTrailingCommas(
         repairArrayCommentary(
           escapeControlCharsInStrings(normalizeSmartQuotes(obj))
         )
-      )
-    );
+      ),
+    });
   }
+  const errors: string[] = [];
   for (const cand of candidates) {
     try {
-      const parsed = JSON.parse(cand);
+      const parsed = JSON.parse(cand.text);
       if (parsed && typeof parsed === "object")
         return parsed as Record<string, unknown>;
-    } catch {
-      // try next candidate
+    } catch (e) {
+      errors.push(`${cand.label}: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
+  // Every candidate failed — log full diagnostics so the exact
+  // malformation is visible in the server log, not just "parse failed".
+  console.error(
+    "[ai/extract] safeParseJSON: all candidates failed.\n" +
+      `  raw length: ${s.length}\n` +
+      errors.map((e) => `  ✗ ${e}`).join("\n") +
+      `\n  --- full raw response ---\n${s}\n  --- end raw response ---`
+  );
   return null;
 }
 
