@@ -1,6 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import * as path from "path";
-import { DOCUMENT_EXTRACTION_PROMPT } from "./prompts";
+import { DOCUMENT_EXTRACTION_PROMPT, buildExtractionPrompt } from "./prompts";
 import {
   AI_MAX_TOKENS_DEFAULT,
   AI_MAX_TOKENS_EXTENDED,
@@ -288,6 +288,11 @@ export interface ExtractOptions {
   /** When true, sends the Sonnet 4 extended-output beta header so the
    *  model is allowed to actually emit up to ~128k tokens. */
   useExtendedOutput?: boolean;
+  /** Per-user taxonomy hint, built by lib/services/taxonomy.ts →
+   *  buildTaxonomyHint(). Injected near the top of the prompt so Claude
+   *  prefers reusing existing subcategory tokens instead of inventing
+   *  drift (apple/apples/appel...). */
+  taxonomyHint?: string;
 }
 
 export async function extractDocument(
@@ -299,8 +304,9 @@ export async function extractDocument(
 
   const mimeType = getMimeType(filename);
 
+  const promptText = buildExtractionPrompt(opts.taxonomyHint);
   const contentBlocks: Anthropic.ContentBlockParam[] = [
-    { type: "text", text: DOCUMENT_EXTRACTION_PROMPT },
+    { type: "text", text: promptText },
   ];
 
   if (mimeType === "text/csv" || mimeType === "text/plain") {

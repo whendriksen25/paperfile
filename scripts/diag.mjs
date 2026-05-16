@@ -570,6 +570,347 @@ async function cmdBulkReassign() {
   );
 }
 
+// ----------------------------------------------------------------------------
+// Taxonomy helpers — mirror of lib/services/taxonomy.ts so the diag can run
+// inline normalisation/matching without importing the TS module.
+// ----------------------------------------------------------------------------
+
+function normalizeToken(s) {
+  return String(s || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .trim();
+}
+function singularize(s) {
+  if (s.length <= 3) return s;
+  if (s.endsWith("ies") && s.length > 4) return s.slice(0, -3) + "y";
+  if (s.endsWith("sses")) return s.slice(0, -2);
+  if (s.endsWith("ches") || s.endsWith("shes")) return s.slice(0, -2);
+  if (s.endsWith("xes") || s.endsWith("zes")) return s.slice(0, -2);
+  if (s.endsWith("s") && !s.endsWith("ss") && !s.endsWith("us")) {
+    return s.slice(0, -1);
+  }
+  return s;
+}
+function levenshtein(a, b) {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  const m = a.length, n = b.length;
+  const prev = new Array(n + 1), curr = new Array(n + 1);
+  for (let j = 0; j <= n; j++) prev[j] = j;
+  for (let i = 1; i <= m; i++) {
+    curr[0] = i;
+    for (let j = 1; j <= n; j++) {
+      const c = a[i - 1] === b[j - 1] ? 0 : 1;
+      curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + c);
+    }
+    for (let j = 0; j <= n; j++) prev[j] = curr[j];
+  }
+  return prev[n];
+}
+function maxAcceptableEdits(s) {
+  if (s.length <= 4) return 1;
+  if (s.length <= 7) return 2;
+  return 3;
+}
+
+/**
+ * Walk every doc's line_items, canonicalise category_path against the
+ * user's existing taxonomy table (auto-registering new tokens), and
+ * write the rewritten path back. One-shot — re-run safe; idempotent.
+ *
+ *   npm run diag taxonomy-backfill -- --dry-run
+ *   npm run diag taxonomy-backfill
+ */
+async function cmdTaxonomyBackfill() {
+  const dryRun = rest.includes("--dry-run");
+  const supabase = admin();
+
+  // 1. Find the user (single-user setup — use the first user with docs).
+  const { data: anyDoc } = await supabase
+    .from("documents")
+    .select("user_id")
+    .limit(1)
+    .maybeSingle();
+  if (!anyDoc) {
+    console.log("No documents found.");
+    return;
+  }
+  const userId = anyDoc.user_id;
+
+  // 2. Snapshot the taxonomy table (per top_category lookup).
+  const { data: taxRows } = await supabase
+    .from("line_item_taxonomy")
+    .select("id, top_category, token, aliases, usage_count")
+    .eq("user_id", userId);
+  const byTop = new Map();
+  for (const r of taxRows || []) {
+    const arr = byTop.get(r.top_category) || [];
+    arr.push(r);
+    byTop.set(r.top_category, arr);
+  }
+
+  // 3. Walk all docs with line_items.
+  const PAGE = 1000;
+  let offset = 0;
+  let scanned = 0, changed = 0, newTokens = 0;
+  const pendingNewTokens = new Map(); // key "top|token" → { top, token, count }
+  while (true) {
+    const { data: docs, error } = await supabase
+      .from("documents")
+      .select("id, extracted_fields")
+      .eq("user_id", userId)
+      .neq("status", "deleted")
+      .range(offset, offset + PAGE - 1);
+    if (error) {
+      console.error(error);
+      break;
+    }
+    if (!docs || docs.length === 0) break;
+    for (const d of docs) {
+      scanned++;
+      const ef = d.extracted_fields;
+      if (!ef || typeof ef !== "object") continue;
+      const items = ef.line_items;
+      if (!Array.isArray(items) || items.length === 0) continue;
+      let dirty = false;
+      for (const it of items) {
+        if (!it || typeof it !== "object") continue;
+        const path = it.category_path;
+        if (!Array.isArray(path) || path.length === 0) continue;
+        const capped = path.slice(0, 3).map((x) => String(x || ""));
+        const top = capped[0]?.toLowerCase().trim();
+        if (!top) continue;
+        const out = [top];
+        const rows = byTop.get(top) || [];
+        for (let i = 1; i < capped.length; i++) {
+          const cleaned = singularize(normalizeToken(capped[i]));
+          if (!cleaned) break;
+          const direct = rows.find(
+            (r) => r.token === cleaned || (r.aliases || []).includes(cleaned)
+          );
+          if (direct) {
+            out.push(direct.token);
+            continue;
+          }
+          let best = null;
+          for (const r of rows) {
+            const d = levenshtein(cleaned, r.token);
+            if (d <= maxAcceptableEdits(cleaned)) {
+              if (!best || d < best.d) best = { row: r, d };
+            }
+          }
+          if (best) {
+            out.push(best.row.token);
+            continue;
+          }
+          // New token — queue for registration after backfill.
+          const key = `${top}|${cleaned}`;
+          const cur = pendingNewTokens.get(key) || { top, token: cleaned, count: 0 };
+          cur.count++;
+          pendingNewTokens.set(key, cur);
+          out.push(cleaned);
+        }
+        // If the path actually changed, mark the doc dirty.
+        if (JSON.stringify(out) !== JSON.stringify(capped)) {
+          it.category_path = out;
+          if (out.length > 0) it.category = out[0];
+          dirty = true;
+          changed++;
+        } else if (capped.length !== path.length) {
+          // We capped depth — still a change.
+          it.category_path = capped;
+          dirty = true;
+        }
+      }
+      if (dirty && !dryRun) {
+        await supabase
+          .from("documents")
+          .update({ extracted_fields: ef })
+          .eq("id", d.id);
+      }
+    }
+    if (docs.length < PAGE) break;
+    offset += PAGE;
+  }
+
+  // 4. Register the new tokens we discovered.
+  newTokens = pendingNewTokens.size;
+  if (!dryRun && newTokens > 0) {
+    for (const { top, token, count } of Array.from(pendingNewTokens.values())) {
+      await supabase
+        .from("line_item_taxonomy")
+        .upsert(
+          {
+            user_id: userId,
+            top_category: top,
+            token,
+            aliases: [],
+            usage_count: count,
+            last_seen_at: new Date().toISOString(),
+          },
+          { onConflict: "user_id,top_category,token", ignoreDuplicates: false }
+        );
+    }
+  }
+
+  console.log(
+    `Scanned ${scanned} docs · rewrote ${changed} line items · ${newTokens} new tokens ${dryRun ? "(dry-run — no writes)" : "registered"}.`
+  );
+}
+
+/**
+ * AI-driven cleanup pass. Lists every taxonomy token under each
+ * top-category, asks Claude to suggest merges where tokens are
+ * obviously the same concept ("apples" → "apple", "wholemilk" →
+ * "milk"). Prints suggestions; the user re-runs with --apply to
+ * actually merge them.
+ *
+ *   npm run diag taxonomy-cleanup            # dry-run, print suggestions
+ *   npm run diag taxonomy-cleanup -- --apply # merge them
+ */
+async function cmdTaxonomyCleanup() {
+  const apply = rest.includes("--apply");
+  const supabase = admin();
+  if (!process.env.ANTHROPIC_API_KEY) {
+    console.error("ANTHROPIC_API_KEY missing — cannot ask Claude for merges.");
+    process.exit(1);
+  }
+  const { Anthropic } = await import("@anthropic-ai/sdk").then((m) => ({
+    Anthropic: m.default || m.Anthropic,
+  }));
+
+  const { data: anyDoc } = await supabase
+    .from("documents")
+    .select("user_id")
+    .limit(1)
+    .maybeSingle();
+  if (!anyDoc) {
+    console.log("No documents found.");
+    return;
+  }
+  const userId = anyDoc.user_id;
+
+  const { data: taxRows } = await supabase
+    .from("line_item_taxonomy")
+    .select("id, top_category, token, aliases, usage_count")
+    .eq("user_id", userId)
+    .order("top_category", { ascending: true })
+    .order("usage_count", { ascending: false });
+
+  if (!taxRows || taxRows.length === 0) {
+    console.log("No taxonomy entries yet — nothing to clean up.");
+    return;
+  }
+
+  // Group by top_category and run Claude per group.
+  const byTop = new Map();
+  for (const r of taxRows) {
+    const arr = byTop.get(r.top_category) || [];
+    arr.push(r);
+    byTop.set(r.top_category, arr);
+  }
+
+  const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  let totalSuggestions = 0;
+  let totalApplied = 0;
+
+  for (const [top, rows] of Array.from(byTop.entries())) {
+    if (rows.length < 2) continue;
+    process.stdout.write(`\n[${top}] ${rows.length} tokens · asking Claude... `);
+    const tokenList = rows
+      .map(
+        (r) =>
+          `  - ${r.token} (used ${r.usage_count}× , aliases: ${(r.aliases || []).join(",") || "none"})`
+      )
+      .join("\n");
+    const prompt = `You're cleaning up a personal spending-category glossary. Below is the list of subcategory tokens used under the top-level category "${top}". Find tokens that are obviously the same concept and should be merged.
+
+Tokens:
+${tokenList}
+
+Return ONLY a JSON array of merge proposals, no prose. Each item:
+{ "canonical": "<keep this token>", "merge_in": ["<token to fold into canonical>", ...], "reason": "<short>" }
+
+Rules:
+- Only propose merges you're confident about. If in doubt, leave alone.
+- Prefer the more-used token as the canonical.
+- Use lowercase singular ("apple", not "apples").
+- Return an empty array [] if nothing should be merged.`;
+
+    try {
+      const resp = await client.messages.create({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 2048,
+        messages: [{ role: "user", content: prompt }],
+      });
+      const text =
+        resp.content
+          .filter((b) => b.type === "text")
+          .map((b) => b.text)
+          .join("") || "";
+      const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+      const body = (fence ? fence[1] : text).trim();
+      const start = body.indexOf("[");
+      const end = body.lastIndexOf("]");
+      if (start === -1 || end === -1) {
+        console.log("no JSON array in response, skipping");
+        continue;
+      }
+      const suggestions = JSON.parse(body.slice(start, end + 1));
+      console.log(`${suggestions.length} suggestion(s)`);
+      for (const s of suggestions) {
+        if (!s || !s.canonical || !Array.isArray(s.merge_in)) continue;
+        console.log(
+          `  ✏ ${s.canonical} ← [${s.merge_in.join(", ")}]  · ${s.reason || ""}`
+        );
+        totalSuggestions++;
+        if (!apply) continue;
+        // Apply: bump canonical's aliases + usage, delete merged-in rows,
+        // rewrite docs containing the merged tokens.
+        const canonRow = rows.find((r) => r.token === s.canonical);
+        if (!canonRow) continue;
+        const newAliases = Array.from(
+          new Set([...(canonRow.aliases || []), ...s.merge_in])
+        );
+        const mergedRows = rows.filter((r) =>
+          s.merge_in.includes(r.token)
+        );
+        const newUsage = canonRow.usage_count + mergedRows.reduce((sum, r) => sum + r.usage_count, 0);
+        await supabase
+          .from("line_item_taxonomy")
+          .update({
+            aliases: newAliases,
+            usage_count: newUsage,
+            last_seen_at: new Date().toISOString(),
+          })
+          .eq("id", canonRow.id);
+        // Delete the merged-in rows.
+        if (mergedRows.length > 0) {
+          await supabase
+            .from("line_item_taxonomy")
+            .delete()
+            .in(
+              "id",
+              mergedRows.map((r) => r.id)
+            );
+        }
+        totalApplied++;
+      }
+    } catch (e) {
+      console.log(`error: ${e.message || e}`);
+    }
+  }
+
+  console.log(
+    `\nDone. ${totalSuggestions} suggestion(s).${apply ? ` Applied ${totalApplied} merge(s) to taxonomy. NOTE: run diag taxonomy-backfill after this to rewrite existing docs.` : " Re-run with --apply to merge them."}`
+  );
+}
+
 async function cmdRetryFailed() {
   const limit = Number(flag("limit", "0")) || 0;
   const base = process.env.DEV_BASE_URL || "http://localhost:3002";
@@ -1326,6 +1667,8 @@ Subcommands:
   repair-matches <statement-id-or-prefix> [--dry-run]
   retry-failed   [--limit=N]
   bulk-reassign  --to=<profile> [--sender=...] [--type=...] [--since=YYYY-MM-DD] [--from=<profile>] [--limit=N] [--dry-run]
+  taxonomy-backfill [--dry-run]
+  taxonomy-cleanup  [--apply]
   pay-actions    [--limit=50]
   match-debug    <tx-id-or-prefix>
   check-deploy
@@ -1351,6 +1694,8 @@ const dispatch = {
   "repair-matches": cmdRepairMatches,
   "retry-failed": cmdRetryFailed,
   "bulk-reassign": cmdBulkReassign,
+  "taxonomy-backfill": cmdTaxonomyBackfill,
+  "taxonomy-cleanup": cmdTaxonomyCleanup,
   "pay-actions": cmdPayActions,
   "match-debug": cmdMatchDebug,
   "check-deploy": cmdCheckDeploy,

@@ -1,6 +1,19 @@
 import { buildLineItemCategoryBlock } from "@/lib/categories";
 
-export const DOCUMENT_EXTRACTION_PROMPT = `You are a document intake assistant. A user will send you ONE scan (image or PDF). Most scans are ONE document, but sometimes a scan contains MULTIPLE distinct documents — for example, four supermarket receipts photographed together on one page, or two separate invoices on facing pages.
+/** Stitch an optional taxonomy hint into the prompt. When the user has
+ * previously categorised line items into a hierarchy ("groceries / produce
+ * / fruit"), passing the existing tokens lets Claude reuse them instead of
+ * inventing variants ("apple" vs "apples" vs "appel"). See
+ * lib/services/taxonomy.ts → buildTaxonomyHint. */
+export function buildExtractionPrompt(taxonomyHint?: string): string {
+  const hintBlock =
+    taxonomyHint && taxonomyHint.trim().length > 0
+      ? `\n\n${taxonomyHint}\n`
+      : "";
+  return DOCUMENT_EXTRACTION_PROMPT.replace("__TAXONOMY_HINT__", hintBlock);
+}
+
+export const DOCUMENT_EXTRACTION_PROMPT = `You are a document intake assistant. A user will send you ONE scan (image or PDF). Most scans are ONE document, but sometimes a scan contains MULTIPLE distinct documents — for example, four supermarket receipts photographed together on one page, or two separate invoices on facing pages.__TAXONOMY_HINT__
 
 MULTI-DOCUMENT DETECTION (read this first):
 
@@ -117,15 +130,16 @@ Rules:
   HIERARCHICAL CATEGORY_PATH — this is REQUIRED on every line item with a category, and enables drill-down spend reports.
     - category_path[0] MUST equal the value of the category field (one of the 25 canonical keys).
     - category_path[1..N] are FREE-TEXT subcategories you choose based on the product. Use English lowercase singular nouns (e.g. "fruit", not "Fruits"). Be CONSISTENT across line items — "apple" not "apples", "milk" not "dairy milk", so the same physical item ends up under the same path on different receipts.
-    - Drill from broad to specific. Examples:
-        groceries item "EKO APPELS GRANNY SMITH"   → ["groceries", "produce", "fruit", "apple"]
+    - Drill from broad to specific. Examples (notice: max 3 levels):
+        groceries item "EKO APPELS GRANNY SMITH"   → ["groceries", "produce", "fruit"]
         groceries item "VOLLE MELK 1L"             → ["groceries", "dairy", "milk"]
         groceries item "BIO VOLKORENBROOD"         → ["groceries", "bakery", "bread"]
         alcohol  item "PINOT GRIGIO 0,75L"         → ["alcohol", "wine", "white"]
         fuel     item "DIESEL 38,12 L"             → ["fuel", "diesel"]
         pharmacy item "IBUPROFEN 400MG 30 ST"      → ["pharmacy", "pain_relief", "ibuprofen"]
         clothing item "NIKE AIR MAX 42"            → ["clothing", "shoes", "sneakers"]
-    - Aim for 2–4 levels deep. Single-level is fine when the item is generic (e.g. ["other"]).
+    - MAX DEPTH 3. The array has at most 3 elements: top_category + at most 2 subcategory levels. Don't go deeper than that, even if the product seems specific. Group by the most natural mid-level concept ("fruit", "wine", "pain_relief") and stop. Going deeper just adds drift across receipts without making the report more useful.
+    - Single-level is fine when the item is generic (e.g. ["other"]).
     - DO NOT invent levels that aren't grounded in the printed description. If the receipt just says "DIVERSEN" or "BTW", a single level is honest. Over-deep paths with guessed sub-labels are worse than shallow honest ones.
   If there's only one line, include it anyway — a single-element array. Omit line_items entirely if the doc has no itemised breakdown (e.g. a letter, a simple payment confirmation with only a total).
 

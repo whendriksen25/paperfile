@@ -20,6 +20,11 @@ import {
 } from "@/lib/utils/rabobank-csv-parser";
 import { reconcileBankStatement } from "@/lib/services/bank-reconciliation";
 import { replaceStatementTransactions } from "@/lib/services/bank-transactions";
+import {
+  loadTaxonomySnapshot,
+  buildTaxonomyHint,
+  canonicalisePath,
+} from "@/lib/services/taxonomy";
 import type { DocumentExtraction } from "@/types/document";
 
 const PROFILE_AUTO_ASSIGN_THRESHOLD = 0.7;
@@ -68,6 +73,13 @@ export async function POST(
     // 1. Download original from its storage backend
     const storage = getStorage(doc.storage_provider);
     const buffer = await storage.downloadFile(doc.dropbox_path);
+
+    // 1a. Load the user's existing taxonomy so we can hint Claude to
+    // REUSE subcategory tokens it already knows ("apple") instead of
+    // inventing variants ("apples", "appel", "Apple "). Cheap query —
+    // tens to low hundreds of rows for a personal archive.
+    const taxonomySnapshot = await loadTaxonomySnapshot(admin, doc.user_id);
+    const taxonomyHint = buildTaxonomyHint(taxonomySnapshot);
 
     // 1.5. CAMT.053 fast path — when the file is a CAMT.053 XML bank
     // statement (every NL bank exports this under "Periodieke afschriften"),
@@ -145,7 +157,7 @@ export async function POST(
           "[api/analyze] CAMT parse failed, falling back to Claude:",
           e
         );
-        const ex = await extractDocument(buffer, doc.file_name || "file.xml");
+        const ex = await extractDocument(buffer, doc.file_name || "file.xml", { taxonomyHint });
         result = ex.data;
         aiUsage = ex.usage;
         aiStopReason = ex.stop_reason;
@@ -213,7 +225,7 @@ export async function POST(
           "[api/analyze] Rabobank CSV parse failed, falling back to Claude:",
           e
         );
-        const ex = await extractDocument(buffer, doc.file_name || "file.csv");
+        const ex = await extractDocument(buffer, doc.file_name || "file.csv", { taxonomyHint });
         result = ex.data;
         aiUsage = ex.usage;
         aiStopReason = ex.stop_reason;
@@ -230,8 +242,8 @@ export async function POST(
         buffer,
         doc.file_name || "file.pdf",
         wantExtended
-          ? { maxTokens: 131072, useExtendedOutput: true }
-          : undefined
+          ? { maxTokens: 131072, useExtendedOutput: true, taxonomyHint }
+          : { taxonomyHint }
       );
       result = ex.data;
       aiUsage = ex.usage;
@@ -317,6 +329,16 @@ export async function POST(
       // After the two early returns above, `result` is necessarily a
       // DocumentExtraction. TS can't narrow through the in-check, so cast.
       extraction = result as Exclude<typeof result, { error: string }>;
+    }
+
+    // Canonicalise category_path on every line item of every detected
+    // doc. Rewrites Claude's free-text subcategory tokens to whatever
+    // canonical form the user's taxonomy table has — so "apples" /
+    // "Apple" / "appel" all become "apple", registering close variants
+    // as aliases for the next pass.
+    await canonicaliseLineItemPaths(admin, doc.user_id, extraction);
+    for (const child of multiDocChildren) {
+      await canonicaliseLineItemPaths(admin, doc.user_id, child);
     }
 
     // 2.4. First-seen-sender detection. If the user has never had a
@@ -1133,5 +1155,44 @@ export async function POST(
       })
       .eq("id", id);
     return NextResponse.json({ error: msg }, { status: 500 });
+  }
+}
+
+/**
+ * Mutates extraction.extracted_fields.line_items[*].category_path in
+ * place: rewrites Claude's free-text subcategory tokens to canonical
+ * forms registered in the user's line_item_taxonomy table. New tokens
+ * are inserted; close variants ("apples" vs "apple") are folded as
+ * aliases so the next extraction matches them exactly.
+ */
+async function canonicaliseLineItemPaths(
+  admin: Awaited<ReturnType<typeof createServiceClient>>,
+  userId: string,
+  extraction: DocumentExtraction
+): Promise<void> {
+  const ef = extraction.extracted_fields as Record<string, unknown> | undefined;
+  if (!ef) return;
+  const items = ef["line_items"];
+  if (!Array.isArray(items)) return;
+  for (const raw of items) {
+    if (!raw || typeof raw !== "object") continue;
+    const item = raw as Record<string, unknown>;
+    const path = item["category_path"];
+    if (!Array.isArray(path) || path.length === 0) continue;
+    try {
+      // Cap at depth 3 client-side too in case Claude ignored the prompt.
+      const capped = (path as unknown[])
+        .slice(0, 3)
+        .map((x) => String(x || ""));
+      const canon = await canonicalisePath(admin, userId, capped);
+      item["category_path"] = canon;
+      // Keep the flat `category` field in sync with path[0].
+      if (canon.length > 0) item["category"] = canon[0];
+    } catch (e) {
+      console.warn(
+        "[api/analyze] canonicalisePath failed for one line item:",
+        e instanceof Error ? e.message : String(e)
+      );
+    }
   }
 }
