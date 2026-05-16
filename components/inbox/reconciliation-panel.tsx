@@ -320,6 +320,17 @@ export function ReconciliationPanel({
             />
           </div>
 
+          {buckets.suspicions.length > 0 && (
+            <a
+              href={`/document/${documentId}/review`}
+              className="mt-3 flex items-center justify-center gap-1.5 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg py-2 transition-colors"
+            >
+              Review {buckets.suspicions.length} suspicion
+              {buckets.suspicions.length === 1 ? "" : "s"} — pick the bill each
+              belongs to →
+            </a>
+          )}
+
           {aiProgress && (
             <div className="mt-3 border-t border-border pt-3">
               <div className="flex items-center justify-between text-xs mb-1">
