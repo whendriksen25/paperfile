@@ -398,16 +398,21 @@ export async function POST(
         try {
           const { cropRegions } = await import("@/lib/services/image-crop");
           const crops = await cropRegions(buffer, boxes);
-          // Re-extract each crop at full resolution. Sequential to keep
-          // memory + concurrency simple; multi-doc scans are small N.
+          // Re-extract each crop at full resolution IN PARALLEL.
+          // Sequential calls take 4×~20s = ~80s which alone exceeds
+          // Vercel's 60s Hobby cap. Parallel collapses wall-clock to
+          // max(per-call) ≈ 20-25s. Anthropic's rate limits are fine
+          // with 4 parallel for personal-scale traffic.
+          const extResults = await Promise.all(
+            crops.map((c, i) =>
+              extractDocument(c, `${doc.file_name || "crop"}_part${i + 1}.jpg`, {
+                taxonomyHint,
+              })
+            )
+          );
           const reExtracted: DocumentExtraction[] = [];
-          for (let i = 0; i < crops.length; i++) {
-            const ex = await extractDocument(
-              crops[i],
-              `${doc.file_name || "crop"}_part${i + 1}.jpg`,
-              { taxonomyHint }
-            );
-            // Accumulate AI usage so the cost is honestly recorded.
+          for (let i = 0; i < extResults.length; i++) {
+            const ex = extResults[i];
             aiUsage = {
               input_tokens: aiUsage.input_tokens + (ex.usage?.input_tokens || 0),
               output_tokens:
