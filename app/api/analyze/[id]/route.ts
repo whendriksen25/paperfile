@@ -74,9 +74,30 @@ export async function POST(
       .update({ status: "processing" })
       .eq("id", id);
 
-    // 1. Download original from its storage backend
+    // 1. Download original from its storage backend.
+    // Special case: ?from_original=1 — when the parent of a multi-doc
+    // split was previously cropped, its dropbox_path now points at
+    // crop[0] (a single receipt). Re-analysing it would just re-process
+    // that one crop. The "Re-analyse full scan" button uses this flag
+    // to download from the FULL multi-receipt scan instead, triggering
+    // a fresh multi-doc detection + new crops (the dedup-on-resplit
+    // logic later in this route replaces all current children cleanly).
+    const fromOriginal =
+      request.nextUrl.searchParams.get("from_original") === "1";
+    const ef0 = doc.extracted_fields as Record<string, unknown> | null;
+    const originalScanPathStored =
+      (ef0?.["_original_scan_path"] as string | undefined) || null;
+    const downloadPath =
+      fromOriginal && originalScanPathStored
+        ? originalScanPathStored
+        : doc.dropbox_path;
+    if (fromOriginal && !originalScanPathStored) {
+      console.warn(
+        "[api/analyze] from_original=1 but no _original_scan_path on doc; falling back to dropbox_path"
+      );
+    }
     const storage = getStorage(doc.storage_provider);
-    const buffer = await storage.downloadFile(doc.dropbox_path);
+    const buffer = await storage.downloadFile(downloadPath);
 
     // 1a. Load the user's existing taxonomy so we can hint Claude to
     // REUSE subcategory tokens it already knows ("apple") instead of
@@ -599,10 +620,13 @@ export async function POST(
     // crop's path. Parent's dropbox_path then gets repointed to crop[0]
     // (the most useful preview for the parent's extraction); children
     // each get crop[i]. Original full scan stays where the move put it
-    // for recoverability.
+    // for recoverability AND so the parent can later trigger a fresh
+    // multi-doc split via ?from_original=1.
+    let originalScanPath: string | null = null;
     if (perCropDropboxBuffers && perCropDropboxBuffers.length > 0) {
       try {
         const originalPath = newPath;
+        originalScanPath = originalPath; // remember for parent's extracted_fields
         const dotIdx = originalPath.lastIndexOf(".");
         const stem =
           dotIdx > 0 ? originalPath.slice(0, dotIdx) : originalPath;
@@ -802,6 +826,13 @@ export async function POST(
         tags: mergedTags,
         extracted_fields: {
           ...(extraction.extracted_fields || {}),
+          // Path to the original full multi-receipt scan, if this row is
+          // the parent of a crop-split. Lets the "Re-analyse full scan"
+          // button re-trigger the multi-doc detection from the original
+          // image instead of just re-extracting crop[0].
+          ...(originalScanPath
+            ? { _original_scan_path: originalScanPath }
+            : {}),
           _profile_match: profileMatchReason
             ? {
                 reason: profileMatchReason,

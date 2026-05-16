@@ -548,6 +548,11 @@ export default async function DocumentDetail({
             documentId={doc.id}
             currentProfileId={doc.primary_profile_id}
             currentDocumentType={doc.document_type}
+            hasOriginalScan={
+              !!(doc.extracted_fields as Record<string, unknown> | null)?.[
+                "_original_scan_path"
+              ]
+            }
           />
         </div>
       </div>

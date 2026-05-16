@@ -43,10 +43,15 @@ export function RefileWidget({
   documentId,
   currentProfileId,
   currentDocumentType,
+  hasOriginalScan,
 }: {
   documentId: string;
   currentProfileId: number | null;
   currentDocumentType: string | null;
+  /** True when this row is the parent of a multi-doc split with the
+   * original full scan still stored in Dropbox — enables the second
+   * "Re-analyse full scan" button that re-runs multi-doc detection. */
+  hasOriginalScan?: boolean;
 }) {
   const router = useRouter();
   const [profiles, setProfiles] = useState<ProfileRow[]>([]);
@@ -54,6 +59,7 @@ export function RefileWidget({
   const [docType, setDocType] = useState<string>(currentDocumentType || "");
   const [saving, setSaving] = useState(false);
   const [reanalysing, setReanalysing] = useState(false);
+  const [reanalysingFull, setReanalysingFull] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [doneMessage, setDoneMessage] = useState<string | null>(null);
   // After save: if siblings exist with a different classification, show a
@@ -164,6 +170,46 @@ export function RefileWidget({
     }
   }
 
+  /** "Re-analyse full scan" — only available when this row is the parent
+   * of a multi-doc crop split. Tells the analyze route to download the
+   * ORIGINAL full multi-receipt scan (stored in extracted_fields
+   * ._original_scan_path) and re-run multi-doc detection. The existing
+   * resplit-dedup logic in the analyze route will cleanly replace the
+   * current children with the new split. */
+  async function reanalyseFullScan() {
+    const confirmed = window.confirm(
+      "Re-analyse the FULL multi-receipt scan from scratch?\n\n" +
+        "This downloads the original multi-receipt scan, asks Claude to detect " +
+        "the boundaries again, crops each receipt fresh, and replaces all the " +
+        "current sibling rows with the new split. Useful when Claude got the " +
+        "split wrong, or when you want to retry with a better bounding-box pass.\n\n" +
+        "Existing children (and their actions) will be deleted; new ones will " +
+        "be spawned.\n\nContinue?"
+    );
+    if (!confirmed) return;
+    setReanalysingFull(true);
+    setError(null);
+    setDoneMessage(null);
+    try {
+      const res = await fetch(
+        `/api/analyze/${documentId}?from_original=1&force_profile=1`,
+        { method: "POST" }
+      );
+      if (!res.ok) {
+        const json = await res.json().catch(() => ({}));
+        throw new Error(json.error || `HTTP ${res.status}`);
+      }
+      setDoneMessage(
+        "Full-scan re-analysed — refresh in a moment to see the new split."
+      );
+      router.refresh();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "Re-analyse full scan failed");
+    } finally {
+      setReanalysingFull(false);
+    }
+  }
+
   return (
     <div className="mt-4 pt-4 border-t border-border">
       <div className="text-xs font-bold uppercase tracking-wider text-muted-foreground mb-3">
@@ -230,7 +276,7 @@ export function RefileWidget({
         </button>
         <button
           onClick={reanalyse}
-          disabled={reanalysing}
+          disabled={reanalysing || reanalysingFull}
           className="btn-secondary text-xs !py-2"
         >
           {reanalysing ? (
@@ -245,6 +291,27 @@ export function RefileWidget({
           )}
         </button>
       </div>
+
+      {/* Multi-doc re-split — only on parents of a crop-split scan. */}
+      {hasOriginalScan && (
+        <button
+          onClick={reanalyseFullScan}
+          disabled={reanalysing || reanalysingFull}
+          className="btn-secondary text-xs !py-2 mt-2 w-full"
+          title="Re-download the original multi-receipt scan and redo the entire split — replaces all current sibling rows"
+        >
+          {reanalysingFull ? (
+            <>
+              <Spinner className="h-3.5 w-3.5" /> Re-analysing full scan…
+            </>
+          ) : (
+            <>
+              <Sparkles className="h-3.5 w-3.5" />
+              Re-analyse full scan (re-split all receipts)
+            </>
+          )}
+        </button>
+      )}
 
       {error && (
         <p className="mt-2 text-xs text-destructive font-semibold">{error}</p>
