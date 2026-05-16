@@ -1,7 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { DocumentCard } from "./document-card";
+import { SelectableCard } from "./selectable-card";
+import { useSelectMode } from "./select-mode-context";
 import { Spinner } from "@/components/ui/spinner";
 import type { DocumentRow, ProfileRow } from "@/types/document";
 
@@ -98,8 +99,9 @@ export function InboxInfiniteList({
 
   return (
     <div className="grid gap-3">
+      <SelectAllShortcut docs={docs} />
       {docs.map((doc) => (
-        <DocumentCard
+        <SelectableCard
           key={doc.id}
           doc={doc}
           profile={
@@ -131,6 +133,40 @@ export function InboxInfiniteList({
           End of list · {docs.length} documents
         </div>
       )}
+    </div>
+  );
+}
+
+/** When in select mode, render a small "Select all on this page" /
+ * "Clear" row above the cards. Hidden completely when not in select
+ * mode so the inbox looks untouched for normal browsing. */
+function SelectAllShortcut({ docs }: { docs: DocumentRow[] }) {
+  const { selectMode, selected, selectMany, clear } = useSelectMode();
+  if (!selectMode) return null;
+  const allHere = docs.every((d) => selected.has(d.id));
+  return (
+    <div className="flex items-center justify-between text-[11px] font-semibold text-muted-foreground py-1">
+      <span>{selected.size} selected · {docs.length} on this page</span>
+      <div className="flex items-center gap-2">
+        {!allHere && docs.length > 0 && (
+          <button
+            type="button"
+            onClick={() => selectMany(docs.map((d) => d.id))}
+            className="text-brand-purple hover:underline"
+          >
+            Select all on this page
+          </button>
+        )}
+        {selected.size > 0 && (
+          <button
+            type="button"
+            onClick={clear}
+            className="text-muted-foreground hover:text-foreground"
+          >
+            Clear
+          </button>
+        )}
+      </div>
     </div>
   );
 }

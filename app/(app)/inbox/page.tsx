@@ -1,6 +1,5 @@
 import Link from "next/link";
 import { createClient } from "@/lib/supabase/server";
-import { DocumentCard } from "@/components/inbox/document-card";
 import { ProcessingBanner } from "@/components/inbox/processing-banner";
 import { NeedsReviewBanner } from "@/components/inbox/needs-review-banner";
 import { InboxInfiniteList } from "@/components/inbox/infinite-list";
@@ -8,6 +7,9 @@ import { ProfileSelector } from "@/components/layout/profile-selector";
 import { ExportToDropboxButton } from "@/components/inbox/export-button";
 import { SanityCheckButton } from "@/components/inbox/sanity-check-button";
 import { SearchInput } from "@/components/inbox/search-input";
+import { SelectModeProvider } from "@/components/inbox/select-mode-context";
+import { InboxBulkControls } from "@/components/inbox/inbox-bulk-controls";
+import { SelectableCard } from "@/components/inbox/selectable-card";
 import { titleCase } from "@/lib/utils/format";
 import {
   INBOX_CARD_FIELDS,
@@ -106,9 +108,15 @@ export default async function InboxPage({
   const categories = ((countsData || []) as { document_type: string; n: number }[])
     .map((r) => [r.document_type, Number(r.n)] as [string, number]);
 
+  // Selection state is cleared whenever the inbox filters change — the
+  // resetKey is a stable string derived from the active search params.
+  const resetKey = `${sp.profile_id || "all"}:${sp.type || "all"}:${sp.batch || "all"}:${sp.needs_review || "0"}:${searchQuery || "all"}`;
+  const profilesArray = (profileData || []) as ProfileRow[];
+
   return (
+    <SelectModeProvider resetKey={resetKey}>
     <div className="px-5 md:px-10 py-6 md:py-10 max-w-5xl mx-auto">
-      <div className="flex items-start justify-between mb-6 gap-4">
+      <div className="flex items-start justify-between mb-6 gap-4 flex-wrap">
         <header>
           <h1 className="text-3xl font-extrabold tracking-tight">
             {triage ? "Needs review" : "File it"}
@@ -131,13 +139,17 @@ export default async function InboxPage({
             )}
           </p>
         </header>
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-3 flex-wrap">
           <SanityCheckButton />
           <ExportToDropboxButton
             type={sp.type || null}
             profileId={sp.profile_id ? Number(sp.profile_id) : null}
             batch={sp.batch || null}
           />
+          {/* Bulk multi-select controls — sits LEFT of the profile filter
+              per UX preference. Idle: "Select" button. Active: target
+              profile picker + Move N docs. */}
+          <InboxBulkControls profiles={profilesArray} />
           <ProfileSelector />
         </div>
       </div>
@@ -262,6 +274,7 @@ export default async function InboxPage({
         <GroupedDocs docs={docs} profilesById={profilesById} group={group} />
       )}
     </div>
+    </SelectModeProvider>
   );
 }
 
@@ -343,7 +356,7 @@ function GroupedDocs({
           </header>
           <div className="grid gap-3">
             {bucket.docs.map((doc) => (
-              <DocumentCard
+              <SelectableCard
                 key={doc.id}
                 doc={doc}
                 profile={
