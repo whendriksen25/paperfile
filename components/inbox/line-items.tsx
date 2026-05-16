@@ -18,12 +18,21 @@ export interface LineItem {
   description?: string | null;
   category?: string | null;
   quantity?: number | null;
+  /** Unit the quantity is in: kg, g, L, ml, m, pack, each, ... */
+  unit?: string | null;
   unit_price?: number | null;
   vat_rate?: number | null;
   vat_amount?: number | null;
   total?: number | null;
   currency?: string | null;
   reference?: string | null;
+  /** Per-line discount printed on the receipt (positive number). */
+  discount_amount?: number | null;
+  /** Verbatim raw line as printed (e.g. "0,428 kg × €4,99 €2,14"). */
+  printed_raw?: string | null;
+  /** Hierarchical category path: [top_key, sub, more_specific, ...].
+   * Index 0 == `category` (top-level key). Drill-down reports use this. */
+  category_path?: string[] | null;
 }
 
 /** Pick a brand chip color per category — keeps the table scannable. */
@@ -183,7 +192,9 @@ export function LineItemsSection({
                     )}
                   </td>
                   <td className="py-2 px-2 text-right tabular-nums hidden md:table-cell text-muted-foreground">
-                    {it.quantity != null ? it.quantity : ""}
+                    {it.quantity != null
+                      ? `${it.quantity}${it.unit ? " " + it.unit : ""}`
+                      : ""}
                   </td>
                   <td className="py-2 px-2 text-right tabular-nums hidden md:table-cell text-muted-foreground">
                     {it.unit_price != null
@@ -198,6 +209,11 @@ export function LineItemsSection({
                     {it.total != null
                       ? formatMoney(it.total, it.currency || currency || null)
                       : ""}
+                    {it.discount_amount != null && it.discount_amount !== 0 && (
+                      <div className="text-[10px] text-rose-700 font-semibold mt-0.5">
+                        −{formatMoney(it.discount_amount, it.currency || currency || null)} discount
+                      </div>
+                    )}
                   </td>
                 </tr>
               );

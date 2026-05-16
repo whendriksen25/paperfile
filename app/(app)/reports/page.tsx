@@ -203,6 +203,12 @@ export default async function ReportsPage({
         <p className="text-sm text-muted-foreground mt-1">
           Total spend by profile and category, over a chosen period.
         </p>
+        <Link
+          href="/reports/categories"
+          className="mt-3 inline-flex items-center gap-1.5 text-xs font-bold text-brand-purple hover:underline"
+        >
+          → Spending by line-item category (drill-down: food › fruit › apple)
+        </Link>
       </header>
 
       {/* Filters */}

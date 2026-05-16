@@ -76,22 +76,60 @@ Rules:
   Skip line items for fees the bank charged its own customer (don't try to reconcile those).
   - contract: parties, effective_date, end_date, contract_reference, national_id
   - invoice: invoice_number, due_date, vat_breakdown, total_excl, total_vat, total_incl, payment_iban, payment_reference, customer_reference
+  - receipt: capture EVERYTHING printed on the receipt — not just the totals. Use these exact keys when present:
+    - store_name (specific branch, e.g. "Ekoplaza Bilthoven"), store_address, store_city, store_phone
+    - store_id / branch_id (printed branch / vestigingsnummer)
+    - register_id / cashier_id / cashier_name (kassa / medewerker if printed)
+    - transaction_time (HH:MM as printed — separate from document_date)
+    - transaction_reference (POS receipt number, transactienummer, bon-nummer)
+    - payment_method ("cash" | "card" | "contactless" | "mobile_pay" | "voucher" | "mixed")
+    - card_last4 (last 4 of payment card, if printed)
+    - card_brand (Maestro, Visa, AmEx, etc.)
+    - customer_number / loyalty_card_number (klantnummer / pasnummer / "Klant: ...")
+    - loyalty_points_earned (this transaction's points / zegels / stempels)
+    - loyalty_points_balance (running total after this transaction, if printed)
+    - loyalty_member_name (name printed alongside the loyalty card)
+    - savings_total (the "u bespaarde X" / "Total savings" line)
+    - subtotal_excl_vat, vat_total, total_incl_vat (the printed totals box)
+    - currency, items_count (number of items if printed at the bottom)
+    - return_policy_id (sometimes printed as a return reference)
+  None of these are mandatory — if a field isn't printed on the receipt, omit it. But if it IS printed, capture it; don't filter "boring" details out.
 
-- "extracted_fields.line_items" — for ANY document with itemised charges (bills, invoices, receipts, prescriptions with multiple products, service quotes) include an array of objects, one per line:
+- "extracted_fields.line_items" — for ANY document with itemised charges (bills, invoices, receipts, prescriptions with multiple products, service quotes) include an array of objects, ONE PER LINE printed on the document. Don't skip lines, don't collapse multiple items into one entry, and EVERY line MUST have a category (never leave category empty):
   [
     {
-      "description": "<what the item is — keep the product/service name verbatim from the doc>",
-      "category": "<one of the line_item_category values below — pick the closest fit; use 'other' only as last resort>",
-      "quantity": <number or null>,
-      "unit_price": <number or null>,
-      "vat_rate": <number or null>,
+      "description": "<what the item is — keep the product/service name verbatim from the doc, in the original language>",
+      "category": "<REQUIRED: pick one of the line_item_category keys below — never leave blank, use 'other' only as last resort>",
+      "quantity": <number or null — the numeric amount: 2, 0.428, 1.5, etc.>,
+      "unit": "<the unit the quantity is in: 'kg', 'g', 'L', 'ml', 'm', 'pack', 'each', 'piece', 'box', 'hour', etc. Null if not weighed/measured.>",
+      "unit_price": <number or null — price PER unit, e.g. €4.99 for "0.428 kg × €4.99/kg">,
+      "vat_rate": <number or null — as a percentage, e.g. 21 or 9>,
       "vat_amount": <number or null>,
-      "total": <number or null — this line's total incl VAT if shown, else excl>,
+      "total": <number or null — this line's total incl VAT if shown, else excl. NEGATIVE for discounts / refunds / deposit returns.>,
       "currency": "<ISO code if different from top-level currency>",
-      "reference": "<product code / SKU / dosage / article number, or null>"
+      "reference": "<product code / SKU / dosage / article number, EAN/barcode, or null>",
+      "discount_amount": <number or null — per-line discount printed on this line, e.g. "−€0.50 bonuskorting". Positive number; subtract from total separately if needed>,
+      "printed_raw": "<the verbatim line as printed, e.g. '0,428 kg × €4,99 €2,14'. Helpful when total/quantity parsing is ambiguous>",
+      "category_path": ["<top-level category key, same as 'category' field>", "<subcategory, free text>", "<more specific, free text>", "<even more specific, free text>"]
     }
   ]
+
+  HIERARCHICAL CATEGORY_PATH — this is REQUIRED on every line item with a category, and enables drill-down spend reports.
+    - category_path[0] MUST equal the value of the category field (one of the 25 canonical keys).
+    - category_path[1..N] are FREE-TEXT subcategories you choose based on the product. Use English lowercase singular nouns (e.g. "fruit", not "Fruits"). Be CONSISTENT across line items — "apple" not "apples", "milk" not "dairy milk", so the same physical item ends up under the same path on different receipts.
+    - Drill from broad to specific. Examples:
+        groceries item "EKO APPELS GRANNY SMITH"   → ["groceries", "produce", "fruit", "apple"]
+        groceries item "VOLLE MELK 1L"             → ["groceries", "dairy", "milk"]
+        groceries item "BIO VOLKORENBROOD"         → ["groceries", "bakery", "bread"]
+        alcohol  item "PINOT GRIGIO 0,75L"         → ["alcohol", "wine", "white"]
+        fuel     item "DIESEL 38,12 L"             → ["fuel", "diesel"]
+        pharmacy item "IBUPROFEN 400MG 30 ST"      → ["pharmacy", "pain_relief", "ibuprofen"]
+        clothing item "NIKE AIR MAX 42"            → ["clothing", "shoes", "sneakers"]
+    - Aim for 2–4 levels deep. Single-level is fine when the item is generic (e.g. ["other"]).
+    - DO NOT invent levels that aren't grounded in the printed description. If the receipt just says "DIVERSEN" or "BTW", a single level is honest. Over-deep paths with guessed sub-labels are worse than shallow honest ones.
   If there's only one line, include it anyway — a single-element array. Omit line_items entirely if the doc has no itemised breakdown (e.g. a letter, a simple payment confirmation with only a total).
+
+  RECEIPT-SPECIFIC NOTE: supermarket receipts often have weighed items ("0,428 kg @ €4,99/kg = €2,14"), per-line bonuskorting / discounts on the NEXT line below the item (link them — put the discount in the discount_amount field on the SAME object, not as a separate item, unless the receipt printed it as its own line), and statiegeld at the bottom (category: deposit_return, total negative). Each printed line should appear in the array.
 
 - line_item_category — pick the best-matching key from this canonical list (Dutch label in parentheses for ambiguity, then short description). Use the ENGLISH key as the value of "category" — never the Dutch label or description:
 ${buildLineItemCategoryBlock()}
