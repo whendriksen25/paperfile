@@ -626,6 +626,92 @@ function maxAcceptableEdits(s) {
  *   npm run diag taxonomy-backfill -- --dry-run
  *   npm run diag taxonomy-backfill
  */
+/**
+ * Find documents that have multi-doc children, identify stale duplicates
+ * (children created by an earlier split run that a later re-analyze
+ * superseded), and delete them.
+ *
+ * Definition of "stale": children whose ID is NOT in the most recent
+ * multi_doc_split maintenance_log entry's payload.child_document_ids
+ * for this parent.
+ *
+ *   npm run diag cleanup-multi-doc-dupes -- --dry-run
+ *   npm run diag cleanup-multi-doc-dupes
+ */
+async function cmdCleanupMultiDocDupes() {
+  const dryRun = rest.includes("--dry-run");
+  const supabase = admin();
+
+  // 1. Find every distinct parent that has children.
+  const { data: kids } = await supabase
+    .from("documents")
+    .select("parent_document_id")
+    .not("parent_document_id", "is", null)
+    .neq("status", "deleted")
+    .limit(5000);
+  const parentIds = Array.from(
+    new Set((kids || []).map((r) => r.parent_document_id))
+  );
+  if (parentIds.length === 0) {
+    console.log("No multi-doc parents found — nothing to clean.");
+    return;
+  }
+  console.log(`Checking ${parentIds.length} multi-doc parent(s)...`);
+
+  let totalStale = 0;
+  let totalKept = 0;
+  for (const parentId of parentIds) {
+    // 2. The most recent multi_doc_split log entry for this parent.
+    const { data: logs } = await supabase
+      .from("maintenance_log")
+      .select("payload, created_at")
+      .eq("kind", "multi_doc_split")
+      .eq("document_id", parentId)
+      .order("created_at", { ascending: false })
+      .limit(1);
+    const latestLog = (logs || [])[0];
+    if (!latestLog) {
+      console.log(
+        `  ? ${parentId.slice(0, 8)} — no multi_doc_split log, skipping`
+      );
+      continue;
+    }
+    const expected = new Set(
+      (latestLog.payload?.child_document_ids || [])
+    );
+    // 3. Current children for this parent.
+    const { data: currentKids } = await supabase
+      .from("documents")
+      .select("id, sender, document_date, amount, created_at")
+      .eq("parent_document_id", parentId)
+      .neq("status", "deleted")
+      .order("created_at", { ascending: true });
+    const stale = (currentKids || []).filter((c) => !expected.has(c.id));
+    const keep = (currentKids || []).filter((c) => expected.has(c.id));
+    totalKept += keep.length;
+    if (stale.length === 0) {
+      continue;
+    }
+    console.log(
+      `  ✗ ${parentId.slice(0, 8)} — ${stale.length} stale child(ren) (keeping ${keep.length})`
+    );
+    for (const s of stale) {
+      console.log(
+        `      stale: ${s.id.slice(0, 8)}  ${s.sender || "—"}  ${s.amount ?? "—"}  created ${s.created_at}`
+      );
+    }
+    totalStale += stale.length;
+    if (!dryRun) {
+      const staleIds = stale.map((s) => s.id);
+      await supabase.from("actions").delete().in("document_id", staleIds);
+      await supabase.from("documents").delete().in("id", staleIds);
+    }
+  }
+  console.log(
+    `\nDone. ${totalStale} stale child(ren) ${dryRun ? "would be deleted" : "deleted"}, ${totalKept} kept.${dryRun ? " Re-run without --dry-run to apply." : ""}`
+  );
+}
+
 async function cmdTaxonomyBackfill() {
   const dryRun = rest.includes("--dry-run");
   const supabase = admin();
@@ -1669,6 +1755,7 @@ Subcommands:
   bulk-reassign  --to=<profile> [--sender=...] [--type=...] [--since=YYYY-MM-DD] [--from=<profile>] [--limit=N] [--dry-run]
   taxonomy-backfill [--dry-run]
   taxonomy-cleanup  [--apply]
+  cleanup-multi-doc-dupes [--dry-run]
   pay-actions    [--limit=50]
   match-debug    <tx-id-or-prefix>
   check-deploy
@@ -1696,6 +1783,7 @@ const dispatch = {
   "bulk-reassign": cmdBulkReassign,
   "taxonomy-backfill": cmdTaxonomyBackfill,
   "taxonomy-cleanup": cmdTaxonomyCleanup,
+  "cleanup-multi-doc-dupes": cmdCleanupMultiDocDupes,
   "pay-actions": cmdPayActions,
   "match-debug": cmdMatchDebug,
   "check-deploy": cmdCheckDeploy,

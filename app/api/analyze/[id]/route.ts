@@ -980,6 +980,34 @@ export async function POST(
     // amount, line items, profile, actions.
     const childIds: string[] = [];
     if (multiDocChildren.length > 0) {
+      // Dedup-on-resplit: a previous run may have spawned children for
+      // this same parent. Re-analyse should REPLACE that set, not stack
+      // on top of it. Find existing children + delete their actions
+      // first, then delete the child rows themselves.
+      try {
+        const { data: existingKids } = await admin
+          .from("documents")
+          .select("id")
+          .eq("parent_document_id", id);
+        const existingIds = (existingKids || []).map(
+          (r) => (r as { id: string }).id
+        );
+        if (existingIds.length > 0) {
+          await admin
+            .from("actions")
+            .delete()
+            .in("document_id", existingIds);
+          await admin.from("documents").delete().in("id", existingIds);
+          console.log(
+            `[api/analyze] deleted ${existingIds.length} stale child doc(s) before respawning`
+          );
+        }
+      } catch (e) {
+        console.warn(
+          "[api/analyze] failed to clean up existing children (continuing):",
+          e
+        );
+      }
       console.log(
         `[api/analyze] spawning ${multiDocChildren.length} multi-doc children for parent ${id}`
       );
