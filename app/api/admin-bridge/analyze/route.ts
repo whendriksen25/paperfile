@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient, createServiceClient } from "@/lib/supabase/server";
 import { getStorage } from "@/lib/storage";
-import { extractDocument } from "@/lib/ai/extract";
+import { extractDocument, isMultiDoc } from "@/lib/ai/extract";
 import { suggestProfile } from "@/lib/ai/suggest-profile";
 import {
   listProfilesForUser,
@@ -76,7 +76,19 @@ export async function POST(request: NextRequest) {
       .eq("id", doc.id);
     return NextResponse.json({ error: "Non-JSON response", stop_reason: result.stop_reason }, { status: 500 });
   }
-  const extraction = result as Exclude<typeof result, { error: string }>;
+  // Multi-doc fallback for the admin-bridge: if Claude detected
+  // multiple documents on this scan, this dev-only retry tool just
+  // uses the FIRST one (matches the existing single-doc behavior). For
+  // full multi-doc child-spawning, use the main /api/analyze/[id] route.
+  const extraction = (isMultiDoc(result)
+    ? result.documents[0]
+    : result) as Exclude<typeof result, { error: string }> as import("@/types/document").DocumentExtraction;
+  if (!extraction) {
+    return NextResponse.json(
+      { error: "Multi-doc result had empty documents array" },
+      { status: 500 }
+    );
+  }
 
   // Profile resolution (same as analyze/[id] route) — but using the row's owner
   let profileId: number | null = doc.primary_profile_id || null;

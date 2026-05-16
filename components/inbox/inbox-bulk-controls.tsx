@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { CheckSquare, Square, Loader2, X } from "lucide-react";
+import { CheckSquare, Square, Loader2, X, Sparkles } from "lucide-react";
 import { useSelectMode } from "./select-mode-context";
 import type { ProfileRow } from "@/types/document";
 
@@ -25,7 +25,9 @@ export function InboxBulkControls({
   const { selectMode, setSelectMode, selected, clear } = useSelectMode();
   const [targetProfileId, setTargetProfileId] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
+  const [reanalyzing, setReanalyzing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [info, setInfo] = useState<string | null>(null);
 
   async function move() {
     if (!targetProfileId || selected.size === 0) return;
@@ -61,6 +63,47 @@ export function InboxBulkControls({
       setError(e instanceof Error ? e.message : "Network error");
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function reanalyze() {
+    if (selected.size === 0) return;
+    const confirmed = window.confirm(
+      `Re-analyze ${selected.size} document${selected.size === 1 ? "" : "s"}?\n\n` +
+        "The AI will re-extract each one. If a scan contains multiple " +
+        "documents (e.g. several receipts on one page), it'll be split " +
+        "into separate rows automatically. Existing data on the original " +
+        "row is overwritten; child rows are new INSERTs.\n\n" +
+        "This calls Claude for each doc — small cost, ~10-40s per doc."
+    );
+    if (!confirmed) return;
+    setReanalyzing(true);
+    setError(null);
+    setInfo(null);
+    try {
+      const res = await fetch("/api/documents/bulk-reanalyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ document_ids: Array.from(selected) }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(json.error || `HTTP ${res.status}`);
+        return;
+      }
+      const succeeded = json.succeeded ?? 0;
+      const failed = json.failed ?? 0;
+      const children = json.total_children_spawned ?? 0;
+      setInfo(
+        `Re-analyzed ${succeeded}, ${failed} failed${children > 0 ? `, spawned ${children} child doc${children === 1 ? "" : "s"} from multi-doc scans` : ""}.`
+      );
+      clear();
+      setSelectMode(false);
+      router.refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Network error");
+    } finally {
+      setReanalyzing(false);
     }
   }
 
@@ -114,16 +157,37 @@ export function InboxBulkControls({
           <button
             type="button"
             onClick={move}
-            disabled={busy || !targetProfileId}
+            disabled={busy || reanalyzing || !targetProfileId}
             className="text-xs font-bold inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-brand-purple text-white hover:opacity-90 disabled:opacity-50"
           >
             {busy ? (
               <Loader2 className="h-3.5 w-3.5 animate-spin" />
             ) : (
-              <>Move {selected.size} doc{selected.size === 1 ? "" : "s"}</>
+              <>Move {selected.size}</>
+            )}
+          </button>
+          <button
+            type="button"
+            onClick={reanalyze}
+            disabled={busy || reanalyzing}
+            title="Re-extract each selected document. Auto-splits scans that contain multiple distinct documents."
+            className="text-xs font-bold inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-indigo-600 text-white hover:opacity-90 disabled:opacity-50"
+          >
+            {reanalyzing ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <>
+                <Sparkles className="h-3.5 w-3.5" />
+                Re-analyze {selected.size}
+              </>
             )}
           </button>
         </>
+      )}
+      {info && (
+        <span className="text-[11px] font-semibold text-brand-green max-w-md truncate">
+          {info}
+        </span>
       )}
       {error && (
         <span className="text-[11px] font-semibold text-destructive max-w-xs truncate">

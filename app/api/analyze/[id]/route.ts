@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient, createServiceClient } from "@/lib/supabase/server";
 import { getStorage } from "@/lib/storage";
-import { extractDocument } from "@/lib/ai/extract";
+import { extractDocument, isMultiDoc } from "@/lib/ai/extract";
 import { suggestProfile } from "@/lib/ai/suggest-profile";
 import {
   listProfilesForUser,
@@ -73,7 +73,11 @@ export async function POST(
     // statement (every NL bank exports this under "Periodieke afschriften"),
     // we parse it deterministically without sending to Claude. Faster,
     // cheaper, and far more accurate than OCR-from-PDF.
-    let result: DocumentExtraction | { error: string; raw_text: string; stop_reason: string | null } | null = null;
+    let result:
+      | DocumentExtraction
+      | { documents: DocumentExtraction[] }
+      | { error: "parse_failed"; raw_text: string; stop_reason: string | null }
+      | null = null;
     // AI usage gets recorded so the user can see what each doc cost.
     // Set to zeros for the deterministic parser branches.
     let aiUsage = { input_tokens: 0, output_tokens: 0 };
@@ -279,9 +283,41 @@ export async function POST(
       );
     }
 
-    // After the two early returns above, `result` is necessarily a
-    // DocumentExtraction. TS can't narrow through the in-check, so cast.
-    const extraction = result as Exclude<typeof result, { error: string }>;
+    // Multi-document detection. If Claude returned { documents: [...] }
+    // — meaning the scan contains multiple distinct documents (e.g. 4
+    // receipts on one photo) — we treat documents[0] as the primary
+    // for this row, and stash documents[1..] to spawn as child rows
+    // after the main flow finishes for the primary. The children share
+    // the same dropbox_path (one physical scan, multiple records).
+    let multiDocChildren: DocumentExtraction[] = [];
+    let extraction: DocumentExtraction;
+    if (isMultiDoc(result)) {
+      const docs = result.documents;
+      if (docs.length === 0) {
+        await admin
+          .from("documents")
+          .update({
+            status: "failed",
+            needs_review: true,
+            review_notes:
+              "Multi-doc detection returned an empty documents array.",
+          })
+          .eq("id", id);
+        return NextResponse.json(
+          { error: "Empty documents array" },
+          { status: 500 }
+        );
+      }
+      extraction = docs[0];
+      multiDocChildren = docs.slice(1);
+      console.log(
+        `[api/analyze] multi-doc detected: ${docs.length} documents on this scan`
+      );
+    } else {
+      // After the two early returns above, `result` is necessarily a
+      // DocumentExtraction. TS can't narrow through the in-check, so cast.
+      extraction = result as Exclude<typeof result, { error: string }>;
+    }
 
     // 2.4. First-seen-sender detection. If the user has never had a
     // processed doc from this sender before, mark this one with a
@@ -915,14 +951,175 @@ export async function POST(
       }
     }
 
+    // 8. Multi-document children. The primary doc has been fully processed
+    // above; now spawn rows for any siblings the AI detected on the same
+    // scan. Each child shares the parent's dropbox_path (one physical
+    // file, multiple records) but is otherwise independent: own sender,
+    // amount, line items, profile, actions.
+    const childIds: string[] = [];
+    if (multiDocChildren.length > 0) {
+      console.log(
+        `[api/analyze] spawning ${multiDocChildren.length} multi-doc children for parent ${id}`
+      );
+      for (const child of multiDocChildren) {
+        try {
+          // Per-child profile match. Each receipt on a scan can legitimately
+          // belong to a different profile (e.g. one for the family, one
+          // for the business), so we re-run the matcher.
+          let childProfileId: number | null = null;
+          let childProfileMatchConfidence = 0;
+          let childProfileMatchReason = "";
+          try {
+            const childSuggestion = await suggestProfile(child, profiles);
+            if (childSuggestion && childSuggestion.profileId != null) {
+              childProfileId = childSuggestion.profileId;
+              childProfileMatchConfidence = childSuggestion.confidence;
+              childProfileMatchReason = childSuggestion.reason;
+            }
+          } catch (e) {
+            console.warn("[api/analyze] child suggestProfile failed", e);
+          }
+          if (!childProfileId && child.profile_hint) {
+            const m = matchProfileByHint(child.profile_hint, profiles);
+            if (m) {
+              childProfileId = m.id;
+              childProfileMatchReason = "Name-token fallback";
+              childProfileMatchConfidence = 0.5;
+            }
+          }
+          // Fallback to parent's profile if the child didn't resolve.
+          if (!childProfileId) childProfileId = profileId;
+
+          // payment_status handling — same logic as parent.
+          const childEf = child.extracted_fields || {};
+          const childPaid = String(
+            (childEf as Record<string, unknown>)["payment_status"] || ""
+          ).toLowerCase() === "paid";
+          const childUnpaid =
+            String(
+              (childEf as Record<string, unknown>)["payment_status"] || ""
+            ).toLowerCase() === "unpaid";
+          const childNeedsAction = childPaid
+            ? false
+            : childUnpaid
+              ? true
+              : !!child.needs_action;
+          const childActionType =
+            child.action_type || (childNeedsAction ? "pay" : null);
+
+          const childInsert = {
+            user_id: doc.user_id,
+            // Share the parent's physical file + storage metadata.
+            dropbox_path: newPath || doc.dropbox_path,
+            dropbox_shared_link: shareLink || doc.dropbox_shared_link,
+            storage_provider: doc.storage_provider,
+            file_name: doc.file_name,
+            file_size_bytes: doc.file_size_bytes,
+            content_hash: doc.content_hash,
+            file_type: doc.file_type,
+            // Link back to parent — this is the marker that says "I'm a
+            // child split from another scan".
+            parent_document_id: id,
+            // Per-child extraction.
+            primary_profile_id: childProfileId,
+            document_type: child.document_type || null,
+            document_subtype: child.document_subtype || null,
+            confidence: child.confidence ?? null,
+            document_date: child.document_date || null,
+            sender: child.sender || null,
+            recipient: child.recipient || null,
+            person: child.profile_hint || null,
+            language: child.language || null,
+            amount: child.amount ?? null,
+            currency: child.currency || null,
+            purchase_category: child.purchase_category || null,
+            title: child.title || null,
+            summary: child.summary || null,
+            tags: child.tags || [],
+            extracted_fields: childEf,
+            ocr_text: child.ocr_text || null,
+            needs_action: childNeedsAction,
+            action_type: childNeedsAction ? childActionType : null,
+            due_date: child.due_date || null,
+            action_summary: childNeedsAction
+              ? child.action_summary || null
+              : null,
+            status: "processed",
+            needs_review: (childProfileMatchConfidence ?? 0) < PROFILE_AUTO_ASSIGN_THRESHOLD,
+            review_notes: childProfileMatchReason
+              ? `Multi-doc child: ${childProfileMatchReason}`
+              : null,
+          };
+          const { data: insRow, error: insErr } = await admin
+            .from("documents")
+            .insert(childInsert)
+            .select("id")
+            .single();
+          if (insErr) {
+            console.warn(
+              "[api/analyze] child insert failed",
+              insErr.message,
+              child.title
+            );
+            continue;
+          }
+          const childId = (insRow as { id: string }).id;
+          childIds.push(childId);
+
+          // Create a pay-action for the child if it has one.
+          if (childNeedsAction && child.action_summary && childActionType) {
+            try {
+              await admin.from("actions").insert({
+                user_id: doc.user_id,
+                document_id: childId,
+                profile_id: childProfileId,
+                action_type: childActionType,
+                summary: child.action_summary,
+                due_date: child.due_date || null,
+                status: "open",
+              });
+            } catch (e) {
+              console.warn(
+                "[api/analyze] child action insert failed",
+                e
+              );
+            }
+          }
+        } catch (e) {
+          console.warn("[api/analyze] child spawn failed", e);
+        }
+      }
+      // Log the split for the activity history.
+      try {
+        await admin.from("maintenance_log").insert({
+          user_id: doc.user_id,
+          document_id: id,
+          kind: "multi_doc_split",
+          reason: `Detected ${1 + multiDocChildren.length} documents on one scan`,
+          payload: {
+            parent_document_id: id,
+            child_document_ids: childIds,
+            total_count: 1 + multiDocChildren.length,
+          },
+        });
+      } catch (e) {
+        console.warn("[api/analyze] multi_doc_split log insert failed", e);
+      }
+    }
+
     console.log(
       "[api/analyze] done",
       id,
       reconciliationSummary
         ? `(reconciled ${reconciliationSummary.matched}/${reconciliationSummary.considered})`
-        : ""
+        : "",
+      childIds.length > 0 ? `+${childIds.length} child docs` : ""
     );
-    return NextResponse.json({ ok: true, reconciliation: reconciliationSummary });
+    return NextResponse.json({
+      ok: true,
+      reconciliation: reconciliationSummary,
+      child_document_ids: childIds,
+    });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Analyze failed";
     console.error("[api/analyze] error:", msg);

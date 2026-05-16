@@ -245,9 +245,37 @@ export interface ExtractionFailure {
  * Result envelope: extraction payload + usage metadata. Usage stays even
  * on failed parses so we can still surface the cost + flag truncation
  * to the user.
+ *
+ * `data` shape:
+ *  - DocumentExtraction (single-doc scan, the 95% case)
+ *  - { documents: DocumentExtraction[] } (multi-doc scan — e.g. 4
+ *    receipts on one phone photo). The analyze route detects this and
+ *    splits into separate DB rows.
+ *  - ExtractionFailure (Claude responded but JSON parse failed)
+ *  - null (empty/no response)
  */
+export interface MultiDocumentExtraction {
+  documents: DocumentExtraction[];
+}
+
+export type ExtractionData =
+  | DocumentExtraction
+  | MultiDocumentExtraction
+  | ExtractionFailure;
+
+export function isMultiDoc(
+  d: ExtractionData | null
+): d is MultiDocumentExtraction {
+  return (
+    !!d &&
+    typeof d === "object" &&
+    "documents" in d &&
+    Array.isArray((d as MultiDocumentExtraction).documents)
+  );
+}
+
 export interface ExtractResult {
-  data: DocumentExtraction | ExtractionFailure | null;
+  data: ExtractionData | null;
   usage: { input_tokens: number; output_tokens: number };
   stop_reason: string | null;
   max_tokens_cap: number;
@@ -359,8 +387,11 @@ export async function extractDocument(
   };
 
   if (parsed) {
+    // The parsed JSON is either a single DocumentExtraction OR a
+    // { documents: [...] } multi-doc wrapper. The type guard `isMultiDoc`
+    // in callers picks them apart. We just cast — both shapes are valid.
     return {
-      data: parsed as unknown as DocumentExtraction,
+      data: parsed as unknown as ExtractionData,
       usage,
       stop_reason: response.stop_reason || null,
       max_tokens_cap: maxTokens,

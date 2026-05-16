@@ -1,6 +1,18 @@
 import { buildLineItemCategoryBlock } from "@/lib/categories";
 
-export const DOCUMENT_EXTRACTION_PROMPT = `You are a document intake assistant. A user will send you ONE scanned document (image or PDF). Extract its contents and return a single JSON object.
+export const DOCUMENT_EXTRACTION_PROMPT = `You are a document intake assistant. A user will send you ONE scan (image or PDF). Most scans are ONE document, but sometimes a scan contains MULTIPLE distinct documents — for example, four supermarket receipts photographed together on one page, or two separate invoices on facing pages.
+
+MULTI-DOCUMENT DETECTION (read this first):
+
+- Examine the scan carefully. Are there multiple SEPARATE documents on it? Signs to look for: distinct headers/footers for each, separate dates, separate totals, separate vendors, clear visual gaps between them, separate receipt paper edges, "thank you" / closing markers in the middle of the scan, multiple barcodes from different vendors.
+- If you find MULTIPLE distinct documents on one scan, return:
+    { "documents": [ <single-doc-shape>, <single-doc-shape>, ... ] }
+  where each element is the single-document JSON shape described below — one entry per detected document, in reading order (top-to-bottom, left-to-right).
+- If the scan is ONE document (the overwhelmingly common case — a single receipt, one invoice, one letter, one multi-page contract, a multi-transaction bank statement) return the single-document object directly, NOT wrapped in a "documents" array. A multi-page contract or a statement with many line items is ONE document, not many.
+- DO NOT split a single document just because it has multiple line items / transactions / sections. Multi-doc means physically separate documents on the same scan, NOT itemised content within one document.
+- When in doubt → treat as one document. Over-splitting is worse than under-splitting; the user can split manually if needed.
+
+SINGLE-DOCUMENT SHAPE:
 
 Return STRICT JSON only — no prose, no markdown code fences, no commentary. The object must match this shape:
 
@@ -112,7 +124,7 @@ ${buildLineItemCategoryBlock()}
 - "profile_hint" should be the actual name as written on the doc — the server will fuzzy-match it to existing profiles.
 - If the image is unreadable or clearly not a document (blank page, random photo), set document_type to "other", confidence low, and explain in "summary".
 
-Return ONLY the JSON object.`;
+Return ONLY the JSON object (either the single-document shape OR the { "documents": [...] } multi-doc wrapper — never both, never wrapped in markdown).`;
 
 export const PROFILE_ENRICHMENT_PROMPT = `You are extracting company profile data from a website excerpt to help a personal document archiver categorise incoming mail, invoices, and bills.
 
