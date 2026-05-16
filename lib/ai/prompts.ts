@@ -11,6 +11,7 @@ MULTI-DOCUMENT DETECTION (read this first):
 - If the scan is ONE document (the overwhelmingly common case — a single receipt, one invoice, one letter, one multi-page contract, a multi-transaction bank statement) return the single-document object directly, NOT wrapped in a "documents" array. A multi-page contract or a statement with many line items is ONE document, not many.
 - DO NOT split a single document just because it has multiple line items / transactions / sections. Multi-doc means physically separate documents on the same scan, NOT itemised content within one document.
 - When in doubt → treat as one document. Over-splitting is worse than under-splitting; the user can split manually if needed.
+- IMPORTANT: when you DO split, each element of the documents array is a COMPLETE single-document object. Each MUST have its own document_date (the date printed on THAT receipt/invoice), its own sender, its own amount, its own line_items, etc. Do NOT inherit fields across array elements — fill each one in independently as if it were a standalone scan. A common mistake is filling fields on documents[0] and leaving documents[1..N] sparse; don't do that.
 
 SINGLE-DOCUMENT SHAPE:
 

@@ -134,6 +134,41 @@ export default async function DocumentDetail({
     }
   }
 
+  // Multi-doc sibling lookup. A "sibling group" is:
+  //   - the parent (parent_document_id IS NULL)
+  //   - all its children (parent_document_id = parent.id)
+  // If THIS doc has parent_document_id set → look up siblings via the
+  // parent. If THIS doc is itself a parent with children → look up
+  // children directly. Either way, build a sorted list with this doc
+  // marked so the badge can render "X of Y in this scan".
+  type SiblingRow = {
+    id: string;
+    sender: string | null;
+    title: string | null;
+    amount: number | null;
+    currency: string | null;
+    document_date: string | null;
+    parent_document_id: string | null;
+  };
+  let siblings: SiblingRow[] = [];
+  const parentId =
+    (doc as DocumentRow & { parent_document_id?: string | null })
+      .parent_document_id || null;
+  const scanRootId = parentId || doc.id;
+  // Always do the query — if scanRootId has no children AND isn't a
+  // child itself, the result is just this one row, and we render no
+  // badge. Cheap query.
+  {
+    const { data: siblingData } = await supabase
+      .from("documents")
+      .select(
+        "id, sender, title, amount, currency, document_date, parent_document_id"
+      )
+      .or(`id.eq.${scanRootId},parent_document_id.eq.${scanRootId}`)
+      .order("created_at", { ascending: true });
+    siblings = (siblingData || []) as SiblingRow[];
+  }
+
   // Look up an active AI reconcile job for this statement so the panel
   // can auto-resume polling if a previous session was interrupted
   // (tab refresh, navigation, network blip).
@@ -193,6 +228,48 @@ export default async function DocumentDetail({
           {doc.sender || titleCase(doc.document_type) || "Unknown sender"}
           {doc.document_date ? ` · ${formatDate(doc.document_date)}` : ""}
         </p>
+
+        {/* Multi-doc sibling badge — shown when this scan was split into
+           multiple docs. Lets the user jump between siblings without
+           hunting in the inbox. */}
+        {siblings.length > 1 && (
+          <div className="mt-3 surface p-3 bg-brand-purple/5 border-brand-purple/30">
+            <div className="text-[10px] uppercase tracking-wider font-bold text-brand-purple mb-1.5">
+              Part of a {siblings.length}-document scan
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {siblings.map((s, i) => {
+                const isCurrent = s.id === doc.id;
+                const label = `${i + 1} of ${siblings.length}`;
+                const summary = [
+                  s.sender || "—",
+                  s.amount != null
+                    ? formatMoney(s.amount, s.currency)
+                    : null,
+                  s.document_date ? formatDate(s.document_date) : null,
+                ]
+                  .filter(Boolean)
+                  .join(" · ");
+                return isCurrent ? (
+                  <span
+                    key={s.id}
+                    className="text-[11px] font-semibold inline-flex items-center gap-1.5 px-2 py-1 rounded bg-brand-purple text-white"
+                  >
+                    {label} — {summary || "this doc"}
+                  </span>
+                ) : (
+                  <Link
+                    key={s.id}
+                    href={`/document/${s.id}`}
+                    className="text-[11px] font-semibold inline-flex items-center gap-1.5 px-2 py-1 rounded border border-brand-purple/30 text-brand-purple hover:bg-brand-purple/10"
+                  >
+                    {label} — {summary || "view"}
+                  </Link>
+                );
+              })}
+            </div>
+          </div>
+        )}
         {/* Payment status — surfaces handwritten "PAID" annotations */}
         {(() => {
           const ef = doc.extracted_fields as Record<string, unknown> | null;
