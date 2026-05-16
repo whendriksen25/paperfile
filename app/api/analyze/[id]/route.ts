@@ -87,15 +87,33 @@ export async function POST(
     const ef0 = doc.extracted_fields as Record<string, unknown> | null;
     const originalScanPathStored =
       (ef0?.["_original_scan_path"] as string | undefined) || null;
+    // Legacy fallback: pre-crop multi-doc parents don't have
+    // _original_scan_path stored, but their dropbox_path IS the original
+    // full scan (since crops weren't a thing yet). Detect by checking
+    // for children — if this doc has children AND no stored original
+    // path, treat dropbox_path as the original.
+    let legacyOriginalFallback = false;
+    if (fromOriginal && !originalScanPathStored) {
+      const { data: kidsCheck } = await admin
+        .from("documents")
+        .select("id")
+        .eq("parent_document_id", id)
+        .limit(1);
+      if ((kidsCheck || []).length > 0) {
+        legacyOriginalFallback = true;
+        console.log(
+          "[api/analyze] from_original=1 with no _original_scan_path; using dropbox_path as legacy original full scan"
+        );
+      } else {
+        console.warn(
+          "[api/analyze] from_original=1 but no _original_scan_path AND no children — falling back to dropbox_path"
+        );
+      }
+    }
     const downloadPath =
       fromOriginal && originalScanPathStored
         ? originalScanPathStored
         : doc.dropbox_path;
-    if (fromOriginal && !originalScanPathStored) {
-      console.warn(
-        "[api/analyze] from_original=1 but no _original_scan_path on doc; falling back to dropbox_path"
-      );
-    }
     const storage = getStorage(doc.storage_provider);
     const buffer = await storage.downloadFile(downloadPath);
 

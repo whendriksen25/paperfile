@@ -44,6 +44,7 @@ export function RefileWidget({
   currentProfileId,
   currentDocumentType,
   hasOriginalScan,
+  isMultiDocParent,
 }: {
   documentId: string;
   currentProfileId: number | null;
@@ -52,6 +53,10 @@ export function RefileWidget({
    * original full scan still stored in Dropbox — enables the second
    * "Re-analyse full scan" button that re-runs multi-doc detection. */
   hasOriginalScan?: boolean;
+  /** True when this row has children (legacy splits don't have
+   * _original_scan_path but their dropbox_path IS the original scan,
+   * and the analyze route knows to handle that legacy fallback). */
+  isMultiDocParent?: boolean;
 }) {
   const router = useRouter();
   const [profiles, setProfiles] = useState<ProfileRow[]>([]);
@@ -292,8 +297,9 @@ export function RefileWidget({
         </button>
       </div>
 
-      {/* Multi-doc re-split — only on parents of a crop-split scan. */}
-      {hasOriginalScan && (
+      {/* Multi-doc re-split — show on any parent of a multi-doc split,
+          new format (with _original_scan_path) OR legacy (without). */}
+      {(hasOriginalScan || isMultiDocParent) && (
         <button
           onClick={reanalyseFullScan}
           disabled={reanalysing || reanalysingFull}

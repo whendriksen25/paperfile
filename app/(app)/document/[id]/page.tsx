@@ -553,6 +553,14 @@ export default async function DocumentDetail({
                 "_original_scan_path"
               ]
             }
+            isMultiDocParent={
+              // Has children pointing at me. Siblings list includes self,
+              // so > 1 means at least one other row in the split set AND
+              // this row is the parent (parent_document_id is null).
+              !(doc as DocumentRow & {
+                parent_document_id?: string | null;
+              }).parent_document_id && siblings.length > 1
+            }
           />
         </div>
       </div>
