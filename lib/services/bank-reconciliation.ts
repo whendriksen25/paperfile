@@ -315,6 +315,13 @@ export async function reconcileBankStatement(
         matched_at: null,
         match_reason: null,
         match_status: null,
+        // Also clear the AI-pass columns. Without this, suspicions +
+        // match_method/match_confidence accumulate across every
+        // Reset/Re-reconcile run — the panel was showing 28 suspicions
+        // when the latest run only produced 18 (10 stale leftovers).
+        match_method: null,
+        match_confidence: null,
+        suspicions: null,
       })
       .eq("statement_id", statementDocId);
     if (clearErr) {
