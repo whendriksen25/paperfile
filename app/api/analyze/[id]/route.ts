@@ -1,7 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient, createServiceClient } from "@/lib/supabase/server";
 import { getStorage } from "@/lib/storage";
-import { extractDocument, isMultiDoc } from "@/lib/ai/extract";
+import {
+  extractDocument,
+  isMultiDoc,
+  type MultiDocumentExtraction,
+} from "@/lib/ai/extract";
 import { suggestProfile } from "@/lib/ai/suggest-profile";
 import {
   listProfilesForUser,
@@ -87,7 +91,7 @@ export async function POST(
     // cheaper, and far more accurate than OCR-from-PDF.
     let result:
       | DocumentExtraction
-      | { documents: DocumentExtraction[] }
+      | MultiDocumentExtraction
       | { error: "parse_failed"; raw_text: string; stop_reason: string | null }
       | null = null;
     // AI usage gets recorded so the user can see what each doc cost.
@@ -303,6 +307,12 @@ export async function POST(
     // the same dropbox_path (one physical scan, multiple records).
     let multiDocChildren: DocumentExtraction[] = [];
     let extraction: DocumentExtraction;
+    // Per-crop image buffers from option-3 cropping. Index 0 = parent's
+    // crop, [1..N] = child crops. Empty until the cropping block runs.
+    let perCropDropboxBuffers: Buffer[] | null = null;
+    // Filled by the file-move section once per-crop Dropbox paths exist.
+    // Used by the child-spawn loop to set each child's dropbox_path.
+    const perCropDropboxPaths: string[] = [];
     if (isMultiDoc(result)) {
       const docs = result.documents;
       if (docs.length === 0) {
@@ -325,6 +335,72 @@ export async function POST(
       console.log(
         `[api/analyze] multi-doc detected: ${docs.length} documents on this scan`
       );
+
+      // ★ Per-receipt cropped re-extraction (option 3).
+      // If Claude gave us bounding boxes AND the original is an image,
+      // crop each receipt out, upload each crop to Dropbox, and re-run
+      // extractDocument on each crop in full resolution. Replaces the
+      // low-res shared-image extractions with high-res per-crop ones.
+      //
+      // Per-crop dropbox paths are remembered so the parent / children
+      // rows can each point at THEIR receipt's crop (not the original
+      // full scan). The original full scan is retained in Dropbox for
+      // recovery; only the row pointers move to the crops.
+      const boxes = (result as MultiDocumentExtraction).bounding_boxes;
+      const isImage = /\.(jpe?g|png|webp|gif|heic|heif)$/i.test(
+        doc.file_name || ""
+      );
+      if (
+        isImage &&
+        Array.isArray(boxes) &&
+        boxes.length === docs.length &&
+        boxes.length > 0
+      ) {
+        try {
+          const { cropRegions } = await import("@/lib/services/image-crop");
+          const crops = await cropRegions(buffer, boxes);
+          // Re-extract each crop at full resolution. Sequential to keep
+          // memory + concurrency simple; multi-doc scans are small N.
+          const reExtracted: DocumentExtraction[] = [];
+          for (let i = 0; i < crops.length; i++) {
+            const ex = await extractDocument(
+              crops[i],
+              `${doc.file_name || "crop"}_part${i + 1}.jpg`,
+              { taxonomyHint }
+            );
+            // Accumulate AI usage so the cost is honestly recorded.
+            aiUsage = {
+              input_tokens: aiUsage.input_tokens + (ex.usage?.input_tokens || 0),
+              output_tokens:
+                aiUsage.output_tokens + (ex.usage?.output_tokens || 0),
+            };
+            const d = ex.data;
+            // If the per-crop extraction failed or also detected multi-doc,
+            // fall back to the original low-res extraction for that index.
+            if (!d || "error" in d || isMultiDoc(d)) {
+              reExtracted.push(docs[i]);
+              console.warn(
+                `[api/analyze] per-crop re-extract failed for crop ${i + 1}, falling back to low-res`
+              );
+            } else {
+              reExtracted.push(d as DocumentExtraction);
+            }
+          }
+          extraction = reExtracted[0];
+          multiDocChildren = reExtracted.slice(1);
+          // Upload each crop to Dropbox and stash the resulting paths so
+          // the file-move + child-spawn code below uses them.
+          perCropDropboxBuffers = crops;
+          console.log(
+            `[api/analyze] cropped + re-extracted ${crops.length} sub-receipts at full res`
+          );
+        } catch (e) {
+          console.warn(
+            "[api/analyze] crop+re-extract failed, falling back to low-res shared-image extractions:",
+            e
+          );
+        }
+      }
     } else {
       // After the two early returns above, `result` is necessarily a
       // DocumentExtraction. TS can't narrow through the in-check, so cast.
@@ -516,6 +592,57 @@ export async function POST(
       shareLink = await storage.getOrCreateShareLink(newPath);
     } catch (e) {
       console.warn("[api/analyze] move/share failed, keeping inbox path", e);
+    }
+
+    // 4a. Multi-doc cropping (option 3): when we have per-crop buffers,
+    // upload each crop alongside the moved original and remember each
+    // crop's path. Parent's dropbox_path then gets repointed to crop[0]
+    // (the most useful preview for the parent's extraction); children
+    // each get crop[i]. Original full scan stays where the move put it
+    // for recoverability.
+    if (perCropDropboxBuffers && perCropDropboxBuffers.length > 0) {
+      try {
+        const originalPath = newPath;
+        const dotIdx = originalPath.lastIndexOf(".");
+        const stem =
+          dotIdx > 0 ? originalPath.slice(0, dotIdx) : originalPath;
+        const ext = dotIdx > 0 ? originalPath.slice(dotIdx) : ".jpg";
+        for (let i = 0; i < perCropDropboxBuffers.length; i++) {
+          const cropPath = `${stem}_part${i + 1}${ext}`;
+          try {
+            await storage.uploadAt({
+              buffer: perCropDropboxBuffers[i],
+              path: cropPath,
+            });
+            perCropDropboxPaths[i] = cropPath;
+          } catch (e) {
+            console.warn(
+              `[api/analyze] crop ${i + 1} upload failed (keeping original path):`,
+              e instanceof Error ? e.message : String(e)
+            );
+          }
+        }
+        // Repoint parent to crop[0] if it uploaded successfully.
+        if (perCropDropboxPaths[0]) {
+          newPath = perCropDropboxPaths[0];
+          try {
+            shareLink = await storage.getOrCreateShareLink(newPath);
+          } catch (e) {
+            console.warn(
+              "[api/analyze] share link refresh for crop[0] failed",
+              e
+            );
+          }
+        }
+        console.log(
+          `[api/analyze] uploaded ${perCropDropboxPaths.filter(Boolean).length}/${perCropDropboxBuffers.length} crops; parent → ${newPath}`
+        );
+      } catch (e) {
+        console.warn(
+          "[api/analyze] per-crop upload block failed (continuing):",
+          e
+        );
+      }
     }
 
     // 5. Merge tags
@@ -1011,7 +1138,8 @@ export async function POST(
       console.log(
         `[api/analyze] spawning ${multiDocChildren.length} multi-doc children for parent ${id}`
       );
-      for (const child of multiDocChildren) {
+      for (let childIdx = 0; childIdx < multiDocChildren.length; childIdx++) {
+        const child = multiDocChildren[childIdx];
         try {
           // Per-child profile match. Each receipt on a scan can legitimately
           // belong to a different profile (e.g. one for the family, one
@@ -1060,7 +1188,14 @@ export async function POST(
           const childInsert = {
             user_id: doc.user_id,
             // Share the parent's physical file + storage metadata.
-            dropbox_path: newPath || doc.dropbox_path,
+            // If we cropped this scan, point THIS child at its own crop;
+            // otherwise fall back to the parent's path (shared scan).
+            // perCropDropboxPaths[0] is the parent's crop, [1..] are children,
+            // so the child at index `childIdx` uses path[childIdx + 1].
+            dropbox_path:
+              perCropDropboxPaths[childIdx + 1] ||
+              newPath ||
+              doc.dropbox_path,
             dropbox_shared_link: shareLink || doc.dropbox_shared_link,
             storage_provider: doc.storage_provider,
             file_name: doc.file_name,

@@ -19,8 +19,12 @@ MULTI-DOCUMENT DETECTION (read this first):
 
 - Examine the scan carefully. Are there multiple SEPARATE documents on it? Signs to look for: distinct headers/footers for each, separate dates, separate totals, separate vendors, clear visual gaps between them, separate receipt paper edges, "thank you" / closing markers in the middle of the scan, multiple barcodes from different vendors.
 - If you find MULTIPLE distinct documents on one scan, return:
-    { "documents": [ <single-doc-shape>, <single-doc-shape>, ... ] }
-  where each element is the single-document JSON shape described below — one entry per detected document, in reading order (top-to-bottom, left-to-right).
+    {
+      "documents": [ <single-doc-shape>, <single-doc-shape>, ... ],
+      "bounding_boxes": [ {"x": 0.0, "y": 0.0, "w": 1.0, "h": 0.5}, ... ]
+    }
+  where each element of "documents" is the single-document JSON shape described below — one entry per detected document, in reading order (top-to-bottom, left-to-right) — AND a matching "bounding_boxes" array with one entry per document, indices aligned (documents[i] ↔ bounding_boxes[i]).
+- Bounding box coordinates are NORMALISED to 0..1: x=0, y=0 is the TOP-LEFT corner of the image, x=1, y=1 is the bottom-right. x,y is the top-left of the box; w,h are width/height as fractions of the image. The system uses these to CROP each receipt into its own file for a higher-resolution second-pass extraction — being a bit generous with margins is better than cutting tight (add ~2-3% padding all around). Boxes can overlap if necessary but should each enclose ONE document fully.
 - If the scan is ONE document (the overwhelmingly common case — a single receipt, one invoice, one letter, one multi-page contract, a multi-transaction bank statement) return the single-document object directly, NOT wrapped in a "documents" array. A multi-page contract or a statement with many line items is ONE document, not many.
 - DO NOT split a single document just because it has multiple line items / transactions / sections. Multi-doc means physically separate documents on the same scan, NOT itemised content within one document.
 - When in doubt → treat as one document. Over-splitting is worse than under-splitting; the user can split manually if needed.

@@ -254,8 +254,21 @@ export interface ExtractionFailure {
  *  - ExtractionFailure (Claude responded but JSON parse failed)
  *  - null (empty/no response)
  */
+export interface BoundingBox {
+  /** All in normalised 0..1 image space, top-left origin. */
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
 export interface MultiDocumentExtraction {
   documents: DocumentExtraction[];
+  /** Optional. Same length + index as documents[]. If present, the
+   * analyze route crops each region and re-extracts at full resolution
+   * for per-receipt accuracy. If absent (older prompt response), the
+   * analyze route falls back to the low-res shared-image extraction. */
+  bounding_boxes?: BoundingBox[];
 }
 
 export type ExtractionData =
