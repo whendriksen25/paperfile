@@ -296,21 +296,46 @@ export async function cropAndDeskew(
       }
       let cropped = await pipeline.jpeg({ quality: 92 }).toBuffer();
 
-      // Optional final-mile orientation probe. Sonnet's rotation hint is
-      // usually right, but occasionally misses a quarter-turn (especially
-      // for receipts photographed upside-down). The probe is a cheap
-      // Haiku call that returns 0/90/180/270 — coarse correction only.
-      // Skipped by default; opt in via opts.orientationProbe=true.
+      // Optional final-mile orientation probe. Sonnet's rotation hint
+      // upstream is usually right, but occasionally misses a quarter-turn
+      // (especially on upside-down receipts) AND tends to underestimate
+      // small tilts. One Haiku call asks for BOTH corrections:
+      //   - quadrant correction (0/90/180/270 clockwise to bring upright)
+      //   - fine tilt (±15° clockwise to align the text baseline after
+      //     that quadrant rotation)
+      // Both are applied. ~$0.001 per crop. Skipped by default; opt in
+      // via opts.orientationProbe=true.
       if (probe) {
         const { probeOrientation, applyQuadrantRotation } = await import(
           "@/lib/services/orientation-probe"
         );
-        const { degrees: quadrant } = await probeOrientation(cropped);
+        const { degrees: quadrant, fineTilt } =
+          await probeOrientation(cropped);
         if (quadrant !== 0) {
           console.log(
-            `[image-crop] orientation probe corrected by ${quadrant}°`
+            `[image-crop] orientation probe: quadrant ${quadrant}°`
           );
           cropped = await applyQuadrantRotation(cropped, quadrant);
+        }
+        if (Math.abs(fineTilt) >= 0.5) {
+          console.log(
+            `[image-crop] orientation probe: fine tilt ${fineTilt.toFixed(1)}°`
+          );
+          try {
+            // sharp().rotate(angle) rotates CLOCKWISE by `angle`. The
+            // probe returns the clockwise correction the image still
+            // needs, so we apply it directly (NOT negated).
+            cropped = await sharp(cropped)
+              .rotate(fineTilt, { background: "#ffffff" })
+              .trim()
+              .jpeg({ quality: 92 })
+              .toBuffer();
+          } catch (e) {
+            console.warn(
+              "[image-crop] fine-tilt apply failed, keeping un-finetilted crop:",
+              e instanceof Error ? e.message : String(e)
+            );
+          }
         }
       }
       out.push(cropped);

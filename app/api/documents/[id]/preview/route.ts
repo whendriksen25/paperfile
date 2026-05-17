@@ -19,10 +19,15 @@ export const maxDuration = 60;
  *   <iframe src="/api/documents/{id}/preview" />       for PDFs
  */
 export async function GET(
-  _request: NextRequest,
+  request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
+  // ?original=1 — for multi-doc parents whose dropbox_path was
+  // repointed to _part1.jpg after the split, this serves the FULL
+  // original multi-receipt scan stored in extracted_fields
+  // ._original_scan_path. Falls back to dropbox_path if not set.
+  const wantOriginal = request.nextUrl.searchParams.get("original") === "1";
 
   const supabase = await createClient();
   const {
@@ -37,7 +42,7 @@ export async function GET(
   const { data: doc, error } = await admin
     .from("documents")
     .select(
-      "id, user_id, dropbox_path, storage_provider, file_name, file_type"
+      "id, user_id, dropbox_path, storage_provider, file_name, file_type, extracted_fields"
     )
     .eq("id", id)
     .maybeSingle();
@@ -49,9 +54,18 @@ export async function GET(
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
+  // Pick which file to serve.
+  let downloadPath = doc.dropbox_path;
+  if (wantOriginal) {
+    const ef = doc.extracted_fields as Record<string, unknown> | null;
+    const originalPath =
+      (ef?.["_original_scan_path"] as string | undefined) || null;
+    if (originalPath) downloadPath = originalPath;
+  }
+
   try {
     const storage = getStorage(doc.storage_provider);
-    const buffer = await storage.downloadFile(doc.dropbox_path);
+    const buffer = await storage.downloadFile(downloadPath);
 
     const contentType =
       doc.file_type && doc.file_type.length > 0
