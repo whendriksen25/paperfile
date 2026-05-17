@@ -1071,18 +1071,41 @@ async function cmdDetectMultidoc() {
     console.warn("auto-rotate skipped:", e.message);
   }
 
-  // Build a stripped-down prompt focused only on multi-doc detection + boxes.
+  // Build a stripped-down prompt focused only on multi-doc detection + polygons.
+  // NOTE: keep this in lockstep with lib/services/analyze-job.ts → DETECT_PROMPT
+  // (and with the multi-doc block in lib/ai/prompts.ts). Both share the same
+  // contract: return polygons hugging each receipt's perimeter, with an
+  // optional rotation_estimate_degrees per polygon.
   const prompt = `Examine this scan and detect whether it contains multiple separate documents (receipts, invoices, etc).
+
+Identify each receipt by its CONTENT (header / store name, line items, total, date) — NOT by background colour or contrast. Receipts may be tilted, slightly overlapping, or on cluttered backgrounds; handle all of these.
 
 If MULTIPLE distinct documents on one scan, return STRICT JSON:
 {
-  "documents": [ { "sender": "...", "amount": <number|null>, "document_date": "YYYY-MM-DD|null", "summary": "one line" }, ... ],
-  "bounding_boxes": [ {"x": 0.0, "y": 0.0, "w": 1.0, "h": 0.5}, ... ]
+  "documents": [ { "sender": "...", "amount": <number|null>, "document_date": "YYYY-MM-DD|null", "summary": "one line", "rotation_estimate_degrees": <number> }, ... ],
+  "polygons": [
+    {
+      "vertices": [
+        {"x": 0.15, "y": 0.00},
+        {"x": 0.40, "y": 0.00},
+        {"x": 0.40, "y": 0.65},
+        {"x": 0.15, "y": 0.65}
+      ],
+      "rotation_estimate_degrees": 0
+    },
+    ...
+  ]
 }
 
-If SINGLE doc, return: { "documents": [{single-doc-summary}], "bounding_boxes": [] }
+If SINGLE doc, return: { "documents": [{single-doc-summary}], "polygons": [] }
 
-Coords are normalised 0..1, top-left origin. documents[i] and bounding_boxes[i] are index-aligned.
+POLYGON RULES:
+- 4 or more vertices that hug the receipt's actual perimeter (not a loose rectangle).
+- Vertices in normalised [0..1] coords, top-left origin (x=0,y=0 is the image's top-left).
+- Listed CLOCKWISE starting from the receipt's OWN top-left corner (where its printed header sits), even if the receipt is tilted on the page.
+- rotation_estimate_degrees: the receipt's tilt vs upright. 0 = upright. Positive = clockwise. Range roughly -45..+45.
+- documents[i] and polygons[i] are index-aligned.
+
 Return ONLY the JSON object. No prose, no markdown.`;
 
   // Call Claude
@@ -1139,24 +1162,89 @@ Return ONLY the JSON object. No prose, no markdown.`;
 
   // Print
   const docs = parsed.documents || [];
-  const boxes = parsed.bounding_boxes || [];
+  let polygons = Array.isArray(parsed.polygons) ? parsed.polygons : [];
+  const boxes = Array.isArray(parsed.bounding_boxes)
+    ? parsed.bounding_boxes
+    : [];
+  // Back-compat: if the model emitted only bounding_boxes (e.g. older
+  // run or a model that ignored the polygon part of the prompt), fold
+  // each box into a 4-vertex rectangular polygon so the print loop
+  // below has a single representation to walk over.
+  if (polygons.length !== docs.length && boxes.length === docs.length) {
+    polygons = boxes.map((b) => ({
+      vertices: [
+        { x: b.x, y: b.y },
+        { x: b.x + b.w, y: b.y },
+        { x: b.x + b.w, y: b.y + b.h },
+        { x: b.x, y: b.y + b.h },
+      ],
+      rotation_estimate_degrees: 0,
+    }));
+    console.log("(converted legacy bounding_boxes → rectangular polygons for display)");
+  }
+
+  // Geometry helper: angle of longest polygon edge above horizontal,
+  // in degrees, restricted to (-90, 90]. Mirrors the helper in
+  // lib/services/image-crop.ts so the diag's computed rotation matches
+  // what the production cropper would apply.
+  function longestEdgeDeg(verts) {
+    if (!verts || verts.length < 2) return 0;
+    let bestLen = -1, bestDx = 0, bestDy = 0;
+    for (let i = 0; i < verts.length; i++) {
+      const a = verts[i];
+      const b = verts[(i + 1) % verts.length];
+      const dx = (Number(b.x) || 0) - (Number(a.x) || 0);
+      const dy = (Number(b.y) || 0) - (Number(a.y) || 0);
+      const len = Math.sqrt(dx * dx + dy * dy);
+      if (len > bestLen) { bestLen = len; bestDx = dx; bestDy = dy; }
+    }
+    let deg = (Math.atan2(bestDy, bestDx) * 180) / Math.PI;
+    if (deg > 90) deg -= 180;
+    if (deg <= -90) deg += 180;
+    return deg;
+  }
+
   console.log(`\n=== Detected ${docs.length} document(s) ===`);
   for (let i = 0; i < docs.length; i++) {
     const d = docs[i];
-    const b = boxes[i];
+    const p = polygons[i];
     console.log(`  #${i + 1}: ${d.sender || "—"} · €${d.amount ?? "—"} · ${d.document_date || "—"}`);
     if (d.summary) console.log(`        ${d.summary}`);
-    if (b) {
+    if (p && Array.isArray(p.vertices) && p.vertices.length > 0) {
+      // Print every vertex as a percentage pair so the operator can
+      // sanity-check that the polygon hugs the receipt's perimeter.
+      const vlines = p.vertices
+        .map(
+          (v, vi) =>
+            `          v${vi}: (${((Number(v.x) || 0) * 100).toFixed(1)}%, ${(
+              (Number(v.y) || 0) * 100
+            ).toFixed(1)}%)`
+        )
+        .join("\n");
+      console.log(`        polygon (${p.vertices.length} vertices):\n${vlines}`);
+      // Explicit hint wins; otherwise fall back to longest-edge geometry
+      // (tilt vs vertical = edgeAngle - 90° if edgeAngle > 0, else +90°).
+      let tilt = null;
+      if (typeof p.rotation_estimate_degrees === "number") {
+        tilt = p.rotation_estimate_degrees;
+      } else {
+        const edge = longestEdgeDeg(p.vertices);
+        tilt = edge > 0 ? edge - 90 : edge + 90;
+      }
       console.log(
-        `        box: x=${(b.x * 100).toFixed(1)}% y=${(b.y * 100).toFixed(1)}% w=${(b.w * 100).toFixed(1)}% h=${(b.h * 100).toFixed(1)}%`
+        `        rotation: ${tilt.toFixed(1)}° (${
+          typeof p.rotation_estimate_degrees === "number"
+            ? "explicit hint"
+            : "derived from longest edge"
+        })`
       );
     } else {
-      console.log(`        (no bounding box)`);
+      console.log(`        (no polygon)`);
     }
   }
-  if (docs.length > 1 && boxes.length !== docs.length) {
+  if (docs.length > 1 && polygons.length !== docs.length) {
     console.log(
-      `\n⚠  bounding_boxes count (${boxes.length}) doesn't match documents count (${docs.length})`
+      `\n⚠  polygons count (${polygons.length}) doesn't match documents count (${docs.length})`
     );
   }
 }

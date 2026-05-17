@@ -2,7 +2,13 @@ import Anthropic from "@anthropic-ai/sdk";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { AI_MODEL_SMART } from "@/lib/ai/pricing";
 import { getStorage } from "@/lib/storage";
-import { extractDocument, isMultiDoc, type BoundingBox } from "@/lib/ai/extract";
+import {
+  extractDocument,
+  isMultiDoc,
+  bboxToPolygon,
+  type BoundingBox,
+  type ReceiptPolygon,
+} from "@/lib/ai/extract";
 import {
   loadTaxonomySnapshot,
   buildTaxonomyHint,
@@ -36,18 +42,41 @@ import type { DocumentExtraction } from "@/types/document";
 // Multi-doc detection prompt — kept in lockstep with the diag script's
 // cmdDetectMultidoc (scripts/diag.mjs). Behaviour should be identical
 // so "the diag found 4 receipts" guarantees "the job will too".
+//
+// Format: returns polygons (4+ vertices, clockwise from receipt's own
+// top-left) hugging each receipt's perimeter. Legacy bounding_boxes
+// also accepted on the parser side for back-compat with older runs.
 // =============================================================================
 const DETECT_PROMPT = `Examine this scan and detect whether it contains multiple separate documents (receipts, invoices, etc).
 
+Identify each receipt by its CONTENT (header / store name, line items, total, date) — NOT by background colour or contrast. Receipts may be tilted, slightly overlapping, or on cluttered backgrounds; handle all of these.
+
 If MULTIPLE distinct documents on one scan, return STRICT JSON:
 {
-  "documents": [ { "sender": "...", "amount": <number|null>, "document_date": "YYYY-MM-DD|null", "summary": "one line" }, ... ],
-  "bounding_boxes": [ {"x": 0.0, "y": 0.0, "w": 1.0, "h": 0.5}, ... ]
+  "documents": [ { "sender": "...", "amount": <number|null>, "document_date": "YYYY-MM-DD|null", "summary": "one line", "rotation_estimate_degrees": <number> }, ... ],
+  "polygons": [
+    {
+      "vertices": [
+        {"x": 0.15, "y": 0.00},
+        {"x": 0.40, "y": 0.00},
+        {"x": 0.40, "y": 0.65},
+        {"x": 0.15, "y": 0.65}
+      ],
+      "rotation_estimate_degrees": 0
+    },
+    ...
+  ]
 }
 
-If SINGLE doc, return: { "documents": [{single-doc-summary}], "bounding_boxes": [] }
+If SINGLE doc, return: { "documents": [{single-doc-summary}], "polygons": [] }
 
-Coords are normalised 0..1, top-left origin. documents[i] and bounding_boxes[i] are index-aligned.
+POLYGON RULES:
+- 4 or more vertices that hug the receipt's actual perimeter (not a loose rectangle).
+- Vertices in normalised [0..1] coords, top-left origin (x=0,y=0 is the image's top-left).
+- Listed CLOCKWISE starting from the receipt's OWN top-left corner (where its printed header sits), even if the receipt is tilted on the page.
+- rotation_estimate_degrees: the receipt's tilt vs upright. 0 = upright. Positive = clockwise. Range roughly -45..+45.
+- documents[i] and polygons[i] are index-aligned.
+
 Return ONLY the JSON object. No prose, no markdown.`;
 
 interface DetectedDoc {
@@ -55,10 +84,16 @@ interface DetectedDoc {
   amount: number | null;
   document_date: string | null;
   summary: string | null;
+  rotation_estimate_degrees?: number | null;
 }
 
 interface DetectResult {
   documents: DetectedDoc[];
+  /** Preferred output — content-aware polygons. */
+  polygons: ReceiptPolygon[];
+  /** Legacy axis-aligned rectangles. Kept on the type so old callers
+   * that read the raw response still compile, but the worker converts
+   * to polygons immediately after parsing. */
   bounding_boxes: BoundingBox[];
 }
 
@@ -78,6 +113,14 @@ interface JobPayload {
   force_profile: boolean;
   original_path: string;
   detected_docs: DetectedDoc[];
+  /** Polygons used to drive the per-crop split. Index-aligned with
+   * detected_docs / crop_paths. Persisted on the parent's
+   * extracted_fields._multidoc at finalise time so the per-child UI
+   * can describe original position on the scan. */
+  polygons: ReceiptPolygon[];
+  /** Legacy bounding_boxes — left in the payload for back-compat with
+   * job rows written before the polygon rewrite. New rows leave this
+   * empty; consumers should prefer `polygons`. */
   boxes: BoundingBox[];
   crop_paths: string[];
 }
@@ -179,19 +222,32 @@ async function detectMultiDoc(
 
   const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
   const body = (fence ? fence[1] : text).trim();
-  let parsed: { documents?: DetectedDoc[]; bounding_boxes?: BoundingBox[] };
+  let parsed: {
+    documents?: DetectedDoc[];
+    polygons?: ReceiptPolygon[];
+    bounding_boxes?: BoundingBox[];
+  };
   try {
     parsed = JSON.parse(body);
   } catch {
     // Treat unparseable detection as "single doc" — caller falls back
     // to the existing inline analyze path. Better than failing the job.
-    return { documents: [], bounding_boxes: [] };
+    return { documents: [], polygons: [], bounding_boxes: [] };
   }
   const docs = Array.isArray(parsed.documents) ? parsed.documents : [];
   const boxes = Array.isArray(parsed.bounding_boxes)
     ? parsed.bounding_boxes
     : [];
-  return { documents: docs, bounding_boxes: boxes };
+  // Prefer polygons (content-aware, tight, tilt-aware). Fall back to
+  // converting legacy bounding_boxes if the model returned only those.
+  // Either way, polygons[i] ↔ documents[i] post-normalisation.
+  let polygons: ReceiptPolygon[] = Array.isArray(parsed.polygons)
+    ? parsed.polygons
+    : [];
+  if (polygons.length !== docs.length && boxes.length === docs.length) {
+    polygons = boxes.map(bboxToPolygon);
+  }
+  return { documents: docs, polygons, bounding_boxes: boxes };
 }
 
 /** Build the per-crop Dropbox path: {stem}_part{i+1}{ext} alongside the
@@ -311,6 +367,7 @@ export async function prepareAnalyzeJob(
   console.log("[analyze-job] running multi-doc detection on", documentId);
   const detect = await detectMultiDoc(buffer, doc.file_name || "scan.jpg");
   const docs = detect.documents;
+  const polygons = detect.polygons;
   const boxes = detect.bounding_boxes;
 
   // 5. Single-doc fall-through. Caller decides what to do next (typically
@@ -338,12 +395,12 @@ export async function prepareAnalyzeJob(
   const cropPaths: string[] = [];
   if (
     isImage &&
-    boxes.length === docs.length &&
-    boxes.length > 0
+    polygons.length === docs.length &&
+    polygons.length > 0
   ) {
     try {
-      const { cropRegions } = await import("@/lib/services/image-crop");
-      const crops = await cropRegions(buffer, boxes);
+      const { cropAndDeskew } = await import("@/lib/services/image-crop");
+      const crops = await cropAndDeskew(buffer, polygons, { trim: true });
       for (let i = 0; i < crops.length; i++) {
         // Crop paths sit alongside the original scan, named
         // {stem}_part{i+1}{ext} — same convention as the inline route.
@@ -397,6 +454,7 @@ export async function prepareAnalyzeJob(
     force_profile: forceProfile,
     original_path: downloadPath,
     detected_docs: docs,
+    polygons,
     boxes,
     crop_paths: cropPaths,
   };
@@ -718,6 +776,18 @@ async function finishStep(
       console.warn("[analyze-job] share link refresh for crop[0] failed", e);
     }
 
+    // Polygons from the prepare step — persisted on the parent (this
+    // row) so the per-child UI can describe original position on the
+    // scan ("top-left of the original scan") and any later overlay
+    // renderer has the geometry available.
+    const polygonsForMulti =
+      Array.isArray(job.payload.polygons) && job.payload.polygons.length > 0
+        ? job.payload.polygons
+        : null;
+    const multiDocMeta = polygonsForMulti
+      ? { polygons: polygonsForMulti, total: job.total_crops }
+      : null;
+
     const updates: Record<string, unknown> = {
       dropbox_path: cropPath,
       dropbox_shared_link: shareLink,
@@ -741,6 +811,7 @@ async function finishStep(
         // "Re-analyse full scan" button keeps working on this row
         // even after multiple re-splits.
         _original_scan_path: originalPath,
+        ...(multiDocMeta ? { _multidoc: multiDocMeta } : {}),
       },
       ocr_text: extraction.ocr_text || null,
       needs_action: needsAction,

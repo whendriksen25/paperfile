@@ -263,12 +263,32 @@ export interface BoundingBox {
   h: number;
 }
 
+/** A single 2D point in NORMALISED 0..1 image coordinates, top-left
+ * origin. Used for polygon vertices returned by the multi-doc detection
+ * prompt. */
+export type Point = { x: number; y: number };
+
+/** A polygon that hugs one receipt's perimeter. Vertices are listed
+ * clockwise starting from the receipt's OWN top-left corner (i.e. the
+ * corner with the printed header), even if the receipt is tilted on
+ * the page. `rotation_estimate_degrees` is the receipt's tilt vs
+ * upright: 0 = upright, positive = clockwise. Optional; the polygon
+ * code can re-derive it from the longest edge if missing. */
+export type ReceiptPolygon = {
+  vertices: Point[];
+  rotation_estimate_degrees?: number;
+};
+
 export interface MultiDocumentExtraction {
   documents: DocumentExtraction[];
-  /** Optional. Same length + index as documents[]. If present, the
-   * analyze route crops each region and re-extracts at full resolution
-   * for per-receipt accuracy. If absent (older prompt response), the
-   * analyze route falls back to the low-res shared-image extraction. */
+  /** Polygons that hug each receipt's perimeter. Same length + index
+   * as documents[]. Preferred form: handles tilted receipts on
+   * cluttered backgrounds far better than axis-aligned rectangles. */
+  polygons?: ReceiptPolygon[];
+  /** Legacy / backward-compat form — axis-aligned rectangles. Older
+   * prompt responses (and the manual diag script before the rewrite)
+   * still emit this. The parser auto-converts to rectangular polygons
+   * when only this is present. Same length + index as documents[]. */
   bounding_boxes?: BoundingBox[];
 }
 
@@ -286,6 +306,71 @@ export function isMultiDoc(
     "documents" in d &&
     Array.isArray((d as MultiDocumentExtraction).documents)
   );
+}
+
+/**
+ * Convert an axis-aligned BoundingBox to a 4-vertex rectangular
+ * ReceiptPolygon, listed clockwise starting from top-left. Used when
+ * Claude returned the legacy `bounding_boxes` field instead of the
+ * preferred `polygons` field — the downstream cropper only needs to
+ * understand polygons.
+ */
+export function bboxToPolygon(b: BoundingBox): ReceiptPolygon {
+  const x = Math.max(0, Math.min(1, Number(b.x) || 0));
+  const y = Math.max(0, Math.min(1, Number(b.y) || 0));
+  const w = Math.max(0, Math.min(1 - x, Number(b.w) || 0));
+  const h = Math.max(0, Math.min(1 - y, Number(b.h) || 0));
+  return {
+    vertices: [
+      { x, y },
+      { x: x + w, y },
+      { x: x + w, y: y + h },
+      { x, y: y + h },
+    ],
+    // A bounding-box has no rotation hint; the polygon code falls back
+    // to longest-edge geometry, which on a rectangle yields ~0°.
+    rotation_estimate_degrees: 0,
+  };
+}
+
+/**
+ * In-place normalisation of a parsed multi-doc response:
+ *   - If polygons[] is already present and length-matches documents[], keep as-is.
+ *   - Otherwise, if bounding_boxes[] is present and length-matches, convert
+ *     each box to a rectangular polygon and stash on polygons[].
+ *   - Otherwise (neither present, or length mismatch), leave polygons
+ *     undefined; the consumer will fall back to the shared-image
+ *     extraction. Logs a warning so the case is visible in server logs.
+ */
+function normaliseMultiDocPolygons(m: MultiDocumentExtraction): void {
+  const docCount = Array.isArray(m.documents) ? m.documents.length : 0;
+  if (docCount === 0) return;
+  // If polygons are already present and well-formed, leave them.
+  if (
+    Array.isArray(m.polygons) &&
+    m.polygons.length === docCount &&
+    m.polygons.every(
+      (p) => p && Array.isArray(p.vertices) && p.vertices.length >= 3
+    )
+  ) {
+    return;
+  }
+  // Try the legacy bounding_boxes form.
+  if (
+    Array.isArray(m.bounding_boxes) &&
+    m.bounding_boxes.length === docCount
+  ) {
+    m.polygons = m.bounding_boxes.map(bboxToPolygon);
+    console.log(
+      `[ai/extract] multi-doc: converted ${m.bounding_boxes.length} bounding_boxes → polygons (legacy form)`
+    );
+    return;
+  }
+  if (docCount > 1) {
+    console.warn(
+      `[ai/extract] multi-doc with ${docCount} documents but no polygons AND no bounding_boxes (or count mismatch). Cropping will be skipped; the analyze pipeline will fall back to shared-image per-doc extractions.`
+    );
+  }
 }
 
 export interface ExtractResult {
@@ -410,6 +495,18 @@ export async function extractDocument(
     // The parsed JSON is either a single DocumentExtraction OR a
     // { documents: [...] } multi-doc wrapper. The type guard `isMultiDoc`
     // in callers picks them apart. We just cast — both shapes are valid.
+    // For multi-doc responses, normalise the polygons / bounding_boxes
+    // pair so downstream code only ever needs to look at `polygons`.
+    const maybeMulti = parsed as Record<string, unknown>;
+    if (
+      maybeMulti &&
+      Array.isArray(maybeMulti["documents"]) &&
+      (maybeMulti["documents"] as unknown[]).length > 0
+    ) {
+      normaliseMultiDocPolygons(
+        maybeMulti as unknown as MultiDocumentExtraction
+      );
+    }
     return {
       data: parsed as unknown as ExtractionData,
       usage,

@@ -370,6 +370,13 @@ export async function POST(
     // Filled by the file-move section once per-crop Dropbox paths exist.
     // Used by the child-spawn loop to set each child's dropbox_path.
     const perCropDropboxPaths: string[] = [];
+    // Polygons that drove the per-crop split. Persisted on the parent's
+    // extracted_fields._multidoc so the UI can render an overlay later
+    // ("the top-left receipt is doc B") and child-doc pages can describe
+    // their original position on the parent scan.
+    let savedMultiDocPolygons:
+      | import("@/lib/ai/extract").ReceiptPolygon[]
+      | null = null;
     if (isMultiDoc(result)) {
       const docs = result.documents;
       if (docs.length === 0) {
@@ -394,28 +401,36 @@ export async function POST(
       );
 
       // ★ Per-receipt cropped re-extraction (option 3).
-      // If Claude gave us bounding boxes AND the original is an image,
-      // crop each receipt out, upload each crop to Dropbox, and re-run
-      // extractDocument on each crop in full resolution. Replaces the
-      // low-res shared-image extractions with high-res per-crop ones.
+      // If Claude gave us polygons (or legacy bounding_boxes — the
+      // extract.ts parser auto-converts those) AND the original is an
+      // image, crop each receipt out + deskew so it sits upright, then
+      // re-run extractDocument on each crop in full resolution.
       //
       // Per-crop dropbox paths are remembered so the parent / children
       // rows can each point at THEIR receipt's crop (not the original
       // full scan). The original full scan is retained in Dropbox for
       // recovery; only the row pointers move to the crops.
-      const boxes = (result as MultiDocumentExtraction).bounding_boxes;
+      const multi = result as MultiDocumentExtraction;
+      // Prefer polygons (content-aware, tight, tilted-receipt-aware).
+      // Fall back to converting legacy bounding_boxes if the parser
+      // didn't already do it. polygons[i] ↔ documents[i].
+      let polygons = Array.isArray(multi.polygons) ? multi.polygons : null;
+      if (!polygons && Array.isArray(multi.bounding_boxes)) {
+        const { bboxToPolygon } = await import("@/lib/ai/extract");
+        polygons = multi.bounding_boxes.map(bboxToPolygon);
+      }
       const isImage = /\.(jpe?g|png|webp|gif|heic|heif)$/i.test(
         doc.file_name || ""
       );
       if (
         isImage &&
-        Array.isArray(boxes) &&
-        boxes.length === docs.length &&
-        boxes.length > 0
+        Array.isArray(polygons) &&
+        polygons.length === docs.length &&
+        polygons.length > 0
       ) {
         try {
-          const { cropRegions } = await import("@/lib/services/image-crop");
-          const crops = await cropRegions(buffer, boxes);
+          const { cropAndDeskew } = await import("@/lib/services/image-crop");
+          const crops = await cropAndDeskew(buffer, polygons, { trim: true });
           // Re-extract each crop at full resolution IN PARALLEL.
           // Sequential calls take 4×~20s = ~80s which alone exceeds
           // Vercel's 60s Hobby cap. Parallel collapses wall-clock to
@@ -453,6 +468,10 @@ export async function POST(
           // Upload each crop to Dropbox and stash the resulting paths so
           // the file-move + child-spawn code below uses them.
           perCropDropboxBuffers = crops;
+          // Remember the polygons that drove the split so we can
+          // persist them on the parent (for overlays + per-child
+          // "originally top-left of the scan" hints).
+          savedMultiDocPolygons = polygons;
           console.log(
             `[api/analyze] cropped + re-extracted ${crops.length} sub-receipts at full res`
           );
@@ -873,6 +892,19 @@ export async function POST(
           // image instead of just re-extracting crop[0].
           ...(originalScanPath
             ? { _original_scan_path: originalScanPath }
+            : {}),
+          // Polygons + per-doc detection metadata from the multi-doc
+          // split, stored on the PARENT row. The child-doc detail page
+          // reads polygons[childIdx + 1] to describe where each child
+          // originally sat on the scan ("top-left of the original scan").
+          // childIdx 0 in polygons corresponds to the parent itself.
+          ...(savedMultiDocPolygons
+            ? {
+                _multidoc: {
+                  polygons: savedMultiDocPolygons,
+                  total: 1 + multiDocChildren.length,
+                },
+              }
             : {}),
           _profile_match: profileMatchReason
             ? {

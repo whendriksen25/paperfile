@@ -18,13 +18,32 @@ export const DOCUMENT_EXTRACTION_PROMPT = `You are a document intake assistant. 
 MULTI-DOCUMENT DETECTION (read this first):
 
 - Examine the scan carefully. Are there multiple SEPARATE documents on it? Signs to look for: distinct headers/footers for each, separate dates, separate totals, separate vendors, clear visual gaps between them, separate receipt paper edges, "thank you" / closing markers in the middle of the scan, multiple barcodes from different vendors.
+- IDENTIFY EACH RECEIPT BY ITS CONTENT, not by background colour or contrast. The reliable signals are the printed content: the header / store name at the top, the line items, the total, the date, the footer / barcode. Use those to define where one receipt ends and the next begins — NOT a guess from where the paper "looks lighter or darker". On a cluttered table, two pale receipts with no visible edge between them are still two receipts if there are two store headers and two totals.
 - If you find MULTIPLE distinct documents on one scan, return:
     {
       "documents": [ <single-doc-shape>, <single-doc-shape>, ... ],
-      "bounding_boxes": [ {"x": 0.0, "y": 0.0, "w": 1.0, "h": 0.5}, ... ]
+      "polygons": [
+        {
+          "vertices": [
+            {"x": 0.15, "y": 0.00},
+            {"x": 0.40, "y": 0.00},
+            {"x": 0.40, "y": 0.65},
+            {"x": 0.15, "y": 0.65}
+          ],
+          "rotation_estimate_degrees": 0
+        },
+        ...
+      ]
     }
-  where each element of "documents" is the single-document JSON shape described below — one entry per detected document, in reading order (top-to-bottom, left-to-right) — AND a matching "bounding_boxes" array with one entry per document, indices aligned (documents[i] ↔ bounding_boxes[i]).
-- Bounding box coordinates are NORMALISED to 0..1: x=0, y=0 is the TOP-LEFT corner of the image, x=1, y=1 is the bottom-right. x,y is the top-left of the box; w,h are width/height as fractions of the image. The system uses these to CROP each receipt into its own file for a higher-resolution second-pass extraction — being a bit generous with margins is better than cutting tight (add ~2-3% padding all around). Boxes can overlap if necessary but should each enclose ONE document fully.
+  where each element of "documents" is the single-document JSON shape described below — one entry per detected document, in reading order (top-to-bottom, left-to-right) — AND a matching "polygons" array with one entry per document, indices aligned (documents[i] ↔ polygons[i]).
+- POLYGON SHAPE — each polygon must:
+  - have 4 or more vertices that HUG THE ACTUAL PERIMETER of the receipt (the printed paper boundary as you can perceive it from the content). A loose rectangle around a tilted receipt is wrong; a tight quad following the receipt's real edges is right.
+  - list vertices in CLOCKWISE order, starting from the receipt's OWN top-left corner — meaning the corner that is the top-left in the receipt's own orientation (where the printed header is). If the receipt is tilted on the page, that vertex may be at e.g. (0.18, 0.04) in image coords; that's fine, just start there and go clockwise around the receipt.
+  - use NORMALISED coordinates in [0..1]: x=0, y=0 is the TOP-LEFT corner of the image, x=1, y=1 is the bottom-right.
+  - include "rotation_estimate_degrees": the receipt's tilt relative to upright on the page, where 0 = upright (header at the top, baseline horizontal), positive = clockwise rotation, negative = counter-clockwise. Range roughly -45..+45 — anything beyond that is unusual and a sign you may be misreading the orientation.
+- Receipts may be ROTATED, slightly OVERLAPPING, or sit on CLUTTERED backgrounds (a wooden table, a desk with pens / cups, another piece of paper underneath). Handle all of these. Do not split one receipt because of a fold or a coffee stain; do not merge two receipts because their paper colour is similar.
+- The system uses each polygon's bounding box (with a small padding margin) to crop the receipt into its own file, then deskews it using the rotation estimate, then re-runs extraction at full resolution. So: tight polygons + an accurate rotation estimate = much cleaner per-receipt extractions. Loose rectangles around tilted receipts force the downstream pipeline to keep too much background.
+- BACKWARD COMPATIBILITY: if for some reason you cannot return polygons, you may instead return the older "bounding_boxes" field as an array of axis-aligned rectangles ({"x","y","w","h"} in normalised coords); the parser still accepts that form and will treat each box as a rectangular polygon. Prefer polygons whenever the receipts are tilted or non-rectangular.
 - If the scan is ONE document (the overwhelmingly common case — a single receipt, one invoice, one letter, one multi-page contract, a multi-transaction bank statement) return the single-document object directly, NOT wrapped in a "documents" array. A multi-page contract or a statement with many line items is ONE document, not many.
 - DO NOT split a single document just because it has multiple line items / transactions / sections. Multi-doc means physically separate documents on the same scan, NOT itemised content within one document.
 - When in doubt → treat as one document. Over-splitting is worse than under-splitting; the user can split manually if needed.
@@ -181,7 +200,7 @@ ${buildLineItemCategoryBlock()}
 - "profile_hint" should be the actual name as written on the doc — the server will fuzzy-match it to existing profiles.
 - If the image is unreadable or clearly not a document (blank page, random photo), set document_type to "other", confidence low, and explain in "summary".
 
-Return ONLY the JSON object (either the single-document shape OR the { "documents": [...] } multi-doc wrapper — never both, never wrapped in markdown).`;
+Return ONLY the JSON object (either the single-document shape OR the { "documents": [...], "polygons": [...] } multi-doc wrapper — never both, never wrapped in markdown).`;
 
 export const PROFILE_ENRICHMENT_PROMPT = `You are extracting company profile data from a website excerpt to help a personal document archiver categorise incoming mail, invoices, and bills.
 

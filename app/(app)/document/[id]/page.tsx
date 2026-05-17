@@ -19,6 +19,7 @@ import { DuplicateBanner } from "@/components/inbox/duplicate-banner";
 import { DocumentPreview } from "@/components/inbox/document-preview";
 import { ReconciliationPanel } from "@/components/inbox/reconciliation-panel";
 import { TruncationBanner } from "@/components/inbox/truncation-banner";
+import { ParentScanBanner } from "@/components/inbox/parent-scan-banner";
 import { estimateAiCostEur, formatAiCostEur } from "@/lib/ai/pricing";
 import {
   ProfileMatchPanel,
@@ -149,6 +150,7 @@ export default async function DocumentDetail({
     currency: string | null;
     document_date: string | null;
     parent_document_id: string | null;
+    dropbox_path: string | null;
   };
   let siblings: SiblingRow[] = [];
   const parentId =
@@ -157,16 +159,138 @@ export default async function DocumentDetail({
   const scanRootId = parentId || doc.id;
   // Always do the query — if scanRootId has no children AND isn't a
   // child itself, the result is just this one row, and we render no
-  // badge. Cheap query.
+  // badge. Cheap query. dropbox_path is fetched so we can derive a
+  // stable left-to-right ordering for the parent-scan banner's
+  // "Part N of M" position (matches the _part1/_part2 naming pattern).
   {
     const { data: siblingData } = await supabase
       .from("documents")
       .select(
-        "id, sender, title, amount, currency, document_date, parent_document_id"
+        "id, sender, title, amount, currency, document_date, parent_document_id, dropbox_path"
       )
       .or(`id.eq.${scanRootId},parent_document_id.eq.${scanRootId}`)
       .order("created_at", { ascending: true });
     siblings = (siblingData || []) as SiblingRow[];
+  }
+
+  // Parent-scan banner data — only relevant for child rows (rows with
+  // a parent_document_id set). We fetch the parent's fields once;
+  // sibling ordering uses the dropbox_path column already on the
+  // siblings array, so no extra query is needed for that.
+  let parentScanInfo: {
+    parentDocId: string;
+    parentSender: string | null;
+    parentDate: string | null;
+    parentDropboxPath: string | null;
+    siblingPosition: number;
+    siblingTotal: number;
+    position:
+      | "top-left"
+      | "top-right"
+      | "bottom-left"
+      | "bottom-right"
+      | "middle"
+      | null;
+  } | null = null;
+  if (parentId) {
+    const { data: parentRow } = await supabase
+      .from("documents")
+      .select("id, sender, document_date, dropbox_path, extracted_fields")
+      .eq("id", parentId)
+      .maybeSingle();
+    if (parentRow) {
+      const pRow = parentRow as {
+        id: string;
+        sender: string | null;
+        document_date: string | null;
+        dropbox_path: string | null;
+        extracted_fields: Record<string, unknown> | null;
+      };
+      // Order siblings by dropbox_path (matches the _part1/_part2/...
+      // naming convention used when crops are written to storage).
+      // Fall back to created_at order for any row without a path.
+      const sorted = [...siblings].sort((a, b) => {
+        const ap = a.dropbox_path || "";
+        const bp = b.dropbox_path || "";
+        if (ap === bp) return 0;
+        return ap < bp ? -1 : 1;
+      });
+      const myPath = doc.dropbox_path || "";
+      // 1-based position: count of siblings whose path is <= mine.
+      let siblingPosition = 0;
+      for (const s of sorted) {
+        const sp = s.dropbox_path || "";
+        if (sp <= myPath) siblingPosition += 1;
+      }
+      // Defensive: position must be ≥ 1 so the banner reads correctly
+      // even if dropbox_path comparison goes weird.
+      if (siblingPosition === 0) siblingPosition = 1;
+      const siblingTotal = sorted.length;
+
+      // Spatial position. The parent persists polygons on
+      // extracted_fields._multidoc.polygons; polygons[0] is the parent
+      // (which after split = the first receipt), [1..] are children.
+      // We classify by centroid quadrant: x<0.5 = left; y<0.5 = top;
+      // a tight middle band (0.4..0.6 on BOTH axes) maps to "middle".
+      let position:
+        | "top-left"
+        | "top-right"
+        | "bottom-left"
+        | "bottom-right"
+        | "middle"
+        | null = null;
+      const mdRaw = pRow.extracted_fields?.["_multidoc"];
+      if (mdRaw && typeof mdRaw === "object") {
+        const md = mdRaw as {
+          polygons?: Array<{ vertices?: Array<{ x: number; y: number }> }>;
+        };
+        const polys = Array.isArray(md.polygons) ? md.polygons : [];
+        // The polygons array is index-aligned with the per-crop split:
+        // index 0 = parent's portion (which after the split is the
+        // first receipt). Children appear at indices 1..N in the same
+        // order they were inserted, which mirrors the sorted dropbox
+        // path order ({stem}_part1, _part2, ...). So the child's polygon
+        // index is the same as siblingPosition - 1 (because the parent
+        // sits at position 1, child[0] sits at position 2, etc.).
+        const polyIdx = siblingPosition - 1;
+        const poly = polys[polyIdx];
+        if (poly && Array.isArray(poly.vertices) && poly.vertices.length > 0) {
+          let cx = 0,
+            cy = 0;
+          for (const v of poly.vertices) {
+            cx += Number(v.x) || 0;
+            cy += Number(v.y) || 0;
+          }
+          cx /= poly.vertices.length;
+          cy /= poly.vertices.length;
+          const inMidX = cx >= 0.4 && cx <= 0.6;
+          const inMidY = cy >= 0.4 && cy <= 0.6;
+          if (inMidX && inMidY) {
+            position = "middle";
+          } else {
+            const top = cy < 0.5;
+            const left = cx < 0.5;
+            position = top
+              ? left
+                ? "top-left"
+                : "top-right"
+              : left
+                ? "bottom-left"
+                : "bottom-right";
+          }
+        }
+      }
+
+      parentScanInfo = {
+        parentDocId: pRow.id,
+        parentSender: pRow.sender,
+        parentDate: pRow.document_date,
+        parentDropboxPath: pRow.dropbox_path,
+        siblingPosition,
+        siblingTotal,
+        position,
+      };
+    }
   }
 
   // Look up an active multi-doc "re-analyse full scan" job so the
@@ -320,6 +444,21 @@ export default async function DocumentDetail({
           return null;
         })()}
       </header>
+
+      {/* Parent-scan banner — only rendered on child docs that came
+         from a multi-receipt scan. Self-suppresses when parentDocId
+         is missing, so unconditional placement is safe. */}
+      {parentScanInfo && (
+        <ParentScanBanner
+          parentDocId={parentScanInfo.parentDocId}
+          parentSender={parentScanInfo.parentSender}
+          parentDate={parentScanInfo.parentDate}
+          parentDropboxPath={parentScanInfo.parentDropboxPath}
+          siblingPosition={parentScanInfo.siblingPosition}
+          siblingTotal={parentScanInfo.siblingTotal}
+          position={parentScanInfo.position}
+        />
+      )}
 
       {isPending && (
         <div className="surface p-5 mb-5 bg-brand-gradient-soft border-brand-purple/30">
