@@ -178,9 +178,10 @@ export function polygonLongestEdgeAngleDegrees(verts: Point[]): number {
 export async function cropAndDeskew(
   buffer: Buffer,
   polygons: ReceiptPolygon[],
-  opts?: { mask?: boolean; trim?: boolean }
+  opts?: { mask?: boolean; trim?: boolean; orientationProbe?: boolean }
 ): Promise<Buffer[]> {
   const trim = opts?.trim !== false; // default true
+  const probe = opts?.orientationProbe === true; // default false (opt-in)
   // opts.mask is intentionally NOT implemented — the spec says "skip
   // this entirely if opts.mask is false; we'll just rely on the bbox
   // + rotate + trim flow." We carry the option through the signature
@@ -204,7 +205,11 @@ export async function cropAndDeskew(
       continue;
     }
 
-    // 1+2. Bbox in pixel coords + ~3% padding so rotation doesn't clip.
+    // 1+2. Bbox in pixel coords + padding so rotation doesn't clip.
+    // Generous (8%) padding: experience shows 3% is too tight — small
+    // tilt corrections push receipt edges outside the crop and .trim()
+    // then bites into receipt content. Better to keep more background
+    // and let the per-receipt extraction ignore it.
     const bbox = polygonBoundingBox(verts);
     if (bbox.w * bbox.h < 0.01) {
       // Polygon is suspiciously small (< 1% of image area) — likely
@@ -213,7 +218,7 @@ export async function cropAndDeskew(
       out.push(buffer);
       continue;
     }
-    const padFrac = 0.03;
+    const padFrac = 0.08;
     const padX = bbox.w * padFrac;
     const padY = bbox.h * padFrac;
     const pxN = Math.max(0, bbox.x - padX);
@@ -243,15 +248,28 @@ export async function cropAndDeskew(
       tilt = tiltFromVertical;
     }
 
-    // Clamp / guard. The spec: don't deskew if |tilt| > 45°.
+    // Clamp / guard.
+    //   - don't deskew if |tilt| > 180° (out of range entirely;
+    //     normalise into ±180° instead via modulo, then re-evaluate)
+    //   - don't deskew if |tilt| < 3° (visible misalignment from a
+    //     micro-rotation is usually worse than the original small tilt;
+    //     per-receipt extraction is tilt-tolerant for small angles)
+    //
+    // The full ±180° range is intentional — receipts may be photographed
+    // sideways (±90°) or upside-down (±180°). Sharp rotates arbitrary
+    // angles correctly. The optional Haiku orientation probe (next step
+    // in the pipeline) catches any remaining 90/180/270° error.
     let applyTilt = true;
     if (tilt == null || !Number.isFinite(tilt)) {
       applyTilt = false;
-    } else if (Math.abs(tilt) > 45) {
-      console.warn(
-        `[image-crop] polygon tilt ${tilt.toFixed(1)}° exceeds ±45° guard; skipping deskew (bbox-only crop)`
-      );
-      applyTilt = false;
+    } else {
+      // Wrap out-of-range values into (-180, 180].
+      while (tilt > 180) tilt -= 360;
+      while (tilt <= -180) tilt += 360;
+      if (Math.abs(tilt) < 3) {
+        // Skip micro-rotations silently — common case for upright receipts.
+        applyTilt = false;
+      }
     }
 
     try {
@@ -262,9 +280,11 @@ export async function cropAndDeskew(
         width: pw,
         height: ph,
       });
-      if (applyTilt && tilt != null && Math.abs(tilt) > 0.1) {
+      if (applyTilt && tilt != null) {
         // sharp().rotate(angle) rotates CLOCKWISE by `angle` degrees.
         // We want to UNDO a clockwise tilt of `tilt`, so rotate by -tilt.
+        // The applyTilt gate above already filtered out micro-rotations
+        // (|tilt| < 3°) and absurd ones (|tilt| > 45°).
         pipeline = pipeline.rotate(-tilt, { background: "#ffffff" });
       }
       if (trim) {
@@ -274,7 +294,25 @@ export async function cropAndDeskew(
         // the trim is conservative and leaves the printed content.
         pipeline = pipeline.trim();
       }
-      const cropped = await pipeline.jpeg({ quality: 92 }).toBuffer();
+      let cropped = await pipeline.jpeg({ quality: 92 }).toBuffer();
+
+      // Optional final-mile orientation probe. Sonnet's rotation hint is
+      // usually right, but occasionally misses a quarter-turn (especially
+      // for receipts photographed upside-down). The probe is a cheap
+      // Haiku call that returns 0/90/180/270 — coarse correction only.
+      // Skipped by default; opt in via opts.orientationProbe=true.
+      if (probe) {
+        const { probeOrientation, applyQuadrantRotation } = await import(
+          "@/lib/services/orientation-probe"
+        );
+        const { degrees: quadrant } = await probeOrientation(cropped);
+        if (quadrant !== 0) {
+          console.log(
+            `[image-crop] orientation probe corrected by ${quadrant}°`
+          );
+          cropped = await applyQuadrantRotation(cropped, quadrant);
+        }
+      }
       out.push(cropped);
     } catch (e) {
       // Per-polygon defensive: fall back to a plain bbox crop, no

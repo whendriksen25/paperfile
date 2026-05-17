@@ -430,7 +430,13 @@ export async function POST(
       ) {
         try {
           const { cropAndDeskew } = await import("@/lib/services/image-crop");
-          const crops = await cropAndDeskew(buffer, polygons, { trim: true });
+          const crops = await cropAndDeskew(buffer, polygons, {
+            trim: true,
+            // Haiku probe on each crop after deskew — catches any
+            // 90/180/270° misalignment Sonnet missed on the busy
+            // multi-receipt scan. ~$0.001 per crop.
+            orientationProbe: true,
+          });
           // Re-extract each crop at full resolution IN PARALLEL.
           // Sequential calls take 4×~20s = ~80s which alone exceeds
           // Vercel's 60s Hobby cap. Parallel collapses wall-clock to

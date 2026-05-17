@@ -1119,9 +1119,11 @@ If SINGLE doc, return: { "documents": [{single-doc-summary}], "polygons": [] }
 
 POLYGON RULES:
 - 4 or more vertices that hug the receipt's actual perimeter (not a loose rectangle).
+- TILTED RECEIPT → TILTED POLYGON. If the receipt is tilted on the page, the 4 vertices must trace the receipt's actual corners — each vertex will have a different x AND a different y. Two vertices sharing the exact same x (or the same y) means the polygon is axis-aligned; that's ONLY correct when the receipt itself is perfectly upright AND perfectly axis-aligned.
+- POLYGONS MUST NOT OVERLAP. Each pixel belongs to at most one receipt's polygon. When two receipts touch on the page, the shared edge must cleanly divide them — no part of receipt B inside receipt A's polygon.
 - Vertices in normalised [0..1] coords, top-left origin (x=0,y=0 is the image's top-left).
 - Listed CLOCKWISE starting from the receipt's OWN top-left corner (where its printed header sits), even if the receipt is tilted on the page.
-- rotation_estimate_degrees: the receipt's tilt vs upright. 0 = upright. Positive = clockwise. Range roughly -45..+45.
+- rotation_estimate_degrees: the receipt's tilt vs upright. 0 = upright. Positive = clockwise. **Range is -180..+180.** Receipts may be sideways (±90°), upside-down (±180°), or at any random angle. Report the actual orientation — a 90° or 180° receipt MUST be reported, never as 0. For small tilts only: if you're not sure whether the receipt is tilted by 1° or genuinely upright (camera perspective vs real rotation), return 0; that case is better off slightly tilted than wrongly deskewed. But for big rotations (>15°), be honest about the magnitude.
 - documents[i] and polygons[i] are index-aligned.
 
 Return ONLY the JSON object. No prose, no markdown.`;

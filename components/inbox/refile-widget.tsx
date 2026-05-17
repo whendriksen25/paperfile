@@ -71,13 +71,17 @@ export function RefileWidget({
   const [docType, setDocType] = useState<string>(currentDocumentType || "");
   const [saving, setSaving] = useState(false);
   const [reanalysing, setReanalysing] = useState(false);
-  const [reanalysingFull, setReanalysingFull] = useState(false);
   // Active analyze-job id. Mirrors the activeAnalyzeJobId server-side
   // prop so a page reload mid-job resumes the panel automatically; set
-  // imperatively when the user clicks "Re-analyse full scan".
+  // imperatively when the user clicks "Re-analyse with AI" on a
+  // multi-doc parent.
   const [analyzeJobId, setAnalyzeJobId] = useState<string | null>(
     activeAnalyzeJobId || null
   );
+  // True when this doc is a multi-doc parent — drives the smart routing
+  // of the single "Re-analyse with AI" button so the user doesn't have
+  // to remember which button does what.
+  const isMultiDoc = !!(hasOriginalScan || isMultiDocParent);
   const [error, setError] = useState<string | null>(null);
   const [doneMessage, setDoneMessage] = useState<string | null>(null);
   // After save: if siblings exist with a different classification, show a
@@ -164,81 +168,85 @@ export function RefileWidget({
     }
   }
 
+  /**
+   * Smart re-analyse. ONE button, three behaviours:
+   *
+   *  1. Multi-doc parent (hasOriginalScan || isMultiDocParent):
+   *     route through /api/analyze-job/start with fromOriginal=true so
+   *     the pipeline downloads the FULL original multi-receipt scan (not
+   *     the parent's current dropbox_path, which after a previous split
+   *     points at _part1.jpg of just one receipt). The job-based
+   *     background pipeline shows a live progress panel below.
+   *
+   *  2. Single doc: standard synchronous re-analyse via the existing
+   *     /api/analyze/[id] route. Fits in Vercel's 60s budget easily.
+   *
+   *  3. Multi-doc parent but the start endpoint reports only one
+   *     document was detected this time (e.g. boxes changed, original
+   *     was actually a single doc): fall back to the synchronous path
+   *     against the original scan.
+   *
+   * force_profile=1 / forceProfile=true tells the analyze pipeline to
+   * ignore any pre-pinned primary_profile_id and let Claude re-rank
+   * profiles from scratch — what "Re-analyse" should always do.
+   */
   async function reanalyse() {
     setReanalysing(true);
     setError(null);
     setDoneMessage(null);
     try {
-      // force_profile=1 tells the analyze route to ignore any pre-pinned
-      // primary_profile_id and let Claude re-rank profiles from scratch.
-      const res = await fetch(
-        `/api/analyze/${documentId}?force_profile=1`,
-        { method: "POST" }
-      );
-      if (!res.ok) {
-        const json = await res.json().catch(() => ({}));
-        throw new Error(json.error || `HTTP ${res.status}`);
-      }
-      setDoneMessage("Re-analysed — refresh in a moment to see updated data.");
-      router.refresh();
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : "Re-analyse failed");
-    } finally {
-      setReanalysing(false);
-    }
-  }
-
-  /** "Re-analyse full scan" — only available when this row is the parent
-   * of a multi-doc crop split. Kicks off a BACKGROUND analyze job
-   * (mirrors the reconcile-job pattern) so per-crop AI calls fit inside
-   * Vercel's 60s function ceiling. The progress panel below the button
-   * renders while the job runs.
-   *
-   * Single-doc fallback: if detection finds only 1 document on the
-   * scan, no job is created and we fall back to the synchronous inline
-   * /api/analyze/[id] route — which is fine for a single doc because
-   * the per-crop concurrency that exceeds the budget never kicks in. */
-  async function reanalyseFullScan() {
-    setReanalysingFull(true);
-    setError(null);
-    setDoneMessage(null);
-    try {
-      const res = await fetch(`/api/analyze-job/start`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          documentId,
-          fromOriginal: true,
-          forceProfile: true,
-        }),
-      });
-      if (!res.ok) {
-        const json = await res.json().catch(() => ({}));
-        throw new Error(json.error || `HTTP ${res.status}`);
-      }
-      const json = (await res.json()) as {
-        jobId: string | null;
-        totalCrops?: number;
-        fallback?: string;
-        reason?: string | null;
-      };
-      if (json.jobId) {
-        // Multi-doc path — render the live progress panel.
-        setAnalyzeJobId(json.jobId);
-      } else if (json.fallback === "single_doc_synchronous") {
-        // Only one document detected — fall back to the inline analyze
-        // route. This path is fast enough to fit in 60s (no per-crop
-        // fan-out) so we don't need the job machinery for it.
-        setDoneMessage(
-          "Only one document detected — running a normal re-analyse instead…"
-        );
-        const ires = await fetch(
-          `/api/analyze/${documentId}?from_original=1&force_profile=1`,
+      if (isMultiDoc) {
+        // Multi-doc parent → job pipeline, downloads the original full
+        // scan and re-splits all receipts.
+        const res = await fetch(`/api/analyze-job/start`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            documentId,
+            fromOriginal: true,
+            forceProfile: true,
+          }),
+        });
+        if (!res.ok) {
+          const json = await res.json().catch(() => ({}));
+          throw new Error(json.error || `HTTP ${res.status}`);
+        }
+        const json = (await res.json()) as {
+          jobId: string | null;
+          totalCrops?: number;
+          fallback?: string;
+        };
+        if (json.jobId) {
+          // Render the live progress panel.
+          setAnalyzeJobId(json.jobId);
+        } else if (json.fallback === "single_doc_synchronous") {
+          // Detection now finds only 1 doc — fall back to the inline
+          // analyze route against the original scan.
+          setDoneMessage(
+            "Only one document detected — running a normal re-analyse instead…"
+          );
+          const ires = await fetch(
+            `/api/analyze/${documentId}?from_original=1&force_profile=1`,
+            { method: "POST" }
+          );
+          if (!ires.ok) {
+            const ij = await ires.json().catch(() => ({}));
+            throw new Error(ij.error || `HTTP ${ires.status}`);
+          }
+          setDoneMessage(
+            "Re-analysed — refresh in a moment to see updated data."
+          );
+          router.refresh();
+        }
+      } else {
+        // Single doc — standard synchronous re-analyse path.
+        const res = await fetch(
+          `/api/analyze/${documentId}?force_profile=1`,
           { method: "POST" }
         );
-        if (!ires.ok) {
-          const ij = await ires.json().catch(() => ({}));
-          throw new Error(ij.error || `HTTP ${ires.status}`);
+        if (!res.ok) {
+          const json = await res.json().catch(() => ({}));
+          throw new Error(json.error || `HTTP ${res.status}`);
         }
         setDoneMessage(
           "Re-analysed — refresh in a moment to see updated data."
@@ -246,9 +254,9 @@ export function RefileWidget({
         router.refresh();
       }
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : "Re-analyse full scan failed");
+      setError(e instanceof Error ? e.message : "Re-analyse failed");
     } finally {
-      setReanalysingFull(false);
+      setReanalysing(false);
     }
   }
 
@@ -318,45 +326,37 @@ export function RefileWidget({
         </button>
         <button
           onClick={reanalyse}
-          disabled={reanalysing || reanalysingFull}
+          disabled={reanalysing || !!analyzeJobId}
           className="btn-secondary text-xs !py-2"
+          title={
+            isMultiDoc
+              ? "Re-download the original multi-receipt scan, redo detection, and re-split into fresh per-receipt children."
+              : "Re-run AI extraction on this document."
+          }
         >
-          {reanalysing ? (
+          {reanalysing || analyzeJobId ? (
             <>
-              <Spinner className="h-3.5 w-3.5" /> Re-analysing…
+              <Spinner className="h-3.5 w-3.5" />
+              {analyzeJobId
+                ? "Re-analysing in background…"
+                : "Re-analysing…"}
             </>
           ) : (
             <>
               <Sparkles className="h-3.5 w-3.5" />
               Re-analyse with AI
+              {isMultiDoc ? " (full scan)" : ""}
             </>
           )}
         </button>
       </div>
 
-      {/* Multi-doc re-split — show on any parent of a multi-doc split,
-          new format (with _original_scan_path) OR legacy (without). */}
-      {(hasOriginalScan || isMultiDocParent) && (
-        <button
-          onClick={reanalyseFullScan}
-          disabled={reanalysing || reanalysingFull || !!analyzeJobId}
-          className="btn-secondary text-xs !py-2 mt-2 w-full"
-          title="Re-download the original multi-receipt scan and redo the entire split — replaces all current sibling rows"
-        >
-          {reanalysingFull || analyzeJobId ? (
-            <>
-              <Spinner className="h-3.5 w-3.5" />
-              {analyzeJobId
-                ? "Re-analysing in background…"
-                : "Starting re-analyse…"}
-            </>
-          ) : (
-            <>
-              <Sparkles className="h-3.5 w-3.5" />
-              Re-analyse full scan (re-split all receipts)
-            </>
-          )}
-        </button>
+      {isMultiDoc && !analyzeJobId && !reanalysing && (
+        <p className="mt-2 text-[11px] text-muted-foreground">
+          This is a multi-receipt scan — re-analyse will download the original
+          full scan and re-split all {hasOriginalScan ? "receipts" : "items"}{" "}
+          fresh.
+        </p>
       )}
 
       {/* Live progress for an active background re-analyse job. Resumes
