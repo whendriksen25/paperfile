@@ -1,5 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type { SupabaseClient } from "@supabase/supabase-js";
+import { AI_MODEL_FAST } from "@/lib/ai/pricing";
 
 /**
  * AI-driven second pass for bank reconciliation. Runs AFTER the
@@ -32,7 +33,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
  * If we later see Haiku miss nuanced cases (combined payments, refund
  * pairs) we can route the harder chunks to Sonnet, but for now Haiku
  * is the right default. */
-const MODEL = "claude-haiku-4-5-20251001";
+const MODEL = AI_MODEL_FAST;
 
 const CONFIDENCE_AUTO_APPLY = 0.8;
 const CONFIDENCE_REVIEW = 0.5;

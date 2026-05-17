@@ -115,7 +115,25 @@ export async function POST(
         ? originalScanPathStored
         : doc.dropbox_path;
     const storage = getStorage(doc.storage_provider);
-    const buffer = await storage.downloadFile(downloadPath);
+    let buffer = await storage.downloadFile(downloadPath);
+
+    // 1a-pre. Auto-rotate phone photos that arrive with an EXIF
+    // orientation tag. Without this, the bytes Claude sees are in
+    // sensor orientation (often 90° or 180° off from how the user
+    // shot the photo), which tanks both single-doc extraction and
+    // multi-doc bounding-box detection. Cheap: ~50ms.
+    {
+      const { autoOrientImage } = await import(
+        "@/lib/services/image-orient"
+      );
+      const oriented = await autoOrientImage(buffer, doc.file_name);
+      if (oriented.rotated) {
+        console.log(
+          `[analyze] auto-rotated ${doc.file_name} by ${oriented.degrees}°`
+        );
+        buffer = oriented.buffer;
+      }
+    }
 
     // 1a. Load the user's existing taxonomy so we can hint Claude to
     // REUSE subcategory tokens it already knows ("apple") instead of

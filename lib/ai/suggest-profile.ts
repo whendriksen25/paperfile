@@ -1,5 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { PROFILE_SUGGESTION_PROMPT } from "./prompts";
+import { AI_MODEL_SMART } from "./pricing";
 import type {
   DocumentExtraction,
   ProfileRow,
@@ -84,7 +85,7 @@ export async function suggestProfile(
   const documentBlock = summariseDocumentForMatch(extraction);
 
   const response = await client.messages.create({
-    model: "claude-sonnet-4-20250514",
+    model: AI_MODEL_SMART,
     max_tokens: 1024,
     temperature: 0,
     messages: [

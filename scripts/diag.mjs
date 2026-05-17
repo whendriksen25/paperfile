@@ -930,7 +930,9 @@ Rules:
 
     try {
       const resp = await client.messages.create({
-        model: "claude-haiku-4-5-20251001",
+        // Mirrors AI_MODEL_FAST in lib/ai/pricing.ts. Override via ENV.
+        model:
+          process.env.ANTHROPIC_MODEL_FAST || "claude-haiku-4-5-20251001",
         max_tokens: 2048,
         messages: [{ role: "user", content: prompt }],
       });
@@ -1049,8 +1051,25 @@ async function cmdDetectMultidoc() {
   });
   console.log("\nDownloading...");
   const dl = await dbx.filesDownload({ path: doc.dropbox_path });
-  const buffer = Buffer.from((dl.result).fileBinary);
+  let buffer = Buffer.from((dl.result).fileBinary);
   console.log(`downloaded ${buffer.length} bytes`);
+
+  // Match the analyze route: auto-rotate via EXIF before sending to Claude
+  // so the diag reflects what production sees.
+  try {
+    const sharpMod = await import("sharp");
+    const sharp = sharpMod.default || sharpMod;
+    const meta = await sharp(buffer).metadata();
+    if (meta.orientation && meta.orientation !== 1) {
+      const before = buffer.length;
+      buffer = await sharp(buffer).rotate().jpeg({ quality: 92 }).toBuffer();
+      console.log(
+        `auto-rotated (EXIF=${meta.orientation}): ${before} → ${buffer.length} bytes`
+      );
+    }
+  } catch (e) {
+    console.warn("auto-rotate skipped:", e.message);
+  }
 
   // Build a stripped-down prompt focused only on multi-doc detection + boxes.
   const prompt = `Examine this scan and detect whether it contains multiple separate documents (receipts, invoices, etc).
@@ -1075,8 +1094,12 @@ Return ONLY the JSON object. No prose, no markdown.`;
     : "application/pdf";
   console.log(`\nCalling Claude (${mediaType})...`);
   const t0 = Date.now();
+  // Mirrors AI_MODEL_SMART in lib/ai/pricing.ts. Override via ENV.
+  const detectModel =
+    process.env.ANTHROPIC_MODEL_SMART || "claude-sonnet-4-6";
+  console.log(`model:     ${detectModel}`);
   const stream = client.messages.stream({
-    model: "claude-sonnet-4-20250514",
+    model: detectModel,
     max_tokens: 8000,
     temperature: 0,
     messages: [

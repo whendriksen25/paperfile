@@ -5,6 +5,7 @@ import {
   AI_MAX_TOKENS_DEFAULT,
   AI_MAX_TOKENS_EXTENDED,
   AI_EXTENDED_BETA_HEADER,
+  AI_MODEL_SMART,
 } from "./pricing";
 import type { DocumentExtraction } from "@/types/document";
 
@@ -367,7 +368,7 @@ export async function extractDocument(
   // (content, stop_reason, usage) is unchanged.
   const stream = client.messages.stream(
     {
-      model: "claude-sonnet-4-20250514",
+      model: AI_MODEL_SMART,
       // Default 64k tokens covers ~250-transaction bank statements,
       // ~80 pages of dense text, any realistic receipt/invoice.
       // Caller can opt into the 128k extended cap (with the beta header)

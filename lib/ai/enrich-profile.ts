@@ -1,5 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { PROFILE_ENRICHMENT_PROMPT } from "./prompts";
+import { AI_MODEL_SMART } from "./pricing";
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -59,7 +60,7 @@ export async function enrichProfileFromText(
   console.log("[ai/enrich-profile] enriching", url, "len:", text.length);
 
   const response = await client.messages.create({
-    model: "claude-sonnet-4-20250514",
+    model: AI_MODEL_SMART,
     max_tokens: 1024,
     temperature: 0,
     messages: [
