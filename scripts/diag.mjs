@@ -997,6 +997,147 @@ Rules:
   );
 }
 
+/**
+ * Run Claude's multi-doc detection on a doc's file and print the
+ * detected bounding boxes + per-doc summary. Doesn't touch the
+ * database — purely a debug tool for "is Claude seeing N receipts
+ * correctly on this scan?" before we attempt the full crop+re-extract.
+ *
+ *   npm run diag detect-multidoc <doc-id-prefix>
+ */
+async function cmdDetectMultidoc() {
+  const [idArg] = positional();
+  if (!idArg)
+    throw new Error("Usage: diag detect-multidoc <doc-id-or-prefix>");
+  if (!process.env.ANTHROPIC_API_KEY) {
+    console.error("ANTHROPIC_API_KEY missing");
+    process.exit(1);
+  }
+  const supabase = admin();
+  const docId = await resolveId(supabase, "documents", idArg);
+  if (!docId) {
+    console.error(`No documents row found matching "${idArg}"`);
+    process.exit(1);
+  }
+
+  // Load doc + its dropbox_path
+  const { data: doc } = await supabase
+    .from("documents")
+    .select("id, file_name, dropbox_path")
+    .eq("id", docId)
+    .single();
+  if (!doc?.dropbox_path) {
+    console.error("Doc has no dropbox_path");
+    process.exit(1);
+  }
+  console.log(`doc:       ${doc.id.slice(0, 8)}`);
+  console.log(`file_name: ${doc.file_name}`);
+  console.log(`path:      ${doc.dropbox_path}`);
+
+  // Download file
+  const { Dropbox } = await import("dropbox");
+  const patchedFetch = async (input, init) => {
+    const res = await fetch(input, init);
+    if (!res.buffer) res.buffer = async () => Buffer.from(await res.arrayBuffer());
+    return res;
+  };
+  const dbx = new Dropbox({
+    clientId: process.env.DROPBOX_APP_KEY,
+    clientSecret: process.env.DROPBOX_APP_SECRET,
+    refreshToken: process.env.DROPBOX_REFRESH_TOKEN,
+    fetch: patchedFetch,
+  });
+  console.log("\nDownloading...");
+  const dl = await dbx.filesDownload({ path: doc.dropbox_path });
+  const buffer = Buffer.from((dl.result).fileBinary);
+  console.log(`downloaded ${buffer.length} bytes`);
+
+  // Build a stripped-down prompt focused only on multi-doc detection + boxes.
+  const prompt = `Examine this scan and detect whether it contains multiple separate documents (receipts, invoices, etc).
+
+If MULTIPLE distinct documents on one scan, return STRICT JSON:
+{
+  "documents": [ { "sender": "...", "amount": <number|null>, "document_date": "YYYY-MM-DD|null", "summary": "one line" }, ... ],
+  "bounding_boxes": [ {"x": 0.0, "y": 0.0, "w": 1.0, "h": 0.5}, ... ]
+}
+
+If SINGLE doc, return: { "documents": [{single-doc-summary}], "bounding_boxes": [] }
+
+Coords are normalised 0..1, top-left origin. documents[i] and bounding_boxes[i] are index-aligned.
+Return ONLY the JSON object. No prose, no markdown.`;
+
+  // Call Claude
+  const { default: Anthropic } = await import("@anthropic-ai/sdk");
+  const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  const isImage = /\.(jpe?g|png|webp|gif|heic|heif)$/i.test(doc.file_name || "");
+  const mediaType = isImage
+    ? (/png$/i.test(doc.file_name) ? "image/png" : "image/jpeg")
+    : "application/pdf";
+  console.log(`\nCalling Claude (${mediaType})...`);
+  const t0 = Date.now();
+  const stream = client.messages.stream({
+    model: "claude-sonnet-4-20250514",
+    max_tokens: 8000,
+    temperature: 0,
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: prompt },
+          isImage
+            ? {
+                type: "image",
+                source: { type: "base64", media_type: mediaType, data: buffer.toString("base64") },
+              }
+            : {
+                type: "document",
+                source: { type: "base64", media_type: mediaType, data: buffer.toString("base64") },
+              },
+        ],
+      },
+    ],
+  });
+  const resp = await stream.finalMessage();
+  const ms = Date.now() - t0;
+  const text = resp.content.filter((b) => b.type === "text").map((b) => b.text).join("") || "";
+  console.log(`Claude responded in ${ms}ms · in=${resp.usage?.input_tokens} out=${resp.usage?.output_tokens} stop=${resp.stop_reason}`);
+
+  // Parse
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const body = (fence ? fence[1] : text).trim();
+  let parsed = null;
+  try {
+    parsed = JSON.parse(body);
+  } catch (e) {
+    console.log("\n!!! Could not parse JSON. Raw response:");
+    console.log(text);
+    return;
+  }
+
+  // Print
+  const docs = parsed.documents || [];
+  const boxes = parsed.bounding_boxes || [];
+  console.log(`\n=== Detected ${docs.length} document(s) ===`);
+  for (let i = 0; i < docs.length; i++) {
+    const d = docs[i];
+    const b = boxes[i];
+    console.log(`  #${i + 1}: ${d.sender || "—"} · €${d.amount ?? "—"} · ${d.document_date || "—"}`);
+    if (d.summary) console.log(`        ${d.summary}`);
+    if (b) {
+      console.log(
+        `        box: x=${(b.x * 100).toFixed(1)}% y=${(b.y * 100).toFixed(1)}% w=${(b.w * 100).toFixed(1)}% h=${(b.h * 100).toFixed(1)}%`
+      );
+    } else {
+      console.log(`        (no bounding box)`);
+    }
+  }
+  if (docs.length > 1 && boxes.length !== docs.length) {
+    console.log(
+      `\n⚠  bounding_boxes count (${boxes.length}) doesn't match documents count (${docs.length})`
+    );
+  }
+}
+
 async function cmdRetryFailed() {
   const limit = Number(flag("limit", "0")) || 0;
   const base = process.env.DEV_BASE_URL || "http://localhost:3002";
@@ -1448,7 +1589,7 @@ async function cmdDoc() {
   const { data, error } = await supabase
     .from("documents")
     .select(
-      "id, file_name, file_size_bytes, content_hash, dropbox_path, sender, document_type, document_date, purchase_category, profile_id, status, needs_action, action_type, action_summary, due_date, ai_input_tokens, ai_output_tokens, ai_stop_reason, ai_truncated, created_at"
+      "id, file_name, file_size_bytes, content_hash, dropbox_path, sender, document_type, document_date, purchase_category, primary_profile_id, status, needs_action, action_type, action_summary, due_date, ai_input_tokens, ai_output_tokens, ai_stop_reason, ai_truncated, created_at"
     )
     .eq("id", fullId)
     .single();
@@ -1466,7 +1607,7 @@ async function cmdDoc() {
   console.log(`document_type:   ${data.document_type}`);
   console.log(`document_date:   ${data.document_date}`);
   console.log(`purchase_cat:    ${data.purchase_category || "—"}`);
-  console.log(`profile_id:      ${data.profile_id ?? "—"}`);
+  console.log(`profile_id:      ${data.primary_profile_id ?? "—"}`);
   console.log(`status:          ${data.status}`);
   console.log(`needs_action:    ${data.needs_action}`);
   console.log(`action_type:     ${data.action_type || "—"}`);
@@ -1756,6 +1897,7 @@ Subcommands:
   taxonomy-backfill [--dry-run]
   taxonomy-cleanup  [--apply]
   cleanup-multi-doc-dupes [--dry-run]
+  detect-multidoc <doc-id-or-prefix>
   pay-actions    [--limit=50]
   match-debug    <tx-id-or-prefix>
   check-deploy
@@ -1784,6 +1926,7 @@ const dispatch = {
   "taxonomy-backfill": cmdTaxonomyBackfill,
   "taxonomy-cleanup": cmdTaxonomyCleanup,
   "cleanup-multi-doc-dupes": cmdCleanupMultiDocDupes,
+  "detect-multidoc": cmdDetectMultidoc,
   "pay-actions": cmdPayActions,
   "match-debug": cmdMatchDebug,
   "check-deploy": cmdCheckDeploy,
