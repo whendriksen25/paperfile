@@ -1,0 +1,967 @@
+import Anthropic from "@anthropic-ai/sdk";
+import type { SupabaseClient } from "@supabase/supabase-js";
+import { AI_MODEL_SMART } from "@/lib/ai/pricing";
+import { getStorage } from "@/lib/storage";
+import { extractDocument, isMultiDoc, type BoundingBox } from "@/lib/ai/extract";
+import {
+  loadTaxonomySnapshot,
+  buildTaxonomyHint,
+} from "@/lib/services/taxonomy";
+import type { DocumentExtraction } from "@/types/document";
+
+/**
+ * Background-job orchestration for "Re-analyse full scan" on a
+ * multi-receipt scan.
+ *
+ * Why this exists: the inline /api/analyze/[id] route does detection +
+ * crop + per-crop re-extraction in one Vercel function call. On a 4+
+ * receipt scan that exceeds the 60s Hobby ceiling. Splitting the work
+ * into one HTTP call per crop keeps each call under ~30s.
+ *
+ * Two exports:
+ *   - prepareAnalyzeJob — synchronous (~10s): download, auto-rotate,
+ *     detect multi-doc, crop, upload crops, create the analyze_jobs row.
+ *     Returns { jobId, totalCrops } or { jobId: null, singleDoc: true }
+ *     when only 1 doc was detected (caller falls back to inline analyze).
+ *   - processNextAnalyzeStep — claims the next pending step, re-extracts
+ *     that one crop via Sonnet (~20s), creates the child doc row,
+ *     increments completed_crops. On the last step, runs the dedup-on-
+ *     resplit cleanup that the existing inline route does.
+ *
+ * Mirrors the reconciliation_jobs pattern (017): poll-driven worker
+ * advance, atomic claim of next pending step, finalize on last step.
+ */
+
+// =============================================================================
+// Multi-doc detection prompt — kept in lockstep with the diag script's
+// cmdDetectMultidoc (scripts/diag.mjs). Behaviour should be identical
+// so "the diag found 4 receipts" guarantees "the job will too".
+// =============================================================================
+const DETECT_PROMPT = `Examine this scan and detect whether it contains multiple separate documents (receipts, invoices, etc).
+
+If MULTIPLE distinct documents on one scan, return STRICT JSON:
+{
+  "documents": [ { "sender": "...", "amount": <number|null>, "document_date": "YYYY-MM-DD|null", "summary": "one line" }, ... ],
+  "bounding_boxes": [ {"x": 0.0, "y": 0.0, "w": 1.0, "h": 0.5}, ... ]
+}
+
+If SINGLE doc, return: { "documents": [{single-doc-summary}], "bounding_boxes": [] }
+
+Coords are normalised 0..1, top-left origin. documents[i] and bounding_boxes[i] are index-aligned.
+Return ONLY the JSON object. No prose, no markdown.`;
+
+interface DetectedDoc {
+  sender: string | null;
+  amount: number | null;
+  document_date: string | null;
+  summary: string | null;
+}
+
+interface DetectResult {
+  documents: DetectedDoc[];
+  bounding_boxes: BoundingBox[];
+}
+
+interface StepState {
+  index: number;
+  status: "pending" | "processing" | "done" | "failed";
+  started_at?: string | null;
+  completed_at?: string | null;
+  child_doc_id?: string | null;
+  error?: string | null;
+  sender_hint?: string | null;
+  amount_hint?: number | null;
+}
+
+interface JobPayload {
+  from_original: boolean;
+  force_profile: boolean;
+  original_path: string;
+  detected_docs: DetectedDoc[];
+  boxes: BoundingBox[];
+  crop_paths: string[];
+}
+
+export interface PrepareAnalyzeJobResult {
+  jobId: string | null;
+  totalCrops: number;
+  singleDoc: boolean;
+  /** When singleDoc is true, the caller should fall back to the
+   * existing synchronous /api/analyze/[id] route. We don't run that
+   * inline here because it would re-introduce the very 60s-budget
+   * concern this job pattern exists to solve (single-doc inline
+   * analyze comfortably fits, but routing through a separate request
+   * keeps the prepare endpoint cheap + cacheable). */
+  reason?: string;
+}
+
+export interface AnalyzeStepResult {
+  status: "pending" | "processing" | "done" | "failed";
+  done: boolean;
+  completed_crops: number;
+  total_crops: number;
+  step?: {
+    index: number;
+    child_doc_id: string | null;
+    sender: string | null;
+    amount: number | null;
+    error?: string | null;
+  };
+}
+
+interface JobRow {
+  id: string;
+  user_id: string;
+  document_id: string;
+  status: "pending" | "processing" | "done" | "failed";
+  phase: string | null;
+  total_crops: number;
+  completed_crops: number;
+  payload: JobPayload;
+  steps_state: StepState[];
+}
+
+/**
+ * Call Sonnet with the detection-only prompt. Same model + temp +
+ * media-type handling as scripts/diag.mjs cmdDetectMultidoc.
+ * Typically returns in ~5-10s on a phone-quality image.
+ */
+async function detectMultiDoc(
+  buffer: Buffer,
+  fileName: string
+): Promise<DetectResult> {
+  const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  const isImage = /\.(jpe?g|png|webp|gif|heic|heif)$/i.test(fileName);
+  const mediaType: "image/png" | "image/jpeg" | "application/pdf" = isImage
+    ? /png$/i.test(fileName)
+      ? "image/png"
+      : "image/jpeg"
+    : "application/pdf";
+
+  const contentBlock = isImage
+    ? ({
+        type: "image" as const,
+        source: {
+          type: "base64" as const,
+          media_type: mediaType as "image/png" | "image/jpeg",
+          data: buffer.toString("base64"),
+        },
+      })
+    : ({
+        type: "document" as const,
+        source: {
+          type: "base64" as const,
+          media_type: "application/pdf" as const,
+          data: buffer.toString("base64"),
+        },
+      });
+
+  const stream = client.messages.stream({
+    model: AI_MODEL_SMART,
+    max_tokens: 8000,
+    temperature: 0,
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: DETECT_PROMPT },
+          contentBlock,
+        ],
+      },
+    ],
+  });
+  const resp = await stream.finalMessage();
+  const text =
+    resp.content
+      .filter((b) => b.type === "text")
+      .map((b) => (b as { text: string }).text)
+      .join("") || "";
+
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const body = (fence ? fence[1] : text).trim();
+  let parsed: { documents?: DetectedDoc[]; bounding_boxes?: BoundingBox[] };
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    // Treat unparseable detection as "single doc" — caller falls back
+    // to the existing inline analyze path. Better than failing the job.
+    return { documents: [], bounding_boxes: [] };
+  }
+  const docs = Array.isArray(parsed.documents) ? parsed.documents : [];
+  const boxes = Array.isArray(parsed.bounding_boxes)
+    ? parsed.bounding_boxes
+    : [];
+  return { documents: docs, bounding_boxes: boxes };
+}
+
+/** Build the per-crop Dropbox path: {stem}_part{i+1}{ext} alongside the
+ * original. Matches the convention the inline analyze route uses. */
+function buildCropPath(originalPath: string, index: number): string {
+  const dotIdx = originalPath.lastIndexOf(".");
+  const stem = dotIdx > 0 ? originalPath.slice(0, dotIdx) : originalPath;
+  const ext = dotIdx > 0 ? originalPath.slice(dotIdx) : ".jpg";
+  return `${stem}_part${index + 1}${ext}`;
+}
+
+// =============================================================================
+// prepareAnalyzeJob — synchronous prepare step
+// =============================================================================
+
+/**
+ * Run the synchronous portion of a "re-analyse full scan" request:
+ * download the original, detect multi-doc, crop, upload crops, insert
+ * the analyze_jobs row.
+ *
+ * If only 1 document is detected, returns { jobId: null, singleDoc: true }
+ * — the caller falls back to the existing synchronous /api/analyze/[id]
+ * route (which is fine because the multi-step background job ONLY exists
+ * to fit multiple per-crop AI calls inside Vercel's 60s ceiling; for one
+ * doc the inline route comfortably fits).
+ */
+export async function prepareAnalyzeJob(
+  admin: SupabaseClient,
+  opts: {
+    documentId: string;
+    userId: string;
+    fromOriginal: boolean;
+    forceProfile: boolean;
+  }
+): Promise<PrepareAnalyzeJobResult> {
+  const { documentId, userId, fromOriginal, forceProfile } = opts;
+
+  if (!process.env.ANTHROPIC_API_KEY) {
+    throw new Error("ANTHROPIC_API_KEY missing");
+  }
+
+  // Cancel any previously-pending analyze jobs for this document so the
+  // worker doesn't pick up stale steps from a prior run.
+  await admin
+    .from("analyze_jobs")
+    .update({ status: "failed", error: "Superseded by new re-analyse run" })
+    .eq("document_id", documentId)
+    .in("status", ["pending", "processing"]);
+
+  // 1. Load the parent doc.
+  const { data: docRaw, error: docErr } = await admin
+    .from("documents")
+    .select("*")
+    .eq("id", documentId)
+    .eq("user_id", userId)
+    .maybeSingle();
+  if (docErr || !docRaw) {
+    throw new Error("Document not found");
+  }
+  const doc = docRaw as {
+    id: string;
+    user_id: string;
+    dropbox_path: string;
+    file_name: string | null;
+    storage_provider: "dropbox" | "gdrive" | "onedrive" | "s3" | "local";
+    extracted_fields: Record<string, unknown> | null;
+  };
+
+  // 2. Resolve which file to download. Same logic the inline analyze
+  // route uses for ?from_original=1, including the legacy fallback for
+  // pre-crop multi-doc parents whose _original_scan_path wasn't stored.
+  const ef0 = doc.extracted_fields || {};
+  const originalScanPathStored =
+    (ef0["_original_scan_path"] as string | undefined) || null;
+  let downloadPath = doc.dropbox_path;
+  if (fromOriginal) {
+    if (originalScanPathStored) {
+      downloadPath = originalScanPathStored;
+    } else {
+      // Legacy fallback: pre-crop multi-doc parents kept the original
+      // scan AT dropbox_path (since crops weren't a thing yet). Detect
+      // by checking for children. If children exist + no stored path,
+      // dropbox_path IS the original.
+      const { data: kidsCheck } = await admin
+        .from("documents")
+        .select("id")
+        .eq("parent_document_id", documentId)
+        .limit(1);
+      if ((kidsCheck || []).length > 0) {
+        downloadPath = doc.dropbox_path;
+        console.log(
+          "[analyze-job] from_original=1 with no _original_scan_path; using dropbox_path as legacy original full scan"
+        );
+      } else {
+        console.warn(
+          "[analyze-job] from_original=1 but no _original_scan_path AND no children — falling back to dropbox_path"
+        );
+      }
+    }
+  }
+
+  const storage = getStorage(doc.storage_provider);
+  let buffer = await storage.downloadFile(downloadPath);
+
+  // 3. Auto-rotate before sending to Claude. EXIF-stripped phone
+  // uploads otherwise reach Sonnet sideways and tank detection.
+  const { autoOrientImage } = await import("@/lib/services/image-orient");
+  const oriented = await autoOrientImage(buffer, doc.file_name || "scan.jpg");
+  if (oriented.rotated) {
+    console.log(
+      `[analyze-job] auto-rotated ${doc.file_name} by ${oriented.degrees}°`
+    );
+    buffer = oriented.buffer;
+  }
+
+  // 4. Detection. ~5-10s, comfortably inside the prepare-route budget.
+  console.log("[analyze-job] running multi-doc detection on", documentId);
+  const detect = await detectMultiDoc(buffer, doc.file_name || "scan.jpg");
+  const docs = detect.documents;
+  const boxes = detect.bounding_boxes;
+
+  // 5. Single-doc fall-through. Caller decides what to do next (typically
+  // POST to the existing inline /api/analyze/[id] route).
+  if (docs.length <= 1) {
+    console.log(
+      "[analyze-job] only 1 doc detected — no job created, caller should fall back to inline analyze"
+    );
+    return {
+      jobId: null,
+      totalCrops: 0,
+      singleDoc: true,
+      reason:
+        docs.length === 0 ? "detection returned 0 docs" : "single doc only",
+    };
+  }
+
+  // 6. Crop + upload. Only images support cropping (sharp can't open
+  // PDFs); if the original is a PDF we still create the job but with
+  // crop_paths set to the original path so per-crop extraction sees the
+  // shared image. In practice multi-receipt scans are always images.
+  const isImage = /\.(jpe?g|png|webp|gif|heic|heif)$/i.test(
+    doc.file_name || ""
+  );
+  const cropPaths: string[] = [];
+  if (
+    isImage &&
+    boxes.length === docs.length &&
+    boxes.length > 0
+  ) {
+    try {
+      const { cropRegions } = await import("@/lib/services/image-crop");
+      const crops = await cropRegions(buffer, boxes);
+      for (let i = 0; i < crops.length; i++) {
+        // Crop paths sit alongside the original scan, named
+        // {stem}_part{i+1}{ext} — same convention as the inline route.
+        // Base the path off downloadPath (the original) so siblings line
+        // up in Dropbox; the inline route does the same.
+        const cropPath = buildCropPath(downloadPath, i);
+        try {
+          await storage.uploadAt({
+            buffer: crops[i],
+            path: cropPath,
+          });
+          cropPaths[i] = cropPath;
+        } catch (e) {
+          console.warn(
+            `[analyze-job] crop ${i + 1} upload failed, will fall back to original path:`,
+            e instanceof Error ? e.message : String(e)
+          );
+          cropPaths[i] = downloadPath; // fallback: per-crop step uses shared image
+        }
+      }
+    } catch (e) {
+      console.warn(
+        "[analyze-job] crop step failed — every step will use the shared image:",
+        e
+      );
+      // Fall through: cropPaths will be filled with the original.
+    }
+  }
+  // Fill any gaps with the original path so every step has SOMETHING.
+  for (let i = 0; i < docs.length; i++) {
+    if (!cropPaths[i]) cropPaths[i] = downloadPath;
+  }
+
+  // 7. Build per-step state with hints so the UI can show "OCR'ing
+  // receipt 1 of 4 — EKOPLAZA €31.72" before extraction even finishes.
+  const stepsState: StepState[] = docs.map((d, i) => ({
+    index: i,
+    status: "pending",
+    sender_hint: d?.sender ?? null,
+    amount_hint:
+      typeof d?.amount === "number" && Number.isFinite(d.amount)
+        ? d.amount
+        : null,
+  }));
+
+  // 8. Insert the analyze_jobs row. status='processing' from the start
+  // because the prepare step already did meaningful work (download +
+  // detect + crop + upload); only per-step extraction remains.
+  const payload: JobPayload = {
+    from_original: fromOriginal,
+    force_profile: forceProfile,
+    original_path: downloadPath,
+    detected_docs: docs,
+    boxes,
+    crop_paths: cropPaths,
+  };
+
+  const { data: jobRow, error: insErr } = await admin
+    .from("analyze_jobs")
+    .insert({
+      user_id: userId,
+      document_id: documentId,
+      status: "processing",
+      phase: "extracting",
+      total_crops: docs.length,
+      completed_crops: 0,
+      payload,
+      steps_state: stepsState,
+    })
+    .select("id")
+    .single();
+  if (insErr || !jobRow) {
+    throw new Error(`Failed to create analyze_jobs row: ${insErr?.message}`);
+  }
+
+  // 9. Mark parent doc as processing so the inbox card shows a spinner
+  // (mirrors the inline route's first action).
+  await admin
+    .from("documents")
+    .update({ status: "processing" })
+    .eq("id", documentId);
+
+  return {
+    jobId: (jobRow as { id: string }).id,
+    totalCrops: docs.length,
+    singleDoc: false,
+  };
+}
+
+// =============================================================================
+// processNextAnalyzeStep — worker, called per-step from the step route
+// =============================================================================
+
+/**
+ * Process one pending step of an analyze job. One call = one per-crop
+ * extraction + one child doc insert (or, for index 0, an update to the
+ * parent doc itself — see below).
+ *
+ * Conventions:
+ *   - Step 0 corresponds to crop[0], which by convention REPLACES the
+ *     parent doc's content. The parent already exists as a row; we
+ *     update its extracted fields + repoint its dropbox_path to crop[0].
+ *     This mirrors the inline route's behaviour.
+ *   - Steps 1..N each create a new child document row with
+ *     parent_document_id = parent.id and dropbox_path = crop[i].
+ *   - When the last step finishes, we run the dedup-on-resplit cleanup
+ *     (delete OLD children + their actions that weren't spawned by this
+ *     job), persist _original_scan_path on the parent, and flip the job
+ *     to 'done'.
+ */
+export async function processNextAnalyzeStep(
+  admin: SupabaseClient,
+  jobId: string
+): Promise<AnalyzeStepResult> {
+  // 1. Load the job + claim the next pending step BEFORE doing work.
+  const { data: jobRaw, error: jErr } = await admin
+    .from("analyze_jobs")
+    .select("*")
+    .eq("id", jobId)
+    .single();
+  if (jErr || !jobRaw) {
+    return {
+      status: "failed",
+      done: false,
+      completed_crops: 0,
+      total_crops: 0,
+    };
+  }
+  const job = jobRaw as JobRow;
+
+  if (job.status === "done" || job.status === "failed") {
+    return {
+      status: job.status,
+      done: job.status === "done",
+      completed_crops: job.completed_crops,
+      total_crops: job.total_crops,
+    };
+  }
+
+  const nextStep = (job.steps_state || []).find(
+    (s) => s.status === "pending"
+  );
+  if (!nextStep) {
+    // No pending step — finalize if not already done.
+    await finalizeJob(admin, job);
+    return {
+      status: "done",
+      done: true,
+      completed_crops: job.completed_crops,
+      total_crops: job.total_crops,
+    };
+  }
+  const stepIndex = nextStep.index;
+  const nowStart = new Date().toISOString();
+
+  // Atomic-ish claim: rewrite steps_state so this index is 'processing'.
+  // (Supabase doesn't give us a per-element atomic operation; we write
+  // back the whole array. Two concurrent workers could race here, but
+  // the UI only ever has one poller in flight at a time and the GET
+  // endpoint's 90s stuck-step guard prevents double-fire under normal
+  // conditions.)
+  const claimedSteps = job.steps_state.map((s) =>
+    s.index === stepIndex
+      ? { ...s, status: "processing" as const, started_at: nowStart }
+      : s
+  );
+  await admin
+    .from("analyze_jobs")
+    .update({
+      steps_state: claimedSteps,
+      phase: "extracting",
+    })
+    .eq("id", job.id);
+
+  // 2. Per-step work — wrap so on any throw we mark THIS step failed
+  // but keep the job alive (UI can offer a retry button).
+  try {
+    return await runStep(admin, job, stepIndex);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error(
+      `[analyze-job] step ${stepIndex} failed for job ${jobId}:`,
+      msg
+    );
+    const failedSteps = claimedSteps.map((s) =>
+      s.index === stepIndex
+        ? {
+            ...s,
+            status: "failed" as const,
+            completed_at: new Date().toISOString(),
+            error: msg.slice(0, 500),
+          }
+        : s
+    );
+    await admin
+      .from("analyze_jobs")
+      .update({ steps_state: failedSteps })
+      .eq("id", job.id);
+    return {
+      status: "processing",
+      done: false,
+      completed_crops: job.completed_crops,
+      total_crops: job.total_crops,
+      step: {
+        index: stepIndex,
+        child_doc_id: null,
+        sender: nextStep.sender_hint ?? null,
+        amount: nextStep.amount_hint ?? null,
+        error: msg.slice(0, 500),
+      },
+    };
+  }
+}
+
+async function runStep(
+  admin: SupabaseClient,
+  job: JobRow,
+  stepIndex: number
+): Promise<AnalyzeStepResult> {
+  // Load the parent doc fresh — we need its full set of fields for
+  // child inserts (storage_provider, file_name, content_hash, etc.).
+  const { data: parentRaw } = await admin
+    .from("documents")
+    .select("*")
+    .eq("id", job.document_id)
+    .single();
+  if (!parentRaw) {
+    throw new Error("Parent document disappeared");
+  }
+  const parent = parentRaw as {
+    id: string;
+    user_id: string;
+    dropbox_path: string;
+    dropbox_shared_link: string | null;
+    storage_provider: "dropbox" | "gdrive" | "onedrive" | "s3" | "local";
+    file_name: string | null;
+    file_size_bytes: number | null;
+    content_hash: string | null;
+    file_type: string | null;
+    primary_profile_id: number | null;
+    extracted_fields: Record<string, unknown> | null;
+    tags: string[] | null;
+  };
+
+  const storage = getStorage(parent.storage_provider);
+  const cropPath = job.payload.crop_paths[stepIndex] || job.payload.original_path;
+
+  // Download the crop, then re-extract via Sonnet at full resolution.
+  const cropBuffer = await storage.downloadFile(cropPath);
+  const taxonomySnapshot = await loadTaxonomySnapshot(admin, job.user_id);
+  const taxonomyHint = buildTaxonomyHint(taxonomySnapshot);
+
+  console.log(
+    `[analyze-job] step ${stepIndex + 1}/${job.total_crops}: extracting ${cropPath}`
+  );
+  const ex = await extractDocument(
+    cropBuffer,
+    `${parent.file_name || "crop"}_part${stepIndex + 1}.jpg`,
+    { taxonomyHint }
+  );
+  const d = ex.data;
+  if (!d || "error" in d || isMultiDoc(d)) {
+    // Per-crop extraction blew up. Fall back to the detection snapshot
+    // (sender/amount only) so we still spawn a row with the user-visible
+    // hints — better than failing the whole step. Caller can re-trigger
+    // a per-crop re-extract from the UI later.
+    const hint = job.payload.detected_docs[stepIndex];
+    // DocumentExtraction requires document_type:string + confidence:number,
+    // so fill in safe defaults; the child row update logic below tolerates
+    // null/empty values gracefully and the user can refile from the UI.
+    const fallback: DocumentExtraction = {
+      document_type: "other",
+      document_subtype: null,
+      confidence: 0,
+      document_date: hint?.document_date || null,
+      sender: hint?.sender || null,
+      recipient: null,
+      language: null,
+      profile_hint: null,
+      amount: hint?.amount ?? null,
+      currency: null,
+      purchase_category: null,
+      title: hint?.summary || null,
+      summary: hint?.summary || null,
+      tags: [],
+      extracted_fields: {},
+      ocr_text: undefined,
+      needs_action: false,
+      action_type: null,
+      due_date: null,
+      action_summary: null,
+    };
+    return finishStep(admin, job, stepIndex, parent, cropPath, fallback, true);
+  }
+  return finishStep(
+    admin,
+    job,
+    stepIndex,
+    parent,
+    cropPath,
+    d as DocumentExtraction,
+    false
+  );
+}
+
+/**
+ * Persist the per-crop extraction + advance the job. For step index 0,
+ * the parent doc itself gets updated. For step index > 0, a new child
+ * doc row is inserted (parent_document_id = parent.id). When this is
+ * the last step, the dedup-on-resplit cleanup runs and the job flips
+ * to 'done'.
+ */
+async function finishStep(
+  admin: SupabaseClient,
+  job: JobRow,
+  stepIndex: number,
+  parent: {
+    id: string;
+    user_id: string;
+    dropbox_path: string;
+    dropbox_shared_link: string | null;
+    storage_provider: "dropbox" | "gdrive" | "onedrive" | "s3" | "local";
+    file_name: string | null;
+    file_size_bytes: number | null;
+    content_hash: string | null;
+    file_type: string | null;
+    primary_profile_id: number | null;
+    extracted_fields: Record<string, unknown> | null;
+    tags: string[] | null;
+  },
+  cropPath: string,
+  extraction: DocumentExtraction,
+  isFallback: boolean
+): Promise<AnalyzeStepResult> {
+  const now = new Date().toISOString();
+  let childDocId: string | null = null;
+  const isFirst = stepIndex === 0;
+
+  // payment_status overrides (mirror inline analyze route).
+  const ef = extraction.extracted_fields || {};
+  const paymentStatus = String(
+    (ef as Record<string, unknown>)["payment_status"] || ""
+  ).toLowerCase();
+  const isPaid = paymentStatus === "paid";
+  const isUnpaid =
+    paymentStatus === "unpaid" || paymentStatus === "partial";
+  const needsAction = isPaid
+    ? false
+    : isUnpaid
+      ? true
+      : !!extraction.needs_action;
+  const actionType =
+    extraction.action_type || (needsAction ? "pay" : null);
+
+  if (isFirst) {
+    // Step 0 — update the parent row in place. This row becomes the
+    // first receipt of the new split. The dedup cleanup at the end of
+    // the job will remove old children that no longer correspond.
+    //
+    // The parent's _original_scan_path stays set (or gets set if it
+    // wasn't already) so future "Re-analyse full scan" clicks know
+    // where the original lives. dropbox_path is repointed to crop[0]
+    // so the inbox preview matches the parent's extracted content.
+    const existingEf =
+      (parent.extracted_fields as Record<string, unknown> | null) || {};
+    const originalPath = job.payload.original_path;
+    let shareLink: string | null = parent.dropbox_shared_link;
+    try {
+      const storage = getStorage(parent.storage_provider);
+      shareLink = await storage.getOrCreateShareLink(cropPath);
+    } catch (e) {
+      console.warn("[analyze-job] share link refresh for crop[0] failed", e);
+    }
+
+    const updates: Record<string, unknown> = {
+      dropbox_path: cropPath,
+      dropbox_shared_link: shareLink,
+      document_type: extraction.document_type || null,
+      document_subtype: extraction.document_subtype || null,
+      confidence: extraction.confidence ?? null,
+      document_date: extraction.document_date || null,
+      sender: extraction.sender || null,
+      recipient: extraction.recipient || null,
+      person: extraction.profile_hint || null,
+      language: extraction.language || null,
+      amount: extraction.amount ?? null,
+      currency: extraction.currency || null,
+      purchase_category: extraction.purchase_category || null,
+      title: extraction.title || null,
+      summary: extraction.summary || null,
+      tags: extraction.tags || [],
+      extracted_fields: {
+        ...(extraction.extracted_fields || {}),
+        // Always re-stamp the original full-scan path so the
+        // "Re-analyse full scan" button keeps working on this row
+        // even after multiple re-splits.
+        _original_scan_path: originalPath,
+      },
+      ocr_text: extraction.ocr_text || null,
+      needs_action: needsAction,
+      action_type: needsAction ? actionType || "other" : null,
+      due_date: extraction.due_date || null,
+      action_summary:
+        needsAction && extraction.action_summary
+          ? extraction.action_summary
+          : null,
+      status: "processed",
+    };
+    const { error: upErr } = await admin
+      .from("documents")
+      .update(updates)
+      .eq("id", parent.id);
+    if (upErr) throw upErr;
+    childDocId = parent.id;
+  } else {
+    // Steps 1..N — insert a new child doc row.
+    let shareLink: string | null = parent.dropbox_shared_link;
+    try {
+      const storage = getStorage(parent.storage_provider);
+      shareLink = await storage.getOrCreateShareLink(cropPath);
+    } catch (e) {
+      console.warn(
+        `[analyze-job] share link for child crop ${stepIndex + 1} failed`,
+        e
+      );
+    }
+    const childInsert = {
+      user_id: parent.user_id,
+      dropbox_path: cropPath,
+      dropbox_shared_link: shareLink,
+      storage_provider: parent.storage_provider,
+      file_name: parent.file_name,
+      file_size_bytes: parent.file_size_bytes,
+      content_hash: parent.content_hash,
+      file_type: parent.file_type,
+      parent_document_id: parent.id,
+      // No per-child profile re-rank here — keep the prepare cheap.
+      // The user can refile any child individually if the parent's
+      // profile doesn't fit. (The inline route does run suggestProfile
+      // per child; we skip it to keep the per-step budget < 30s.)
+      primary_profile_id: parent.primary_profile_id,
+      document_type: extraction.document_type || null,
+      document_subtype: extraction.document_subtype || null,
+      confidence: extraction.confidence ?? null,
+      document_date: extraction.document_date || null,
+      sender: extraction.sender || null,
+      recipient: extraction.recipient || null,
+      person: extraction.profile_hint || null,
+      language: extraction.language || null,
+      amount: extraction.amount ?? null,
+      currency: extraction.currency || null,
+      purchase_category: extraction.purchase_category || null,
+      title: extraction.title || null,
+      summary: extraction.summary || null,
+      tags: extraction.tags || [],
+      extracted_fields: extraction.extracted_fields || {},
+      ocr_text: extraction.ocr_text || null,
+      needs_action: needsAction,
+      action_type: needsAction ? actionType : null,
+      due_date: extraction.due_date || null,
+      action_summary: needsAction ? extraction.action_summary || null : null,
+      status: "processed",
+      needs_review: false,
+      review_notes: isFallback
+        ? "Multi-doc child: per-crop extraction failed; populated from detection summary only. Re-analyse this row to retry."
+        : null,
+    };
+    const { data: insRow, error: insErr } = await admin
+      .from("documents")
+      .insert(childInsert)
+      .select("id")
+      .single();
+    if (insErr) throw insErr;
+    childDocId = (insRow as { id: string }).id;
+
+    // Spawn the child's action row if needed.
+    if (needsAction && extraction.action_summary && actionType) {
+      try {
+        await admin.from("actions").insert({
+          user_id: parent.user_id,
+          document_id: childDocId,
+          profile_id: parent.primary_profile_id,
+          action_type: actionType,
+          summary: extraction.action_summary,
+          due_date: extraction.due_date || null,
+          status: "open",
+        });
+      } catch (e) {
+        console.warn("[analyze-job] child action insert failed", e);
+      }
+    }
+  }
+
+  // Advance job state — mark this step done, bump completed_crops.
+  const updatedSteps = job.steps_state.map((s) =>
+    s.index === stepIndex
+      ? {
+          ...s,
+          status: "done" as const,
+          completed_at: now,
+          child_doc_id: childDocId,
+        }
+      : s
+  );
+  const newCompleted = job.completed_crops + 1;
+  const allDone = newCompleted >= job.total_crops;
+
+  await admin
+    .from("analyze_jobs")
+    .update({
+      steps_state: updatedSteps,
+      completed_crops: newCompleted,
+      phase: allDone ? "finalising" : "extracting",
+    })
+    .eq("id", job.id);
+
+  if (allDone) {
+    // Last step done → run the dedup-on-resplit cleanup and flip status.
+    await finalizeJob(admin, {
+      ...job,
+      steps_state: updatedSteps,
+      completed_crops: newCompleted,
+    });
+  }
+
+  return {
+    status: allDone ? "done" : "processing",
+    done: allDone,
+    completed_crops: newCompleted,
+    total_crops: job.total_crops,
+    step: {
+      index: stepIndex,
+      child_doc_id: childDocId,
+      sender: extraction.sender || null,
+      amount: extraction.amount ?? null,
+    },
+  };
+}
+
+/**
+ * Final cleanup: when every step is done, remove any OLD children that
+ * existed before this re-split and were NOT spawned by this job. Match
+ * the inline analyze route's dedup-on-resplit behaviour.
+ *
+ * Safe to call more than once — it queries against current child_doc_ids
+ * in steps_state and only deletes children outside that set.
+ */
+async function finalizeJob(
+  admin: SupabaseClient,
+  job: {
+    id: string;
+    document_id: string;
+    user_id: string;
+    steps_state: StepState[];
+    completed_crops: number;
+    total_crops: number;
+  }
+): Promise<void> {
+  // Skip if already done (idempotent re-runs from the GET-route auto-kick).
+  const { data: cur } = await admin
+    .from("analyze_jobs")
+    .select("status")
+    .eq("id", job.id)
+    .maybeSingle();
+  if (cur && (cur as { status: string }).status === "done") return;
+
+  // Spawned IDs include the parent (step 0 → parent.id) and every child.
+  const spawnedIds = new Set<string>();
+  for (const s of job.steps_state) {
+    if (s.child_doc_id) spawnedIds.add(s.child_doc_id);
+  }
+  spawnedIds.add(job.document_id); // parent is always kept
+
+  try {
+    const { data: existingKids } = await admin
+      .from("documents")
+      .select("id")
+      .eq("parent_document_id", job.document_id);
+    const stale = (existingKids || [])
+      .map((r) => (r as { id: string }).id)
+      .filter((id) => !spawnedIds.has(id));
+    if (stale.length > 0) {
+      await admin.from("actions").delete().in("document_id", stale);
+      await admin.from("documents").delete().in("id", stale);
+      console.log(
+        `[analyze-job] deleted ${stale.length} stale child doc(s) after re-split for ${job.document_id}`
+      );
+    }
+  } catch (e) {
+    console.warn("[analyze-job] dedup-on-resplit cleanup failed:", e);
+  }
+
+  // Activity log entry — mirrors the inline route's multi_doc_split log.
+  try {
+    const childIds = job.steps_state
+      .filter((s) => s.index !== 0 && s.child_doc_id)
+      .map((s) => s.child_doc_id as string);
+    await admin.from("maintenance_log").insert({
+      user_id: job.user_id,
+      document_id: job.document_id,
+      kind: "multi_doc_split",
+      reason: `Re-analyse full scan: split into ${job.total_crops} documents`,
+      payload: {
+        parent_document_id: job.document_id,
+        child_document_ids: childIds,
+        total_count: job.total_crops,
+        via: "analyze_job",
+      },
+    });
+  } catch (e) {
+    console.warn("[analyze-job] multi_doc_split log insert failed", e);
+  }
+
+  await admin
+    .from("analyze_jobs")
+    .update({
+      status: "done",
+      phase: "done",
+    })
+    .eq("id", job.id);
+}

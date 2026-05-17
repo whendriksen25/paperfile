@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Sparkles, FolderInput, Wand2, Loader2, X } from "lucide-react";
 import { Spinner } from "@/components/ui/spinner";
+import { AnalyzeProgressPanel } from "@/components/inbox/analyze-progress-panel";
 import type { ProfileRow } from "@/types/document";
 
 /**
@@ -45,6 +46,7 @@ export function RefileWidget({
   currentDocumentType,
   hasOriginalScan,
   isMultiDocParent,
+  activeAnalyzeJobId,
 }: {
   documentId: string;
   currentProfileId: number | null;
@@ -57,6 +59,11 @@ export function RefileWidget({
    * _original_scan_path but their dropbox_path IS the original scan,
    * and the analyze route knows to handle that legacy fallback). */
   isMultiDocParent?: boolean;
+  /** When a "Re-analyse full scan" job is already pending/processing
+   * on the server (e.g. the user reloaded the page mid-job), pass its
+   * id here so the panel resumes polling instead of leaving the user
+   * staring at a stale UI. */
+  activeAnalyzeJobId?: string | null;
 }) {
   const router = useRouter();
   const [profiles, setProfiles] = useState<ProfileRow[]>([]);
@@ -65,6 +72,12 @@ export function RefileWidget({
   const [saving, setSaving] = useState(false);
   const [reanalysing, setReanalysing] = useState(false);
   const [reanalysingFull, setReanalysingFull] = useState(false);
+  // Active analyze-job id. Mirrors the activeAnalyzeJobId server-side
+  // prop so a page reload mid-job resumes the panel automatically; set
+  // imperatively when the user clicks "Re-analyse full scan".
+  const [analyzeJobId, setAnalyzeJobId] = useState<string | null>(
+    activeAnalyzeJobId || null
+  );
   const [error, setError] = useState<string | null>(null);
   const [doneMessage, setDoneMessage] = useState<string | null>(null);
   // After save: if siblings exist with a different classification, show a
@@ -176,38 +189,62 @@ export function RefileWidget({
   }
 
   /** "Re-analyse full scan" — only available when this row is the parent
-   * of a multi-doc crop split. Tells the analyze route to download the
-   * ORIGINAL full multi-receipt scan (stored in extracted_fields
-   * ._original_scan_path) and re-run multi-doc detection. The existing
-   * resplit-dedup logic in the analyze route will cleanly replace the
-   * current children with the new split. */
+   * of a multi-doc crop split. Kicks off a BACKGROUND analyze job
+   * (mirrors the reconcile-job pattern) so per-crop AI calls fit inside
+   * Vercel's 60s function ceiling. The progress panel below the button
+   * renders while the job runs.
+   *
+   * Single-doc fallback: if detection finds only 1 document on the
+   * scan, no job is created and we fall back to the synchronous inline
+   * /api/analyze/[id] route — which is fine for a single doc because
+   * the per-crop concurrency that exceeds the budget never kicks in. */
   async function reanalyseFullScan() {
-    const confirmed = window.confirm(
-      "Re-analyse the FULL multi-receipt scan from scratch?\n\n" +
-        "This downloads the original multi-receipt scan, asks Claude to detect " +
-        "the boundaries again, crops each receipt fresh, and replaces all the " +
-        "current sibling rows with the new split. Useful when Claude got the " +
-        "split wrong, or when you want to retry with a better bounding-box pass.\n\n" +
-        "Existing children (and their actions) will be deleted; new ones will " +
-        "be spawned.\n\nContinue?"
-    );
-    if (!confirmed) return;
     setReanalysingFull(true);
     setError(null);
     setDoneMessage(null);
     try {
-      const res = await fetch(
-        `/api/analyze/${documentId}?from_original=1&force_profile=1`,
-        { method: "POST" }
-      );
+      const res = await fetch(`/api/analyze-job/start`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          documentId,
+          fromOriginal: true,
+          forceProfile: true,
+        }),
+      });
       if (!res.ok) {
         const json = await res.json().catch(() => ({}));
         throw new Error(json.error || `HTTP ${res.status}`);
       }
-      setDoneMessage(
-        "Full-scan re-analysed — refresh in a moment to see the new split."
-      );
-      router.refresh();
+      const json = (await res.json()) as {
+        jobId: string | null;
+        totalCrops?: number;
+        fallback?: string;
+        reason?: string | null;
+      };
+      if (json.jobId) {
+        // Multi-doc path — render the live progress panel.
+        setAnalyzeJobId(json.jobId);
+      } else if (json.fallback === "single_doc_synchronous") {
+        // Only one document detected — fall back to the inline analyze
+        // route. This path is fast enough to fit in 60s (no per-crop
+        // fan-out) so we don't need the job machinery for it.
+        setDoneMessage(
+          "Only one document detected — running a normal re-analyse instead…"
+        );
+        const ires = await fetch(
+          `/api/analyze/${documentId}?from_original=1&force_profile=1`,
+          { method: "POST" }
+        );
+        if (!ires.ok) {
+          const ij = await ires.json().catch(() => ({}));
+          throw new Error(ij.error || `HTTP ${ires.status}`);
+        }
+        setDoneMessage(
+          "Re-analysed — refresh in a moment to see updated data."
+        );
+        router.refresh();
+      }
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Re-analyse full scan failed");
     } finally {
@@ -302,13 +339,16 @@ export function RefileWidget({
       {(hasOriginalScan || isMultiDocParent) && (
         <button
           onClick={reanalyseFullScan}
-          disabled={reanalysing || reanalysingFull}
+          disabled={reanalysing || reanalysingFull || !!analyzeJobId}
           className="btn-secondary text-xs !py-2 mt-2 w-full"
           title="Re-download the original multi-receipt scan and redo the entire split — replaces all current sibling rows"
         >
-          {reanalysingFull ? (
+          {reanalysingFull || analyzeJobId ? (
             <>
-              <Spinner className="h-3.5 w-3.5" /> Re-analysing full scan…
+              <Spinner className="h-3.5 w-3.5" />
+              {analyzeJobId
+                ? "Re-analysing in background…"
+                : "Starting re-analyse…"}
             </>
           ) : (
             <>
@@ -317,6 +357,27 @@ export function RefileWidget({
             </>
           )}
         </button>
+      )}
+
+      {/* Live progress for an active background re-analyse job. Resumes
+          from a server-side row when activeAnalyzeJobId was passed in
+          from the page server component (page reload mid-job). */}
+      {analyzeJobId && (
+        <AnalyzeProgressPanel
+          jobId={analyzeJobId}
+          onComplete={() => {
+            // Clear the local job id so the button re-enables.
+            setAnalyzeJobId(null);
+            setDoneMessage(
+              "Full-scan re-analysed — new split is live below."
+            );
+            router.refresh();
+          }}
+          onFailed={(err) => {
+            setAnalyzeJobId(null);
+            setError(err || "Re-analyse job failed");
+          }}
+        />
       )}
 
       {error && (

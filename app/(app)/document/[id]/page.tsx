@@ -169,6 +169,24 @@ export default async function DocumentDetail({
     siblings = (siblingData || []) as SiblingRow[];
   }
 
+  // Look up an active multi-doc "re-analyse full scan" job so the
+  // RefileWidget's progress panel can auto-resume after a page reload.
+  // Cheap query — one row at most per (document, in-flight status).
+  let activeAnalyzeJobId: string | null = null;
+  {
+    const { data: ajRow } = await supabase
+      .from("analyze_jobs")
+      .select("id")
+      .eq("document_id", id)
+      .in("status", ["pending", "processing"])
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (ajRow) {
+      activeAnalyzeJobId = (ajRow as { id: string }).id;
+    }
+  }
+
   // Look up an active AI reconcile job for this statement so the panel
   // can auto-resume polling if a previous session was interrupted
   // (tab refresh, navigation, network blip).
@@ -561,6 +579,7 @@ export default async function DocumentDetail({
                 parent_document_id?: string | null;
               }).parent_document_id && siblings.length > 1
             }
+            activeAnalyzeJobId={activeAnalyzeJobId}
           />
         </div>
       </div>
