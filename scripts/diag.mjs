@@ -1022,19 +1022,37 @@ async function cmdDetectMultidoc() {
     process.exit(1);
   }
 
-  // Load doc + its dropbox_path
+  // Load doc + its dropbox_path. Also fetch extracted_fields so we can
+  // read _original_scan_path when --from-original is passed (needed for
+  // multi-doc parents whose dropbox_path was repointed to _part1.jpg).
   const { data: doc } = await supabase
     .from("documents")
-    .select("id, file_name, dropbox_path")
+    .select("id, file_name, dropbox_path, extracted_fields")
     .eq("id", docId)
     .single();
   if (!doc?.dropbox_path) {
     console.error("Doc has no dropbox_path");
     process.exit(1);
   }
+
+  // --from-original=1: use the parent's _original_scan_path instead of
+  // its current dropbox_path. Necessary to inspect the FULL multi-receipt
+  // scan after a split has already moved the parent's pointer to a crop.
+  const fromOriginal = flag("from-original", "0") === "1";
+  const originalPath = doc.extracted_fields?._original_scan_path || null;
+  let downloadPath = doc.dropbox_path;
+  if (fromOriginal) {
+    if (originalPath) {
+      downloadPath = originalPath;
+    } else {
+      console.warn(
+        "  ⚠ --from-original=1 set but no _original_scan_path stored; falling back to dropbox_path"
+      );
+    }
+  }
   console.log(`doc:       ${doc.id.slice(0, 8)}`);
   console.log(`file_name: ${doc.file_name}`);
-  console.log(`path:      ${doc.dropbox_path}`);
+  console.log(`path:      ${downloadPath}${fromOriginal ? "  (--from-original)" : ""}`);
 
   // Download file
   const { Dropbox } = await import("dropbox");
@@ -1050,7 +1068,7 @@ async function cmdDetectMultidoc() {
     fetch: patchedFetch,
   });
   console.log("\nDownloading...");
-  const dl = await dbx.filesDownload({ path: doc.dropbox_path });
+  const dl = await dbx.filesDownload({ path: downloadPath });
   let buffer = Buffer.from((dl.result).fileBinary);
   console.log(`downloaded ${buffer.length} bytes`);
 
@@ -2008,7 +2026,7 @@ Subcommands:
   taxonomy-backfill [--dry-run]
   taxonomy-cleanup  [--apply]
   cleanup-multi-doc-dupes [--dry-run]
-  detect-multidoc <doc-id-or-prefix>
+  detect-multidoc <doc-id-or-prefix> [--from-original=1]
   pay-actions    [--limit=50]
   match-debug    <tx-id-or-prefix>
   check-deploy
