@@ -20,7 +20,6 @@ import { DocumentPreview } from "@/components/inbox/document-preview";
 import { ReconciliationPanel } from "@/components/inbox/reconciliation-panel";
 import { TruncationBanner } from "@/components/inbox/truncation-banner";
 import { ParentScanBanner } from "@/components/inbox/parent-scan-banner";
-import { OriginalScanViewer } from "@/components/inbox/original-scan-viewer";
 import { estimateAiCostEur, formatAiCostEur } from "@/lib/ai/pricing";
 import {
   ProfileMatchPanel,
@@ -37,6 +36,7 @@ import {
   User,
   FolderOpen,
   ChevronRight,
+  Images,
 } from "lucide-react";
 
 export const dynamic = "force-dynamic";
@@ -294,86 +294,20 @@ export default async function DocumentDetail({
     }
   }
 
-  // Original-scan-with-overlays data — built when THIS doc is itself
-  // the parent of a multi-doc split (has children + has polygons
-  // stored). Renders an interactive viewer showing the full original
-  // scan with each child's polygon colour-coded and clickable.
-  let originalScanInfo: {
-    parentDocId: string;
-    totalReceipts: number;
-    childPolygons: Array<{
-      childId: string;
-      vertices: { x: number; y: number }[];
-      partNumber: number;
-      sender: string | null;
-      amount: number | null;
-    }>;
-  } | null = null;
-  {
+  // "Has original full scan" flag — true when THIS doc is a multi-doc
+  // parent (no parent_document_id, has children) AND the analyze
+  // pipeline saved the original full multi-receipt scan's Dropbox
+  // path. Drives the "View original full scan" button below the
+  // sibling badge. Click → opens the original via the existing
+  // /preview?original=1 route in a new tab.
+  const hasOriginalFullScan = (() => {
+    if (parentId) return false; // children don't get this button
+    if (siblings.length <= 1) return false; // not a multi-doc parent
     const docExtracted = doc.extracted_fields as
       | Record<string, unknown>
       | null;
-    const hasOriginalPath =
-      typeof docExtracted?.["_original_scan_path"] === "string";
-    const isParentWithChildren =
-      !parentId && siblings.length > 1;
-    if (isParentWithChildren && hasOriginalPath) {
-      const mdRaw = docExtracted?.["_multidoc"];
-      if (mdRaw && typeof mdRaw === "object") {
-        const md = mdRaw as {
-          polygons?: Array<{
-            vertices?: Array<{ x: number; y: number }>;
-          }>;
-        };
-        const polys = Array.isArray(md.polygons) ? md.polygons : [];
-        // Sort siblings by dropbox_path so polygon[i] aligns with
-        // siblings[i] in the same convention used for the parent-scan
-        // banner. The parent row also lives in siblings (its
-        // dropbox_path points at _part1.jpg) so it gets index 0.
-        const sortedSiblings = [...siblings].sort((a, b) => {
-          const ap = a.dropbox_path || "";
-          const bp = b.dropbox_path || "";
-          if (ap === bp) return 0;
-          return ap < bp ? -1 : 1;
-        });
-        const built: Array<{
-          childId: string;
-          vertices: { x: number; y: number }[];
-          partNumber: number;
-          sender: string | null;
-          amount: number | null;
-        }> = [];
-        const n = Math.min(polys.length, sortedSiblings.length);
-        for (let i = 0; i < n; i++) {
-          const p = polys[i];
-          const s = sortedSiblings[i];
-          if (
-            !p ||
-            !Array.isArray(p.vertices) ||
-            p.vertices.length < 3
-          )
-            continue;
-          built.push({
-            childId: s.id,
-            vertices: p.vertices.map((v) => ({
-              x: Number(v.x) || 0,
-              y: Number(v.y) || 0,
-            })),
-            partNumber: i + 1,
-            sender: s.sender,
-            amount: s.amount,
-          });
-        }
-        if (built.length > 0) {
-          originalScanInfo = {
-            parentDocId: doc.id,
-            totalReceipts: built.length,
-            childPolygons: built,
-          };
-        }
-      }
-    }
-  }
+    return typeof docExtracted?.["_original_scan_path"] === "string";
+  })();
 
   // Look up an active multi-doc "re-analyse full scan" job so the
   // RefileWidget's progress panel can auto-resume after a page reload.
@@ -456,17 +390,20 @@ export default async function DocumentDetail({
         {/* Multi-doc sibling badge — shown when this scan was split into
            multiple docs. Lets the user jump between siblings without
            hunting in the inbox. */}
-        {/* Original-scan viewer — when THIS doc is the parent of a
-            multi-doc split, show the full original scan with each
-            receipt's polygon overlaid + clickable to jump to that child. */}
-        {originalScanInfo && (
-          <div className="mt-3">
-            <OriginalScanViewer
-              parentDocId={originalScanInfo.parentDocId}
-              childPolygons={originalScanInfo.childPolygons}
-              totalReceipts={originalScanInfo.totalReceipts}
-            />
-          </div>
+        {/* "View original full scan" — only on multi-doc parents. Opens
+            the original multi-receipt mosaic in a new tab via the
+            existing /preview?original=1 route. */}
+        {hasOriginalFullScan && (
+          <a
+            href={`/api/documents/${doc.id}/preview?original=1`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="btn-secondary text-xs !py-2 mt-3 inline-flex"
+          >
+            <Images className="h-3.5 w-3.5" />
+            View original full scan ({siblings.length}{" "}
+            {siblings.length === 1 ? "receipt" : "receipts"})
+          </a>
         )}
 
         {siblings.length > 1 && (
