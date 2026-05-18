@@ -392,6 +392,11 @@ export interface ExtractOptions {
    *  prefers reusing existing subcategory tokens instead of inventing
    *  drift (apple/apples/appel...). */
   taxonomyHint?: string;
+  /** Internal flag — set by extractDocument when re-invoking itself
+   *  after an empty-line_items first response. Prepends a stricter
+   *  "enumerate every printed line item" preface to the prompt and
+   *  guards against infinite recursion. Callers should NEVER set this. */
+  __isRetry?: boolean;
 }
 
 export async function extractDocument(
@@ -403,7 +408,10 @@ export async function extractDocument(
 
   const mimeType = getMimeType(filename);
 
-  const promptText = buildExtractionPrompt(opts.taxonomyHint);
+  const basePrompt = buildExtractionPrompt(opts.taxonomyHint);
+  const promptText = opts.__isRetry
+    ? `RETRY: the previous extraction returned an empty line_items array, but this is a receipt-style document so there ARE printed line items on it. Look more carefully — every printed line that shows an item being purchased (item name, optionally with price and quantity) MUST be in line_items. Even if the print quality is marginal and you can't read every digit, include the item name with whatever you can read. Empty line_items is the wrong answer for this document type.\n\n${basePrompt}`
+    : basePrompt;
   const contentBlocks: Anthropic.ContentBlockParam[] = [
     { type: "text", text: promptText },
   ];
@@ -498,15 +506,75 @@ export async function extractDocument(
     // For multi-doc responses, normalise the polygons / bounding_boxes
     // pair so downstream code only ever needs to look at `polygons`.
     const maybeMulti = parsed as Record<string, unknown>;
-    if (
-      maybeMulti &&
+    const isMultiDocShape =
+      !!maybeMulti &&
       Array.isArray(maybeMulti["documents"]) &&
-      (maybeMulti["documents"] as unknown[]).length > 0
-    ) {
+      (maybeMulti["documents"] as unknown[]).length > 0;
+    if (isMultiDocShape) {
       normaliseMultiDocPolygons(
         maybeMulti as unknown as MultiDocumentExtraction
       );
     }
+
+    // Retry on empty line_items for receipt-shaped image docs. Pattern
+    // we hit in production: Sonnet returns the basic summary (sender,
+    // amount, date) but `line_items: []`, even though items are clearly
+    // printed on the receipt. Image-degradation-sensitive case — small
+    // crops with marginal print quality. One retry with an explicit
+    // "enumerate every line" instruction usually rescues it.
+    //
+    // Scope of retry:
+    //   - input must be an image (PDF/CSV have their own structure)
+    //   - parsed result must be a SINGLE doc shape (multi-doc handles
+    //     line items per-crop later)
+    //   - document_type must be a receipt-like type where line items
+    //     are expected
+    //   - line_items must be missing or empty
+    //   - guard against infinite recursion via opts.__isRetry flag
+    if (
+      !isMultiDocShape &&
+      mimeType.startsWith("image/") &&
+      !opts.__isRetry &&
+      shouldRetryForLineItems(parsed)
+    ) {
+      console.log(
+        "[ai/extract] empty line_items on receipt-shaped doc — retrying with stricter prompt"
+      );
+      const retryResult = await extractDocument(fileBuffer, filename, {
+        ...opts,
+        __isRetry: true,
+      });
+      // Use the retry IF it produced non-empty line_items; otherwise
+      // keep the original result (so we don't replace a valid summary
+      // with a worse-quality second attempt). line_items lives inside
+      // extracted_fields (per the extraction prompt schema), not at
+      // the top level of the parsed object.
+      const retryHasLineItems = (() => {
+        const d = retryResult.data;
+        if (!d || typeof d !== "object" || !("extracted_fields" in d)) {
+          return false;
+        }
+        const ef = (d as DocumentExtraction).extracted_fields as
+          | Record<string, unknown>
+          | undefined;
+        const li = ef?.["line_items"];
+        return Array.isArray(li) && li.length > 0;
+      })();
+      if (retryHasLineItems) {
+        return {
+          ...retryResult,
+          // Accumulate token usage from both calls — caller's cost
+          // tracker should see the full bill.
+          usage: {
+            input_tokens:
+              usage.input_tokens + retryResult.usage.input_tokens,
+            output_tokens:
+              usage.output_tokens + retryResult.usage.output_tokens,
+          },
+        };
+      }
+    }
+
     return {
       data: parsed as unknown as ExtractionData,
       usage,
@@ -524,4 +592,27 @@ export async function extractDocument(
     stop_reason: response.stop_reason || null,
     max_tokens_cap: maxTokens,
   };
+}
+
+/** Document types where we EXPECT at least one line item on a healthy
+ * extraction. If the type is something else (id_document, certificate,
+ * letter) we don't bother retrying — empty line_items is correct. */
+const LINE_ITEM_DOC_TYPES = new Set([
+  "receipt",
+  "invoice",
+  "medical_bill",
+  "utility_bill",
+  "bank_statement", // multi-tx CSV/PDF — different code path usually
+]);
+
+function shouldRetryForLineItems(parsed: Record<string, unknown>): boolean {
+  const docType = String(parsed["document_type"] || "").toLowerCase();
+  if (!LINE_ITEM_DOC_TYPES.has(docType)) return false;
+  // line_items lives inside extracted_fields per the prompt schema.
+  const ef = parsed["extracted_fields"] as
+    | Record<string, unknown>
+    | undefined;
+  const li = ef?.["line_items"];
+  if (!Array.isArray(li)) return true; // null / missing → retry
+  return li.length === 0;
 }

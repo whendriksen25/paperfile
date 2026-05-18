@@ -273,71 +273,81 @@ export async function cropAndDeskew(
     }
 
     try {
-      // 4+5. Extract bbox → rotate → trim → encode.
+      // We aim for ONE resample + ONE JPEG encode on the final crop so
+      // small receipts don't get blurred to the point Claude can't read
+      // line items. Strategy:
+      //   - Compute total rotation = polygon tilt + probe quadrant + probe fine tilt
+      //   - Run the probe on a TRANSIENT low-quality buffer (just bytes
+      //     sent to Haiku, never saved). The probe image is the polygon-
+      //     rotated bbox so the probe sees roughly what the final crop
+      //     will look like for orientation purposes.
+      //   - Build the FINAL crop from the raw source in one pipeline:
+      //     extract → rotate(total) → trim → encode at high quality.
+      // This avoids the double-encode that was burying line-item detail.
+
+      // Step 1: build a transient image for the probe (only when probe enabled).
+      let probeQuadrant: 0 | 90 | 180 | 270 = 0;
+      let probeFineTilt = 0;
+      if (probe) {
+        let probePipeline = sharp(buffer).extract({
+          left: px,
+          top: py,
+          width: pw,
+          height: ph,
+        });
+        if (applyTilt && tilt != null) {
+          probePipeline = probePipeline.rotate(-tilt, {
+            background: "#ffffff",
+          });
+        }
+        // Lower quality OK — probe only judges orientation, not text.
+        const probeBuf = await probePipeline.jpeg({ quality: 80 }).toBuffer();
+        const { probeOrientation } = await import(
+          "@/lib/services/orientation-probe"
+        );
+        const probeResult = await probeOrientation(probeBuf);
+        probeQuadrant = probeResult.degrees;
+        probeFineTilt = probeResult.fineTilt;
+        if (probeQuadrant !== 0) {
+          console.log(
+            `[image-crop] orientation probe: quadrant ${probeQuadrant}°`
+          );
+        }
+        if (Math.abs(probeFineTilt) >= 0.5) {
+          console.log(
+            `[image-crop] orientation probe: fine tilt ${probeFineTilt.toFixed(1)}°`
+          );
+        } else {
+          probeFineTilt = 0; // below dead-zone, treat as 0
+        }
+      }
+
+      // Step 2: sum all rotations and apply in ONE final pipeline.
+      // Sign convention: sharp.rotate(a) is clockwise by `a` degrees.
+      //   - polygon tilt > 0 means receipt is tilted clockwise → we need
+      //     to rotate CCW (i.e. -tilt) to undo
+      //   - probe quadrant/fine tilt are reported as "additional CW
+      //     rotation still needed to be upright" → apply directly
+      const polygonRotation = applyTilt && tilt != null ? -tilt : 0;
+      const totalRotation = polygonRotation + probeQuadrant + probeFineTilt;
+
       let pipeline = sharp(buffer).extract({
         left: px,
         top: py,
         width: pw,
         height: ph,
       });
-      if (applyTilt && tilt != null) {
-        // sharp().rotate(angle) rotates CLOCKWISE by `angle` degrees.
-        // We want to UNDO a clockwise tilt of `tilt`, so rotate by -tilt.
-        // The applyTilt gate above already filtered out micro-rotations
-        // (|tilt| < 3°) and absurd ones (|tilt| > 45°).
-        pipeline = pipeline.rotate(-tilt, { background: "#ffffff" });
+      if (Math.abs(totalRotation) > 0.1) {
+        pipeline = pipeline.rotate(totalRotation, { background: "#ffffff" });
       }
       if (trim) {
         // .trim() removes uniform-colour borders left by the rotation
-        // (the white wedges around the corners). Default threshold is
-        // fine for #ffffff backgrounds; if the receipt itself is white
-        // the trim is conservative and leaves the printed content.
+        // (the white wedges around the corners).
         pipeline = pipeline.trim();
       }
-      let cropped = await pipeline.jpeg({ quality: 92 }).toBuffer();
-
-      // Optional final-mile orientation probe. Sonnet's rotation hint
-      // upstream is usually right, but occasionally misses a quarter-turn
-      // (especially on upside-down receipts) AND tends to underestimate
-      // small tilts. One Haiku call asks for BOTH corrections:
-      //   - quadrant correction (0/90/180/270 clockwise to bring upright)
-      //   - fine tilt (±15° clockwise to align the text baseline after
-      //     that quadrant rotation)
-      // Both are applied. ~$0.001 per crop. Skipped by default; opt in
-      // via opts.orientationProbe=true.
-      if (probe) {
-        const { probeOrientation, applyQuadrantRotation } = await import(
-          "@/lib/services/orientation-probe"
-        );
-        const { degrees: quadrant, fineTilt } =
-          await probeOrientation(cropped);
-        if (quadrant !== 0) {
-          console.log(
-            `[image-crop] orientation probe: quadrant ${quadrant}°`
-          );
-          cropped = await applyQuadrantRotation(cropped, quadrant);
-        }
-        if (Math.abs(fineTilt) >= 0.5) {
-          console.log(
-            `[image-crop] orientation probe: fine tilt ${fineTilt.toFixed(1)}°`
-          );
-          try {
-            // sharp().rotate(angle) rotates CLOCKWISE by `angle`. The
-            // probe returns the clockwise correction the image still
-            // needs, so we apply it directly (NOT negated).
-            cropped = await sharp(cropped)
-              .rotate(fineTilt, { background: "#ffffff" })
-              .trim()
-              .jpeg({ quality: 92 })
-              .toBuffer();
-          } catch (e) {
-            console.warn(
-              "[image-crop] fine-tilt apply failed, keeping un-finetilted crop:",
-              e instanceof Error ? e.message : String(e)
-            );
-          }
-        }
-      }
+      // Quality 95 instead of 92 — for small receipts the extra ~10%
+      // file size is worth it to keep line items legible to Sonnet.
+      const cropped = await pipeline.jpeg({ quality: 95 }).toBuffer();
       out.push(cropped);
     } catch (e) {
       // Per-polygon defensive: fall back to a plain bbox crop, no
@@ -349,7 +359,7 @@ export async function cropAndDeskew(
       try {
         const fallback = await sharp(buffer)
           .extract({ left: px, top: py, width: pw, height: ph })
-          .jpeg({ quality: 92 })
+          .jpeg({ quality: 95 })
           .toBuffer();
         out.push(fallback);
       } catch (e2) {
