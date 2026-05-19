@@ -378,7 +378,7 @@ export async function POST(
       | import("@/lib/ai/extract").ReceiptPolygon[]
       | null = null;
     if (isMultiDoc(result)) {
-      const docs = result.documents;
+      let docs = result.documents;
       if (docs.length === 0) {
         await admin
           .from("documents")
@@ -394,11 +394,6 @@ export async function POST(
           { status: 500 }
         );
       }
-      extraction = docs[0];
-      multiDocChildren = docs.slice(1);
-      console.log(
-        `[api/analyze] multi-doc detected: ${docs.length} documents on this scan`
-      );
 
       // ★ Per-receipt cropped re-extraction (option 3).
       // If Claude gave us polygons (or legacy bounding_boxes — the
@@ -419,6 +414,23 @@ export async function POST(
         const { bboxToPolygon } = await import("@/lib/ai/extract");
         polygons = multi.bounding_boxes.map(bboxToPolygon);
       }
+      // Cleanup: drop tiny phantom polygons + resolve pairwise overlaps
+      // by midpoint-split. Catches Sonnet's two common mis-detections
+      // on multi-receipt scans. Updates docs[] in lockstep so per-doc
+      // indices stay aligned with the cleaned polygons[].
+      if (polygons && polygons.length > 0) {
+        const { cleanupPolygonsForCropping } = await import(
+          "@/lib/services/image-crop"
+        );
+        const cleaned = cleanupPolygonsForCropping(polygons, docs);
+        polygons = cleaned.polygons;
+        docs = cleaned.documents;
+      }
+      extraction = docs[0];
+      multiDocChildren = docs.slice(1);
+      console.log(
+        `[api/analyze] multi-doc detected: ${docs.length} documents on this scan (post-cleanup)`
+      );
       const isImage = /\.(jpe?g|png|webp|gif|heic|heif)$/i.test(
         doc.file_name || ""
       );

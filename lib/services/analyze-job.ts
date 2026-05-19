@@ -368,8 +368,20 @@ export async function prepareAnalyzeJob(
   // 4. Detection. ~5-10s, comfortably inside the prepare-route budget.
   console.log("[analyze-job] running multi-doc detection on", documentId);
   const detect = await detectMultiDoc(buffer, doc.file_name || "scan.jpg");
-  const docs = detect.documents;
-  const polygons = detect.polygons;
+  // 4a. Polygon cleanup: drop phantom small detections (<3% area), then
+  // resolve pairwise overlaps via midpoint-split. Catches Sonnet's two
+  // common mis-detections: a tiny 5th "receipt" that isn't really there,
+  // and polygon edges that overlap neighbours (causing bleed-through
+  // into adjacent crops).
+  const { cleanupPolygonsForCropping } = await import(
+    "@/lib/services/image-crop"
+  );
+  const cleaned = cleanupPolygonsForCropping(
+    detect.polygons,
+    detect.documents
+  );
+  const docs = cleaned.documents;
+  const polygons = cleaned.polygons;
   const boxes = detect.bounding_boxes;
 
   // 5. Single-doc fall-through. Caller decides what to do next (typically
