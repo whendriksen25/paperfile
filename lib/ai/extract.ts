@@ -522,14 +522,20 @@ export async function extractDocument(
       );
     }
 
-    // Retry on empty line_items for receipt-shaped image docs. Pattern
-    // we hit in production: Sonnet returns the basic summary (sender,
-    // amount, date) but `line_items: []`, even though items are clearly
-    // printed on the receipt. Image-degradation-sensitive case — small
-    // crops with marginal print quality. One retry with an explicit
-    // "enumerate every line" instruction usually rescues it.
+    // Empty-line_items fallback. Pattern we hit in production: Sonnet
+    // returns basic fields (sender, amount, date) but `line_items: []`
+    // even though items are clearly printed. The diag proved Sonnet CAN
+    // read those items — the full extraction prompt's "you may omit
+    // line_items if there's no itemised breakdown" escape hatch + the
+    // heavy per-line schema makes it skip them on marginal-quality crops.
     //
-    // Scope of retry:
+    // Fallback strategy: when line_items is empty, fire a SECOND call
+    // with a focused stripped prompt (just name/qty/price) and merge
+    // that array back into the original extraction's extracted_fields.
+    // Doesn't re-do anything else — sender/amount/date from the first
+    // call are kept. ~7-10s wall clock on failures; cheap.
+    //
+    // Scope of fallback:
     //   - input must be an image (PDF/CSV have their own structure)
     //   - parsed result must be a SINGLE doc shape (multi-doc handles
     //     line items per-crop later)
@@ -545,39 +551,29 @@ export async function extractDocument(
       shouldRetryForLineItems(parsed)
     ) {
       console.log(
-        "[ai/extract] empty line_items on receipt-shaped doc — retrying with stricter prompt"
+        "[ai/extract] empty line_items — firing focused line-items fallback"
       );
-      const retryResult = await extractDocument(fileBuffer, filename, {
-        ...opts,
-        __isRetry: true,
-      });
-      // Use the retry IF it produced non-empty line_items; otherwise
-      // keep the original result (so we don't replace a valid summary
-      // with a worse-quality second attempt). line_items lives inside
-      // extracted_fields (per the extraction prompt schema), not at
-      // the top level of the parsed object.
-      const retryHasLineItems = (() => {
-        const d = retryResult.data;
-        if (!d || typeof d !== "object" || !("extracted_fields" in d)) {
-          return false;
-        }
-        const ef = (d as DocumentExtraction).extracted_fields as
-          | Record<string, unknown>
-          | undefined;
-        const li = ef?.["line_items"];
-        return Array.isArray(li) && li.length > 0;
-      })();
-      if (retryHasLineItems) {
+      const fallback = await extractLineItemsFocused(
+        fileBuffer,
+        mimeType,
+        opts.taxonomyHint
+      );
+      if (fallback.line_items.length > 0) {
+        const orig = parsed as Record<string, unknown>;
+        const origEf = (orig["extracted_fields"] as Record<string, unknown>) || {};
+        orig["extracted_fields"] = {
+          ...origEf,
+          line_items: fallback.line_items,
+        };
         return {
-          ...retryResult,
-          // Accumulate token usage from both calls — caller's cost
-          // tracker should see the full bill.
+          data: orig as unknown as ExtractionData,
           usage: {
-            input_tokens:
-              usage.input_tokens + retryResult.usage.input_tokens,
+            input_tokens: usage.input_tokens + fallback.usage.input_tokens,
             output_tokens:
-              usage.output_tokens + retryResult.usage.output_tokens,
+              usage.output_tokens + fallback.usage.output_tokens,
           },
+          stop_reason: response.stop_reason || null,
+          max_tokens_cap: maxTokens,
         };
       }
     }
@@ -611,6 +607,134 @@ const LINE_ITEM_DOC_TYPES = new Set([
   "utility_bill",
   "bank_statement", // multi-tx CSV/PDF — different code path usually
 ]);
+
+/**
+ * Focused line-items extraction — a SECOND Sonnet call with a stripped
+ * prompt that asks ONLY for the line items, never for the full schema.
+ * Used as a fallback when the main extraction returned empty line_items
+ * on a receipt-shaped doc.
+ *
+ * Why a focused second call instead of just nudging the main prompt:
+ * the main prompt is ~200 lines and asks for ~10 fields per line item
+ * (name, qty, unit, price, total, category, category_path, vat_rate,
+ * discount_amount, printed_raw). Sonnet on a marginal-quality crop
+ * appears to give up on the full schema. A simple prompt asking only
+ * for name + price + quantity reliably extracts what's there — the
+ * diag proved this on a crop that returned empty from the full prompt.
+ *
+ * The returned items have only the basic three fields. Downstream
+ * code that expects category/category_path will see undefined; that's
+ * fine — the taxonomy canonicalisation pass treats missing fields as
+ * "needs categorisation later" and the UI shows them as uncategorised.
+ *
+ * Tokens cap kept low (8k) — line_items rarely exceed a few hundred
+ * tokens even on long receipts, no need for the 64k that the main
+ * prompt budgets for.
+ */
+async function extractLineItemsFocused(
+  fileBuffer: Buffer,
+  mimeType: SupportedMediaType,
+  _taxonomyHint?: string
+): Promise<{
+  line_items: Array<{ name: string; price: number | null; quantity: number }>;
+  usage: { input_tokens: number; output_tokens: number };
+}> {
+  const prompt = `Extract the LINE ITEMS from this receipt and return STRICT JSON:
+{
+  "line_items": [
+    { "name": "<item name as printed>", "price": <number or null>, "quantity": <number, default 1> }
+  ]
+}
+
+Enumerate EVERY printed line item — every product, every fee, every discount. Include every line even if you can read the name but not the price (set price to null). Empty line_items is the WRONG answer for a receipt with visible item lines.
+
+Return ONLY the JSON object. No markdown, no extra fields, no surrounding prose.`;
+
+  const contentBlocks: Anthropic.ContentBlockParam[] = [
+    { type: "text", text: prompt },
+  ];
+  if (mimeType === "application/pdf") {
+    contentBlocks.push({
+      type: "document",
+      source: {
+        type: "base64",
+        media_type: "application/pdf",
+        data: fileBuffer.toString("base64"),
+      },
+    } as unknown as Anthropic.ContentBlockParam);
+  } else {
+    contentBlocks.push({
+      type: "image",
+      source: {
+        type: "base64",
+        media_type: mimeType as "image/jpeg" | "image/png" | "image/gif" | "image/webp",
+        data: fileBuffer.toString("base64"),
+      },
+    });
+  }
+  try {
+    const stream = client.messages.stream({
+      model: AI_MODEL_SMART,
+      max_tokens: 8000,
+      temperature: 0,
+      messages: [{ role: "user", content: contentBlocks }],
+    });
+    const resp = await stream.finalMessage();
+    const text =
+      resp.content
+        .filter((b) => b.type === "text")
+        .map((b) => (b as { type: "text"; text: string }).text)
+        .join("") || "";
+    const parsed = safeParseJSON(text);
+    const usage = {
+      input_tokens: resp.usage?.input_tokens || 0,
+      output_tokens: resp.usage?.output_tokens || 0,
+    };
+    if (!parsed) {
+      console.warn("[ai/extract] focused line-items parse failed");
+      return { line_items: [], usage };
+    }
+    const items = Array.isArray(parsed["line_items"])
+      ? (parsed["line_items"] as unknown[])
+      : [];
+    // Sanitise the items — keep only objects with a name. Coerce numbers,
+    // default quantity to 1 if missing.
+    const cleaned = items
+      .map((it) => {
+        if (!it || typeof it !== "object") return null;
+        const o = it as Record<string, unknown>;
+        const name = typeof o.name === "string" ? o.name.trim() : "";
+        if (!name) return null;
+        const priceRaw = o.price;
+        const price =
+          typeof priceRaw === "number" && Number.isFinite(priceRaw)
+            ? priceRaw
+            : null;
+        const qtyRaw = o.quantity;
+        const quantity =
+          typeof qtyRaw === "number" && Number.isFinite(qtyRaw) && qtyRaw > 0
+            ? qtyRaw
+            : 1;
+        return { name, price, quantity };
+      })
+      .filter((x): x is { name: string; price: number | null; quantity: number } =>
+        x !== null
+      );
+    console.log(
+      `[ai/extract] focused line-items fallback returned ${cleaned.length} items (in=${usage.input_tokens} out=${usage.output_tokens})`
+    );
+    return { line_items: cleaned, usage };
+  } catch (e) {
+    console.warn(
+      "[ai/extract] focused line-items fallback threw:",
+      e instanceof Error ? e.message : String(e)
+    );
+    return {
+      line_items: [],
+      usage: { input_tokens: 0, output_tokens: 0 },
+    };
+  }
+}
 
 function shouldRetryForLineItems(parsed: Record<string, unknown>): boolean {
   const docType = String(parsed["document_type"] || "").toLowerCase();

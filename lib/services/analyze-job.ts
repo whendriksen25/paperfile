@@ -732,11 +732,9 @@ async function runStep(
     `${parent.file_name || "crop"}_part${stepIndex + 1}.jpg`,
     {
       taxonomyHint,
-      // Job worker has a per-step 60s Vercel budget. A retry on empty
-      // line_items doubles the wall-clock and can blow the budget;
-      // leave the empty result as-is and let the user re-analyse this
-      // one child synchronously later if they want a retry.
-      disableLineItemRetry: true,
+      // Fallback re-enabled now that it's a focused single-task call
+      // (~7-10s on failures only, not a duplicate of the full prompt).
+      // Stays inside the per-step 60s Vercel budget even when it fires.
     }
   );
   const d = ex.data;

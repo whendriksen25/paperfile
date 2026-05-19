@@ -1290,31 +1290,48 @@ Return ONLY the JSON object. No prose, no markdown.`;
  */
 async function cmdExtractDoc() {
   const [idArg] = positional();
-  if (!idArg)
-    throw new Error("Usage: diag extract-doc <doc-id-or-prefix>");
+  // --path=/Archive/... — extract from a Dropbox path directly without
+  // needing a DB row. Useful for orphan crop files (e.g. _part4.jpg
+  // left behind after a failed split). When provided, idArg is ignored.
+  const directPath = flag("path", "") || null;
+  if (!idArg && !directPath)
+    throw new Error(
+      "Usage: diag extract-doc <doc-id-or-prefix>  OR  diag extract-doc -- --path=/Archive/...path.jpg"
+    );
   if (!process.env.ANTHROPIC_API_KEY) {
     console.error("ANTHROPIC_API_KEY missing");
     process.exit(1);
   }
-  const supabase = admin();
-  const docId = await resolveId(supabase, "documents", idArg);
-  if (!docId) {
-    console.error(`No documents row found matching "${idArg}"`);
-    process.exit(1);
-  }
 
-  const { data: doc } = await supabase
-    .from("documents")
-    .select("id, file_name, dropbox_path")
-    .eq("id", docId)
-    .single();
-  if (!doc?.dropbox_path) {
-    console.error("Doc has no dropbox_path");
-    process.exit(1);
+  let resolvedPath;
+  let displayFileName;
+  let displayDocId = "(no row)";
+  if (directPath) {
+    resolvedPath = directPath;
+    displayFileName = directPath.split("/").pop() || directPath;
+  } else {
+    const supabase = admin();
+    const docId = await resolveId(supabase, "documents", idArg);
+    if (!docId) {
+      console.error(`No documents row found matching "${idArg}"`);
+      process.exit(1);
+    }
+    const { data: doc } = await supabase
+      .from("documents")
+      .select("id, file_name, dropbox_path")
+      .eq("id", docId)
+      .single();
+    if (!doc?.dropbox_path) {
+      console.error("Doc has no dropbox_path");
+      process.exit(1);
+    }
+    resolvedPath = doc.dropbox_path;
+    displayFileName = doc.file_name;
+    displayDocId = doc.id.slice(0, 8);
   }
-  console.log(`doc:       ${doc.id.slice(0, 8)}`);
-  console.log(`file_name: ${doc.file_name}`);
-  console.log(`path:      ${doc.dropbox_path}`);
+  console.log(`doc:       ${displayDocId}`);
+  console.log(`file_name: ${displayFileName}`);
+  console.log(`path:      ${resolvedPath}`);
 
   // Download from Dropbox
   const { Dropbox } = await import("dropbox");
@@ -1330,7 +1347,7 @@ async function cmdExtractDoc() {
     fetch: patchedFetch,
   });
   console.log("\nDownloading...");
-  const dl = await dbx.filesDownload({ path: doc.dropbox_path });
+  const dl = await dbx.filesDownload({ path: resolvedPath });
   const buffer = Buffer.from((dl.result).fileBinary);
   console.log(`downloaded ${buffer.length} bytes`);
 
@@ -1360,10 +1377,10 @@ Return ONLY the JSON. No prose, no markdown.`;
     process.env.ANTHROPIC_MODEL_SMART || "claude-sonnet-4-6";
   console.log(`model:     ${model}`);
   const isImage = /\.(jpe?g|png|webp|gif|heic|heif)$/i.test(
-    doc.file_name || doc.dropbox_path
+    displayFileName || resolvedPath
   );
   const mediaType = isImage
-    ? (/png$/i.test(doc.file_name || doc.dropbox_path) ? "image/png" : "image/jpeg")
+    ? (/png$/i.test(displayFileName || resolvedPath) ? "image/png" : "image/jpeg")
     : "application/pdf";
   console.log(`\nCalling ${model} (${mediaType})...`);
   const t0 = Date.now();
@@ -2194,7 +2211,7 @@ Subcommands:
   taxonomy-cleanup  [--apply]
   cleanup-multi-doc-dupes [--dry-run]
   detect-multidoc <doc-id-or-prefix> [--from-original=1]
-  extract-doc     <doc-id-or-prefix>
+  extract-doc     <doc-id-or-prefix>  OR  --path=/Archive/...path.jpg
   pay-actions    [--limit=50]
   match-debug    <tx-id-or-prefix>
   check-deploy
