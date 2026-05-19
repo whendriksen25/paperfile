@@ -1269,6 +1269,171 @@ Return ONLY the JSON object. No prose, no markdown.`;
   }
 }
 
+/**
+ * Run a focused receipt-extraction prompt against a SINGLE document's
+ * file and print what Claude returned. No DB writes. Used to debug
+ * cases like "receipt #4 returns empty line_items but the crop looks
+ * fine in Dropbox" — isolates the question of whether Claude can
+ * actually read THIS file in isolation, without the full production
+ * pipeline's surrounding noise.
+ *
+ * Reports:
+ *   - time taken (wall clock + Anthropic-observed)
+ *   - stop_reason from the model
+ *   - input + output tokens
+ *   - sender / total_amount detected
+ *   - line_items count + first 5 names
+ *   - whether the JSON parsed cleanly
+ *
+ * Usage:
+ *   npm run diag extract-doc <doc-id-or-prefix>
+ */
+async function cmdExtractDoc() {
+  const [idArg] = positional();
+  if (!idArg)
+    throw new Error("Usage: diag extract-doc <doc-id-or-prefix>");
+  if (!process.env.ANTHROPIC_API_KEY) {
+    console.error("ANTHROPIC_API_KEY missing");
+    process.exit(1);
+  }
+  const supabase = admin();
+  const docId = await resolveId(supabase, "documents", idArg);
+  if (!docId) {
+    console.error(`No documents row found matching "${idArg}"`);
+    process.exit(1);
+  }
+
+  const { data: doc } = await supabase
+    .from("documents")
+    .select("id, file_name, dropbox_path")
+    .eq("id", docId)
+    .single();
+  if (!doc?.dropbox_path) {
+    console.error("Doc has no dropbox_path");
+    process.exit(1);
+  }
+  console.log(`doc:       ${doc.id.slice(0, 8)}`);
+  console.log(`file_name: ${doc.file_name}`);
+  console.log(`path:      ${doc.dropbox_path}`);
+
+  // Download from Dropbox
+  const { Dropbox } = await import("dropbox");
+  const patchedFetch = async (input, init) => {
+    const res = await fetch(input, init);
+    if (!res.buffer) res.buffer = async () => Buffer.from(await res.arrayBuffer());
+    return res;
+  };
+  const dbx = new Dropbox({
+    clientId: process.env.DROPBOX_APP_KEY,
+    clientSecret: process.env.DROPBOX_APP_SECRET,
+    refreshToken: process.env.DROPBOX_REFRESH_TOKEN,
+    fetch: patchedFetch,
+  });
+  console.log("\nDownloading...");
+  const dl = await dbx.filesDownload({ path: doc.dropbox_path });
+  const buffer = Buffer.from((dl.result).fileBinary);
+  console.log(`downloaded ${buffer.length} bytes`);
+
+  // Focused receipt-extraction prompt. Mirrors the line-items
+  // schema the production prompt asks for but cut down to the bare
+  // minimum so we can attribute success/failure to the IMAGE content,
+  // not to prompt complexity.
+  const prompt = `Extract this receipt's data and return STRICT JSON:
+{
+  "sender": "<store name as printed at top>",
+  "total_amount": <number, the printed total>,
+  "currency": "<3-letter code or symbol>",
+  "document_date": "YYYY-MM-DD or null",
+  "line_items": [
+    { "name": "<item name as printed>", "price": <number>, "quantity": <number, default 1> }
+  ]
+}
+
+Enumerate EVERY printed line item — every product, every fee, every discount. If you can read the name but not the price, include the line with price: null. Empty line_items is the wrong answer for a receipt with visible item lines.
+
+Return ONLY the JSON. No prose, no markdown.`;
+
+  // Call Sonnet
+  const { default: Anthropic } = await import("@anthropic-ai/sdk");
+  const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  const model =
+    process.env.ANTHROPIC_MODEL_SMART || "claude-sonnet-4-6";
+  console.log(`model:     ${model}`);
+  const isImage = /\.(jpe?g|png|webp|gif|heic|heif)$/i.test(
+    doc.file_name || doc.dropbox_path
+  );
+  const mediaType = isImage
+    ? (/png$/i.test(doc.file_name || doc.dropbox_path) ? "image/png" : "image/jpeg")
+    : "application/pdf";
+  console.log(`\nCalling ${model} (${mediaType})...`);
+  const t0 = Date.now();
+  const stream = client.messages.stream({
+    model,
+    max_tokens: 16000,
+    temperature: 0,
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: prompt },
+          isImage
+            ? { type: "image", source: { type: "base64", media_type: mediaType, data: buffer.toString("base64") } }
+            : { type: "document", source: { type: "base64", media_type: mediaType, data: buffer.toString("base64") } },
+        ],
+      },
+    ],
+  });
+  const resp = await stream.finalMessage();
+  const ms = Date.now() - t0;
+  const text = resp.content.filter((b) => b.type === "text").map((b) => b.text).join("") || "";
+  console.log(
+    `\nClaude responded in ${ms}ms · in=${resp.usage?.input_tokens} out=${resp.usage?.output_tokens} stop=${resp.stop_reason}`
+  );
+
+  // Parse
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const body = (fence ? fence[1] : text).trim();
+  let parsed = null;
+  try {
+    parsed = JSON.parse(body);
+  } catch (e) {
+    console.log(
+      `\n!!! JSON parse FAILED: ${e instanceof Error ? e.message : String(e)}`
+    );
+    console.log("Raw response (first 500 chars):");
+    console.log(text.slice(0, 500));
+    return;
+  }
+
+  // Print summary
+  const items = Array.isArray(parsed.line_items) ? parsed.line_items : [];
+  console.log("\n=== Extraction result ===");
+  console.log(`  sender:        ${parsed.sender ?? "—"}`);
+  console.log(`  total_amount:  ${parsed.total_amount ?? "—"}`);
+  console.log(`  currency:      ${parsed.currency ?? "—"}`);
+  console.log(`  document_date: ${parsed.document_date ?? "—"}`);
+  console.log(`  line_items:    ${items.length}`);
+  if (items.length === 0) {
+    console.log(
+      "\n  !! line_items is EMPTY — the production retry would kick in here."
+    );
+  } else {
+    console.log("  first lines:");
+    for (const li of items.slice(0, 5)) {
+      console.log(
+        `    · ${li.name ?? "—"}  ${li.price != null ? li.price : ""}`
+      );
+    }
+    if (items.length > 5) console.log(`    ... + ${items.length - 5} more`);
+  }
+  console.log(`\nWall-clock: ${(ms / 1000).toFixed(1)}s`);
+  if (ms > 30_000) {
+    console.log(
+      "  ⚠  >30s — a production retry doubling this would exceed Vercel's 60s function budget."
+    );
+  }
+}
+
 async function cmdRetryFailed() {
   const limit = Number(flag("limit", "0")) || 0;
   const base = process.env.DEV_BASE_URL || "http://localhost:3002";
@@ -2029,6 +2194,7 @@ Subcommands:
   taxonomy-cleanup  [--apply]
   cleanup-multi-doc-dupes [--dry-run]
   detect-multidoc <doc-id-or-prefix> [--from-original=1]
+  extract-doc     <doc-id-or-prefix>
   pay-actions    [--limit=50]
   match-debug    <tx-id-or-prefix>
   check-deploy
@@ -2058,6 +2224,7 @@ const dispatch = {
   "taxonomy-cleanup": cmdTaxonomyCleanup,
   "cleanup-multi-doc-dupes": cmdCleanupMultiDocDupes,
   "detect-multidoc": cmdDetectMultidoc,
+  "extract-doc": cmdExtractDoc,
   "pay-actions": cmdPayActions,
   "match-debug": cmdMatchDebug,
   "check-deploy": cmdCheckDeploy,

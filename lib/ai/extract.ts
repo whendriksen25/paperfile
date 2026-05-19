@@ -397,6 +397,12 @@ export interface ExtractOptions {
    *  "enumerate every printed line item" preface to the prompt and
    *  guards against infinite recursion. Callers should NEVER set this. */
   __isRetry?: boolean;
+  /** When true, skip the auto-retry on empty line_items. Set by the
+   *  multi-doc job worker because each per-crop step has a 60s Vercel
+   *  budget — a second call doubles the time and can blow the budget.
+   *  Single-doc synchronous callers leave this false to keep the retry
+   *  safety net for marginal-quality receipts. */
+  disableLineItemRetry?: boolean;
 }
 
 export async function extractDocument(
@@ -535,6 +541,7 @@ export async function extractDocument(
       !isMultiDocShape &&
       mimeType.startsWith("image/") &&
       !opts.__isRetry &&
+      !opts.disableLineItemRetry &&
       shouldRetryForLineItems(parsed)
     ) {
       console.log(

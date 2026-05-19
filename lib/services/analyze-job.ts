@@ -730,7 +730,14 @@ async function runStep(
   const ex = await extractDocument(
     cropBuffer,
     `${parent.file_name || "crop"}_part${stepIndex + 1}.jpg`,
-    { taxonomyHint }
+    {
+      taxonomyHint,
+      // Job worker has a per-step 60s Vercel budget. A retry on empty
+      // line_items doubles the wall-clock and can blow the budget;
+      // leave the empty result as-is and let the user re-analyse this
+      // one child synchronously later if they want a retry.
+      disableLineItemRetry: true,
+    }
   );
   const d = ex.data;
   if (!d || "error" in d || isMultiDoc(d)) {
