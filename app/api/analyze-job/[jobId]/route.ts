@@ -82,9 +82,15 @@ export async function GET(
       return NextResponse.json({ error: "Forbidden" }, { status: 403 });
     }
 
-    // Auto-kick: if processing AND we have a pending step AND no step
-    // is currently 'processing' (or one is stuck >90s), nudge the
-    // worker. Fire-and-forget — we don't await the response.
+    // Auto-kick: nudge the worker when there's something to do. Two
+    // triggers, either of which fires the kick:
+    //   1. A pending step exists AND no step is currently in-flight
+    //      (the normal advance case).
+    //   2. A step is stuck in 'processing' for >90s (Vercel killed its
+    //      worker; the server-side recovery code in processNextAnalyzeStep
+    //      will mark it failed at >120s and let the job finalize). The
+    //      previous version only kicked when there was ALSO a pending
+    //      step, which left jobs stuck forever when the LAST step hung.
     if (job.status === "processing") {
       const steps = job.steps_state || [];
       const hasPending = steps.some((s) => s.status === "pending");
@@ -94,7 +100,9 @@ export async function GET(
         ? Date.now() - new Date(inFlight.started_at).getTime()
         : 0;
       const isStuck = !!inFlight && inFlightAge > stuckMs;
-      if (hasPending && (!inFlight || isStuck)) {
+      const shouldKick =
+        (hasPending && (!inFlight || isStuck)) || (!hasPending && isStuck);
+      if (shouldKick) {
         // Build absolute URL so server-side fetch works (relative paths
         // don't resolve in Node). Forward auth cookies so the step
         // route's service-client + verification still pass.

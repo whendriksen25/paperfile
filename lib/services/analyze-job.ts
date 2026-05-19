@@ -600,7 +600,22 @@ export async function processNextAnalyzeStep(
     (s) => s.status === "pending"
   );
   if (!nextStep) {
-    // No pending step — finalize if not already done.
+    // No pending step. Two sub-cases:
+    //   - Some step is still 'processing' (recovery didn't fire because
+    //     it wasn't yet at 120s). Don't finalize — wait for the next
+    //     poll, by which point the recovery will mark it failed.
+    //   - All steps are 'done' or 'failed' → ready to finalize.
+    const stillInFlight = (job.steps_state || []).some(
+      (s) => s.status === "processing"
+    );
+    if (stillInFlight) {
+      return {
+        status: "processing",
+        done: false,
+        completed_crops: job.completed_crops,
+        total_crops: job.total_crops,
+      };
+    }
     await finalizeJob(admin, job);
     return {
       status: "done",
