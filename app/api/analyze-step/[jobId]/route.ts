@@ -64,6 +64,63 @@ export async function POST(
       );
     }
 
+    // Optional ?retry_step=N — reset that step's status back to pending
+    // BEFORE the worker picks. Used by the "retry" button in the UI
+    // for a step that auto-failed (e.g. hang timeout). Without this
+    // reset the worker would skip the failed step and go to the next
+    // pending one, which isn't what the user clicked.
+    const retryStepParam = request.nextUrl.searchParams.get("retry_step");
+    if (retryStepParam != null) {
+      const retryIdx = Number.parseInt(retryStepParam, 10);
+      if (Number.isFinite(retryIdx) && retryIdx >= 0) {
+        const { data: cur } = await admin
+          .from("analyze_jobs")
+          .select("steps_state, completed_crops, status")
+          .eq("id", jobId)
+          .maybeSingle();
+        if (cur) {
+          const curRow = cur as {
+            steps_state: Array<{
+              index: number;
+              status: string;
+              [k: string]: unknown;
+            }>;
+            completed_crops: number;
+            status: string;
+          };
+          const stepNow = curRow.steps_state.find((s) => s.index === retryIdx);
+          if (stepNow && stepNow.status === "failed") {
+            const updated = curRow.steps_state.map((s) =>
+              s.index === retryIdx
+                ? {
+                    ...s,
+                    status: "pending",
+                    started_at: null,
+                    completed_at: null,
+                    error: null,
+                  }
+                : s
+            );
+            // Bump completed_crops back down by 1 — we just took one out
+            // of "done/failed" and put it back in the queue.
+            const newCompleted = Math.max(0, curRow.completed_crops - 1);
+            await admin
+              .from("analyze_jobs")
+              .update({
+                steps_state: updated,
+                completed_crops: newCompleted,
+                // If the job had finalised, flip it back to processing.
+                ...(curRow.status === "done" ? { status: "processing" } : {}),
+              })
+              .eq("id", jobId);
+            console.log(
+              `[api/analyze-step] retry: reset step ${retryIdx} to pending`
+            );
+          }
+        }
+      }
+    }
+
     const result = await processNextAnalyzeStep(admin, jobId);
     return NextResponse.json(result);
   } catch (e: unknown) {

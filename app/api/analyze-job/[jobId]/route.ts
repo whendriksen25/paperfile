@@ -123,9 +123,60 @@ export async function GET(
     const childDocIds =
       job.status === "done"
         ? (job.steps_state || [])
-            .filter((s) => s.index !== 0 && s.child_doc_id)
+            .filter((s) => s.child_doc_id)
             .map((s) => s.child_doc_id as string)
         : undefined;
+
+    // History-based estimate: median per-step duration from this user's
+    // last few completed analyze_jobs. Lets the progress panel show an
+    // estimate calibrated to actual local conditions (Anthropic latency,
+    // image complexity, Vercel cold starts) instead of a hardcoded 20s.
+    // Falls back to null if there's no history yet; the panel uses its
+    // hardcoded default in that case.
+    let historicalEtaPerStepSec: number | null = null;
+    try {
+      const { data: pastJobs } = await admin
+        .from("analyze_jobs")
+        .select("steps_state")
+        .eq("user_id", user.id)
+        .eq("status", "done")
+        .order("created_at", { ascending: false })
+        .limit(5);
+      const durations: number[] = [];
+      for (const row of pastJobs || []) {
+        const steps = (row as { steps_state?: typeof job.steps_state })
+          .steps_state || [];
+        for (const s of steps) {
+          if (
+            s.status === "done" &&
+            s.started_at &&
+            s.completed_at
+          ) {
+            const ms =
+              new Date(s.completed_at).getTime() -
+              new Date(s.started_at).getTime();
+            if (ms > 1000 && ms < 5 * 60_000) {
+              // Sanity-clamp: ignore <1s (likely instant fallbacks) and
+              // >5min (likely stuck-then-recovered outliers).
+              durations.push(ms / 1000);
+            }
+          }
+        }
+      }
+      if (durations.length > 0) {
+        durations.sort((a, b) => a - b);
+        const mid = Math.floor(durations.length / 2);
+        historicalEtaPerStepSec =
+          durations.length % 2 === 0
+            ? Math.round((durations[mid - 1] + durations[mid]) / 2)
+            : Math.round(durations[mid]);
+      }
+    } catch (e) {
+      console.warn(
+        "[api/analyze-job] historical eta lookup failed (ignoring):",
+        e instanceof Error ? e.message : String(e)
+      );
+    }
 
     return NextResponse.json({
       id: job.id,
@@ -141,6 +192,7 @@ export async function GET(
         crop_paths: job.payload?.crop_paths || [],
       },
       child_doc_ids: childDocIds,
+      historical_eta_per_step_sec: historicalEtaPerStepSec,
       created_at: job.created_at,
       updated_at: job.updated_at,
     });

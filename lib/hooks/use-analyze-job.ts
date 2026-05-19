@@ -37,6 +37,11 @@ export interface AnalyzeJobState {
     crop_paths: string[];
   };
   child_doc_ids?: string[];
+  /** Median per-step duration (seconds) from this user's recent
+   * completed analyze_jobs. The progress panel uses this for its
+   * countdown estimate when present; falls back to a hardcoded default
+   * when null (first-time user, no history yet). */
+  historical_eta_per_step_sec?: number | null;
   created_at: string;
   updated_at: string;
 }

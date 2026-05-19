@@ -549,6 +549,53 @@ export async function processNextAnalyzeStep(
     };
   }
 
+  // Hang recovery: before picking a new step, look for steps that
+  // claim to be "processing" but have been stuck for >120s. Vercel kills
+  // the worker function at 60s, so any step that hasn't completed in
+  // 120s is dead — we mark it failed so the job can finish (the user
+  // can retry that one step from the UI). Without this, a hung step
+  // leaves the job in 'processing' forever and the live progress UI
+  // just spins.
+  const STUCK_TIMEOUT_MS = 120_000;
+  const nowMs = Date.now();
+  const recoveredSteps = (job.steps_state || []).map((s) => {
+    if (s.status === "processing" && s.started_at) {
+      const age = nowMs - new Date(s.started_at).getTime();
+      if (age > STUCK_TIMEOUT_MS) {
+        console.warn(
+          `[analyze-job] step ${s.index} stuck for ${Math.round(age / 1000)}s — marking failed`
+        );
+        return {
+          ...s,
+          status: "failed" as const,
+          completed_at: new Date(nowMs).toISOString(),
+          error: `Worker timeout (>${STUCK_TIMEOUT_MS / 1000}s)`,
+        };
+      }
+    }
+    return s;
+  });
+  const recoveredCount = recoveredSteps.filter(
+    (s, i) => job.steps_state[i].status !== s.status
+  ).length;
+  if (recoveredCount > 0) {
+    // Increment completed_crops so the job's progress accounting reflects
+    // the failed-as-completed steps (otherwise we never reach total_crops
+    // and the job never finalizes).
+    const newCompleted = recoveredSteps.filter(
+      (s) => s.status === "done" || s.status === "failed"
+    ).length;
+    await admin
+      .from("analyze_jobs")
+      .update({
+        steps_state: recoveredSteps,
+        completed_crops: newCompleted,
+      })
+      .eq("id", job.id);
+    job.steps_state = recoveredSteps;
+    job.completed_crops = newCompleted;
+  }
+
   const nextStep = (job.steps_state || []).find(
     (s) => s.status === "pending"
   );

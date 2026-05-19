@@ -135,11 +135,20 @@ function PanelBody({
     [state.steps_state]
   );
 
+  // Per-step ETA — prefer the median from this user's recent completed
+  // jobs (server-computed in /api/analyze-job/[jobId]). Falls back to
+  // the hardcoded 20s when no history exists (first run).
+  const perStepEtaS =
+    typeof state.historical_eta_per_step_sec === "number" &&
+    state.historical_eta_per_step_sec > 0
+      ? state.historical_eta_per_step_sec
+      : ETA_PER_STEP_S;
+
   // Overall ETA in seconds = remaining steps × per-step estimate, + a
   // little finalisation overhead. Recomputed every render; the
   // useCountdown hook independently counts down per second.
   const totalEtaS =
-    remainingPendingOrProcessing * ETA_PER_STEP_S +
+    remainingPendingOrProcessing * perStepEtaS +
     (remainingPendingOrProcessing > 0 ? ETA_FINALISE_S : 0);
 
   return (
@@ -177,6 +186,7 @@ function PanelBody({
             step={activeStep}
             total={state.total_crops}
             completed={state.completed_crops}
+            perStepEtaS={perStepEtaS}
           />
         )}
         {/* 4. Finalising — only shown when last step done but job not yet
@@ -273,7 +283,11 @@ function PhaseRow({
       </span>
       {countdown !== null && (
         <span className="text-[11px] text-muted-foreground tabular-nums">
-          {countdown > 0 ? `~${countdown}s` : "taking longer than expected…"}
+          {countdown.phase === "counting"
+            ? `~${countdown.remaining}s`
+            : countdown.phase === "overflow_brief"
+              ? "taking longer than expected…"
+              : `+${countdown.over}s over estimate`}
         </span>
       )}
     </div>
@@ -284,10 +298,12 @@ function ActiveStepRow({
   step,
   total,
   completed,
+  perStepEtaS,
 }: {
   step: AnalyzeJobStep;
   total: number;
   completed: number;
+  perStepEtaS: number;
 }) {
   const isProcessing = step.status === "processing";
   const label = `OCR'ing receipt ${completed + 1} of ${total} — ${formatHint(step)}`;
@@ -296,7 +312,7 @@ function ActiveStepRow({
       icon={<Spinner className="h-4 w-4" />}
       label={label}
       status={isProcessing ? "processing" : "pending"}
-      countdownSeconds={ETA_PER_STEP_S}
+      countdownSeconds={perStepEtaS}
     />
   );
 }
@@ -309,15 +325,13 @@ function StepLine({ step, jobId }: { step: AnalyzeJobStep; jobId: string }) {
     setRetrying(true);
     setRetryError(null);
     try {
-      // Reset this step to pending then trigger the worker. There's no
-      // dedicated reset endpoint yet — the GET-route auto-kick will
-      // fire the worker on the next poll once we patch the row. But
-      // we don't expose a row-mutation endpoint from the client either,
-      // so for now we just POST to the step route which will pick up
-      // any pending step (including ones that error'd through reload).
-      const res = await fetch(`/api/analyze-step/${jobId}`, {
-        method: "POST",
-      });
+      // Pass ?retry_step=N — server resets this step to pending then
+      // processes it. Without the param the worker would pick the next
+      // pending step and skip the one the user clicked.
+      const res = await fetch(
+        `/api/analyze-step/${jobId}?retry_step=${step.index}`,
+        { method: "POST" }
+      );
       if (!res.ok) {
         const text = await res.text().catch(() => "");
         throw new Error(text.slice(0, 120) || `HTTP ${res.status}`);
@@ -400,20 +414,55 @@ function formatEta(seconds: number): string {
 }
 
 /**
- * Tick-down hook — returns the remaining seconds (clamped at 0). Resets
- * to the initial value whenever the input changes, so re-mounting the
- * row for a new step starts a fresh countdown. Returns null when input
- * is null (no countdown shown).
+ * Tick hook used by the step countdown. Returns a two-phase state:
+ *   - phase: 'counting' while remaining > 0 (shows "~Xs left")
+ *   - phase: 'overflow_brief' for ~2 seconds after remaining hits 0
+ *     (shows "Taking longer than expected")
+ *   - phase: 'overflow_counting' once we're past the brief flash
+ *     (shows "+Xs over estimate")
+ *
+ * Resets whenever the initial seconds input changes (e.g. moving to a
+ * new step). Returns null when input is null.
  */
-function useCountdown(seconds: number | null): number | null {
-  const [remaining, setRemaining] = useState<number | null>(seconds);
+type CountdownState =
+  | { phase: "counting"; remaining: number }
+  | { phase: "overflow_brief"; over: number }
+  | { phase: "overflow_counting"; over: number };
+
+function useCountdown(seconds: number | null): CountdownState | null {
+  const [state, setState] = useState<CountdownState | null>(
+    seconds === null ? null : { phase: "counting", remaining: seconds }
+  );
   useEffect(() => {
-    setRemaining(seconds);
-    if (seconds === null) return;
+    if (seconds === null) {
+      setState(null);
+      return;
+    }
+    setState({ phase: "counting", remaining: seconds });
     const interval = setInterval(() => {
-      setRemaining((r) => (r === null ? null : Math.max(0, r - 1)));
+      setState((s) => {
+        if (s === null) return null;
+        if (s.phase === "counting") {
+          if (s.remaining > 1) {
+            return { phase: "counting", remaining: s.remaining - 1 };
+          }
+          // Tipped past zero — show the brief "Taking longer" flash.
+          return { phase: "overflow_brief", over: 1 };
+        }
+        if (s.phase === "overflow_brief") {
+          // After ~2 seconds in the brief state, switch to the live
+          // "+Xs over estimate" counter so the user sees something
+          // useful rather than a stuck label.
+          if (s.over >= 2) {
+            return { phase: "overflow_counting", over: s.over + 1 };
+          }
+          return { phase: "overflow_brief", over: s.over + 1 };
+        }
+        // overflow_counting — keep climbing.
+        return { phase: "overflow_counting", over: s.over + 1 };
+      });
     }, 1000);
     return () => clearInterval(interval);
   }, [seconds]);
-  return remaining;
+  return state;
 }
