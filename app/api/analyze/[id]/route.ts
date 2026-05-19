@@ -469,8 +469,65 @@ export async function POST(
               reExtracted.push(d as DocumentExtraction);
             }
           }
-          extraction = reExtracted[0];
-          multiDocChildren = reExtracted.slice(1);
+          // NEW MODEL: parent stays as the original scan container; ALL
+          // N receipts become children (not N-1 with receipt #1 folded
+          // into the parent). Build a synthetic container extraction for
+          // the parent row — aggregated sender/amount/date so the inbox
+          // shows useful metadata at a glance.
+          const totalAmount = reExtracted
+            .map((r) => r.amount)
+            .filter((a): a is number => typeof a === "number")
+            .reduce((s, n) => s + n, 0);
+          const sendersSet = new Set(
+            reExtracted
+              .map((r) => (r.sender || "").trim())
+              .filter(Boolean)
+          );
+          const commonSender =
+            sendersSet.size === 1 ? Array.from(sendersSet)[0] : null;
+          const currenciesSet = new Set(
+            reExtracted
+              .map((r) => (r.currency || "").trim())
+              .filter(Boolean)
+          );
+          const commonCurrency =
+            currenciesSet.size === 1 ? Array.from(currenciesSet)[0] : null;
+          const allDates = reExtracted
+            .map((r) => r.document_date)
+            .filter((d): d is string => !!d)
+            .sort();
+          const latestDate = allDates.length > 0 ? allDates[allDates.length - 1] : null;
+          const n = reExtracted.length;
+          const containerExtraction: DocumentExtraction = {
+            document_type: "multi_doc_scan",
+            document_subtype: null,
+            confidence: 1,
+            document_date: latestDate,
+            sender: commonSender,
+            recipient: null,
+            language: null,
+            profile_hint: null,
+            amount: totalAmount || null,
+            currency: commonCurrency,
+            purchase_category: null,
+            title: commonSender
+              ? `${commonSender} — ${n}-receipt scan`
+              : `Multi-receipt scan (${n} receipts)`,
+            summary:
+              totalAmount > 0
+                ? `${n} receipts on one scan totalling ${commonCurrency || "EUR"} ${totalAmount.toFixed(2)}.`
+                : `${n} receipts detected on one scan.`,
+            tags: [],
+            extracted_fields: { _is_multidoc_container: true, _child_count: n },
+            ocr_text: undefined,
+            needs_action: false,
+            action_type: null,
+            due_date: null,
+            action_summary: null,
+          };
+          extraction = containerExtraction;
+          // EVERY receipt is a child under the new model.
+          multiDocChildren = reExtracted;
           // Upload each crop to Dropbox and stash the resulting paths so
           // the file-move + child-spawn code below uses them.
           perCropDropboxBuffers = crops;
@@ -712,20 +769,11 @@ export async function POST(
             );
           }
         }
-        // Repoint parent to crop[0] if it uploaded successfully.
-        if (perCropDropboxPaths[0]) {
-          newPath = perCropDropboxPaths[0];
-          try {
-            shareLink = await storage.getOrCreateShareLink(newPath);
-          } catch (e) {
-            console.warn(
-              "[api/analyze] share link refresh for crop[0] failed",
-              e
-            );
-          }
-        }
+        // NEW MODEL: parent stays at the original full scan; do NOT
+        // repoint to crop[0]. Children get their own crop paths via
+        // perCropDropboxPaths[childIdx].
         console.log(
-          `[api/analyze] uploaded ${perCropDropboxPaths.filter(Boolean).length}/${perCropDropboxBuffers.length} crops; parent → ${newPath}`
+          `[api/analyze] uploaded ${perCropDropboxPaths.filter(Boolean).length}/${perCropDropboxBuffers.length} crops; parent stays at ${newPath}`
         );
       } catch (e) {
         console.warn(
@@ -1297,13 +1345,13 @@ export async function POST(
 
           const childInsert = {
             user_id: doc.user_id,
-            // Share the parent's physical file + storage metadata.
-            // If we cropped this scan, point THIS child at its own crop;
-            // otherwise fall back to the parent's path (shared scan).
-            // perCropDropboxPaths[0] is the parent's crop, [1..] are children,
-            // so the child at index `childIdx` uses path[childIdx + 1].
+            // Point THIS child at its own crop file. NEW MODEL:
+            // every receipt is a child (no parent-takes-crop-0), so the
+            // child at index `childIdx` uses perCropDropboxPaths[childIdx]
+            // directly. Falls back to the parent's path if for some
+            // reason the crop upload failed (rare, defensive).
             dropbox_path:
-              perCropDropboxPaths[childIdx + 1] ||
+              perCropDropboxPaths[childIdx] ||
               newPath ||
               doc.dropbox_path,
             dropbox_shared_link: shareLink || doc.dropbox_shared_link,

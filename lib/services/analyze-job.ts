@@ -746,7 +746,6 @@ async function finishStep(
 ): Promise<AnalyzeStepResult> {
   const now = new Date().toISOString();
   let childDocId: string | null = null;
-  const isFirst = stepIndex === 0;
 
   // payment_status overrides (mirror inline analyze route).
   const ef = extraction.extracted_fields || {};
@@ -764,81 +763,12 @@ async function finishStep(
   const actionType =
     extraction.action_type || (needsAction ? "pay" : null);
 
-  if (isFirst) {
-    // Step 0 — update the parent row in place. This row becomes the
-    // first receipt of the new split. The dedup cleanup at the end of
-    // the job will remove old children that no longer correspond.
-    //
-    // The parent's _original_scan_path stays set (or gets set if it
-    // wasn't already) so future "Re-analyse full scan" clicks know
-    // where the original lives. dropbox_path is repointed to crop[0]
-    // so the inbox preview matches the parent's extracted content.
-    const existingEf =
-      (parent.extracted_fields as Record<string, unknown> | null) || {};
-    const originalPath = job.payload.original_path;
-    let shareLink: string | null = parent.dropbox_shared_link;
-    try {
-      const storage = getStorage(parent.storage_provider);
-      shareLink = await storage.getOrCreateShareLink(cropPath);
-    } catch (e) {
-      console.warn("[analyze-job] share link refresh for crop[0] failed", e);
-    }
-
-    // Polygons from the prepare step — persisted on the parent (this
-    // row) so the per-child UI can describe original position on the
-    // scan ("top-left of the original scan") and any later overlay
-    // renderer has the geometry available.
-    const polygonsForMulti =
-      Array.isArray(job.payload.polygons) && job.payload.polygons.length > 0
-        ? job.payload.polygons
-        : null;
-    const multiDocMeta = polygonsForMulti
-      ? { polygons: polygonsForMulti, total: job.total_crops }
-      : null;
-
-    const updates: Record<string, unknown> = {
-      dropbox_path: cropPath,
-      dropbox_shared_link: shareLink,
-      document_type: extraction.document_type || null,
-      document_subtype: extraction.document_subtype || null,
-      confidence: extraction.confidence ?? null,
-      document_date: extraction.document_date || null,
-      sender: extraction.sender || null,
-      recipient: extraction.recipient || null,
-      person: extraction.profile_hint || null,
-      language: extraction.language || null,
-      amount: extraction.amount ?? null,
-      currency: extraction.currency || null,
-      purchase_category: extraction.purchase_category || null,
-      title: extraction.title || null,
-      summary: extraction.summary || null,
-      tags: extraction.tags || [],
-      extracted_fields: {
-        ...(extraction.extracted_fields || {}),
-        // Always re-stamp the original full-scan path so the
-        // "Re-analyse full scan" button keeps working on this row
-        // even after multiple re-splits.
-        _original_scan_path: originalPath,
-        ...(multiDocMeta ? { _multidoc: multiDocMeta } : {}),
-      },
-      ocr_text: extraction.ocr_text || null,
-      needs_action: needsAction,
-      action_type: needsAction ? actionType || "other" : null,
-      due_date: extraction.due_date || null,
-      action_summary:
-        needsAction && extraction.action_summary
-          ? extraction.action_summary
-          : null,
-      status: "processed",
-    };
-    const { error: upErr } = await admin
-      .from("documents")
-      .update(updates)
-      .eq("id", parent.id);
-    if (upErr) throw upErr;
-    childDocId = parent.id;
-  } else {
-    // Steps 1..N — insert a new child doc row.
+  {
+    // EVERY step inserts a new CHILD doc row. The parent never gets
+    // repurposed as receipt #1 anymore — it stays as the container
+    // (its dropbox_path keeps pointing at the original full scan).
+    // finalizeJob() updates the parent's container metadata once all
+    // steps have completed.
     let shareLink: string | null = parent.dropbox_shared_link;
     try {
       const storage = getStorage(parent.storage_provider);
@@ -979,23 +909,29 @@ async function finalizeJob(
     steps_state: StepState[];
     completed_crops: number;
     total_crops: number;
+    payload?: JobPayload;
   }
 ): Promise<void> {
   // Skip if already done (idempotent re-runs from the GET-route auto-kick).
   const { data: cur } = await admin
     .from("analyze_jobs")
-    .select("status")
+    .select("status, payload")
     .eq("id", job.id)
     .maybeSingle();
   if (cur && (cur as { status: string }).status === "done") return;
+  // Use the freshly-read payload if the caller didn't pass one.
+  const payload =
+    job.payload || (cur as { payload?: JobPayload } | null)?.payload;
 
-  // Spawned IDs include the parent (step 0 → parent.id) and every child.
+  // Spawned child IDs — every step's child_doc_id (the parent is NOT
+  // in this set; it's the container, kept and updated below).
   const spawnedIds = new Set<string>();
   for (const s of job.steps_state) {
     if (s.child_doc_id) spawnedIds.add(s.child_doc_id);
   }
-  spawnedIds.add(job.document_id); // parent is always kept
 
+  // 1. Dedup-on-resplit: delete any OLD child rows that aren't part of
+  //    this job's spawned set (and their actions).
   try {
     const { data: existingKids } = await admin
       .from("documents")
@@ -1015,10 +951,136 @@ async function finalizeJob(
     console.warn("[analyze-job] dedup-on-resplit cleanup failed:", e);
   }
 
-  // Activity log entry — mirrors the inline route's multi_doc_split log.
+  // 2. Reset parent to "container" state. The parent represents the
+  //    ORIGINAL full multi-receipt scan, not any one receipt on it.
+  //    Aggregate sender/amount/date from the spawned children so the
+  //    parent's metadata reflects the whole scan at a glance.
+  try {
+    const childIds = Array.from(spawnedIds);
+    let aggregateSender: string | null = null;
+    let aggregateAmount: number | null = null;
+    let aggregateDate: string | null = null;
+    let aggregateCurrency: string | null = null;
+    if (childIds.length > 0) {
+      const { data: kidsRaw } = await admin
+        .from("documents")
+        .select("sender, amount, currency, document_date")
+        .in("id", childIds);
+      const kids = (kidsRaw || []) as Array<{
+        sender: string | null;
+        amount: number | null;
+        currency: string | null;
+        document_date: string | null;
+      }>;
+      // Sender: if all children agree, use it; else null.
+      const senders = new Set(
+        kids.map((k) => (k.sender || "").trim()).filter(Boolean)
+      );
+      if (senders.size === 1) aggregateSender = Array.from(senders)[0];
+      // Amount: sum of all child amounts (so the inbox shows total spend
+      // on this scan at a glance).
+      const amounts = kids
+        .map((k) => k.amount)
+        .filter((a): a is number => typeof a === "number");
+      if (amounts.length > 0) {
+        aggregateAmount = amounts.reduce((s, n) => s + n, 0);
+      }
+      // Currency: if children agree.
+      const currencies = new Set(
+        kids.map((k) => (k.currency || "").trim()).filter(Boolean)
+      );
+      if (currencies.size === 1) aggregateCurrency = Array.from(currencies)[0];
+      // Date: most recent across children (or null if none have dates).
+      const dates = kids
+        .map((k) => k.document_date)
+        .filter((d): d is string => !!d)
+        .sort();
+      if (dates.length > 0) aggregateDate = dates[dates.length - 1];
+    }
+
+    // Container title — concise and identifiable in the inbox listing.
+    const n = job.total_crops;
+    const title = aggregateSender
+      ? `${aggregateSender} — ${n}-receipt scan`
+      : `Multi-receipt scan (${n} receipts)`;
+    const summary = aggregateAmount != null
+      ? `${n} receipts on one scan totalling ${aggregateCurrency || "EUR"} ${aggregateAmount.toFixed(2)}.`
+      : `${n} receipts detected on one scan.`;
+
+    const originalPath = payload?.original_path || null;
+    const polygons =
+      Array.isArray(payload?.polygons) && payload.polygons.length > 0
+        ? payload.polygons
+        : null;
+
+    // Look up current parent row so we can preserve user-set fields
+    // (primary_profile_id, tags they added, etc.) where reasonable.
+    const { data: parentRow } = await admin
+      .from("documents")
+      .select("extracted_fields, primary_profile_id, dropbox_path, file_name")
+      .eq("id", job.document_id)
+      .maybeSingle();
+    const existingEf = (parentRow?.extracted_fields ||
+      {}) as Record<string, unknown>;
+
+    // Drop receipt-specific fields from extracted_fields — the parent
+    // is a container, not a receipt. Keep only multidoc / system flags.
+    const containerEf: Record<string, unknown> = {
+      _is_multidoc_container: true,
+      _child_count: n,
+      ...(originalPath ? { _original_scan_path: originalPath } : {}),
+      ...(polygons ? { _multidoc: { polygons, total: n } } : {}),
+    };
+    // Preserve any other system-level flags the user/system might have
+    // set on this row (anything starting with _ that we don't recognise).
+    for (const [k, v] of Object.entries(existingEf)) {
+      if (
+        k.startsWith("_") &&
+        !["_is_multidoc_container", "_child_count", "_original_scan_path", "_multidoc"].includes(k)
+      ) {
+        containerEf[k] = v;
+      }
+    }
+
+    const parentUpdates: Record<string, unknown> = {
+      // Reset dropbox_path back to the original full scan — overrides
+      // the old _part1.jpg pointer from the previous architecture.
+      dropbox_path: originalPath || parentRow?.dropbox_path || null,
+      document_type: "multi_doc_scan",
+      document_subtype: null,
+      title,
+      summary,
+      sender: aggregateSender,
+      amount: aggregateAmount,
+      currency: aggregateCurrency,
+      document_date: aggregateDate,
+      purchase_category: null,
+      // Container has no line items or OCR text of its own.
+      ocr_text: null,
+      tags: [],
+      needs_action: false,
+      action_type: null,
+      due_date: null,
+      action_summary: null,
+      extracted_fields: containerEf,
+      status: "processed",
+      needs_review: false,
+    };
+    const { error: parentErr } = await admin
+      .from("documents")
+      .update(parentUpdates)
+      .eq("id", job.document_id);
+    if (parentErr) {
+      console.warn("[analyze-job] parent container update failed:", parentErr);
+    }
+  } catch (e) {
+    console.warn("[analyze-job] container metadata update failed:", e);
+  }
+
+  // 3. Activity log entry — mirrors the inline route's multi_doc_split log.
   try {
     const childIds = job.steps_state
-      .filter((s) => s.index !== 0 && s.child_doc_id)
+      .filter((s) => s.child_doc_id)
       .map((s) => s.child_doc_id as string);
     await admin.from("maintenance_log").insert({
       user_id: job.user_id,

@@ -33,6 +33,10 @@ const DOCUMENT_TYPES = [
   "rental_agreement",
   "warranty",
   "certificate",
+  // Container type: the original multi-receipt scan, not a receipt itself.
+  // Set automatically by the analyze pipeline when a scan splits into N
+  // children; the parent row becomes the container.
+  "multi_doc_scan",
   "other",
 ] as const;
 

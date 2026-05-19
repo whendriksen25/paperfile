@@ -367,6 +367,15 @@ export default async function DocumentDetail({
   }
 
   const isPending = doc.status === "pending" || doc.status === "processing";
+  // True when THIS doc is the container of a multi-doc split (the
+  // original full scan, not any one receipt on it). Drives a clearer
+  // header label + suppresses the receipt-style sections that don't
+  // apply to a container.
+  const isMultiDocContainer =
+    doc.document_type === "multi_doc_scan" ||
+    !!(doc.extracted_fields as Record<string, unknown> | null)?.[
+      "_is_multidoc_container"
+    ];
 
   return (
     <div className="px-5 md:px-10 py-6 md:py-10 max-w-5xl mx-auto">
@@ -379,12 +388,23 @@ export default async function DocumentDetail({
       </Link>
 
       <header className="mb-6">
+        {isMultiDocContainer && (
+          <div className="text-[10px] uppercase tracking-wider font-bold text-brand-purple mb-1">
+            Multi-receipt scan · {siblings.length - 1 > 0 ? siblings.length - 1 : siblings.length} {" "}
+            {(siblings.length - 1 > 0 ? siblings.length - 1 : siblings.length) === 1
+              ? "receipt"
+              : "receipts"}
+          </div>
+        )}
         <h1 className="text-3xl font-extrabold tracking-tight">
           {doc.title || displayName || "Untitled document"}
         </h1>
         <p className="text-sm text-muted-foreground mt-1">
-          {doc.sender || titleCase(doc.document_type) || "Unknown sender"}
-          {doc.document_date ? ` · ${formatDate(doc.document_date)}` : ""}
+          {isMultiDocContainer
+            ? `${doc.sender || "Container"} — re-analyse to re-split, or open any of the ${siblings.length - 1 > 0 ? siblings.length - 1 : siblings.length} receipts below`
+            : `${doc.sender || titleCase(doc.document_type) || "Unknown sender"}${
+                doc.document_date ? ` · ${formatDate(doc.document_date)}` : ""
+              }`}
         </p>
 
         {/* Multi-doc sibling badge — shown when this scan was split into
