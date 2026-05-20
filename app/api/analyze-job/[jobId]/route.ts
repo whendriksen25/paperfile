@@ -47,7 +47,7 @@ export async function GET(
       id: string;
       user_id: string;
       document_id: string;
-      status: "pending" | "processing" | "done" | "failed";
+      status: "pending" | "processing" | "done" | "failed" | "cancelled";
       phase: string | null;
       total_crops: number;
       completed_crops: number;

@@ -21,7 +21,7 @@ export interface AnalyzeJobStep {
 export interface AnalyzeJobState {
   id: string;
   document_id: string;
-  status: "pending" | "processing" | "done" | "failed";
+  status: "pending" | "processing" | "done" | "failed" | "cancelled";
   phase: string | null;
   total_crops: number;
   completed_crops: number;
@@ -120,18 +120,16 @@ export function useAnalyzeJob(jobId: string | null): UseAnalyzeJobReturn {
     setLoading(true);
     // Immediate first poll so the UI shows real state without a 1.5s
     // gap of "loading…".
+    const isTerminal = (s: string) =>
+      s === "done" || s === "failed" || s === "cancelled";
     fetchOnce(jobId).then((res) => {
       // If the job is already terminal on first poll, don't start the
       // interval — nothing to drive.
-      if (res && (res.status === "done" || res.status === "failed")) return;
+      if (res && isTerminal(res.status)) return;
       if (!mountedRef.current) return;
       timerRef.current = setInterval(() => {
         fetchOnce(jobId).then((latest) => {
-          if (
-            latest &&
-            (latest.status === "done" || latest.status === "failed") &&
-            timerRef.current
-          ) {
+          if (latest && isTerminal(latest.status) && timerRef.current) {
             clearInterval(timerRef.current);
             timerRef.current = null;
           }

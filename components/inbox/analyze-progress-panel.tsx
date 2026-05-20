@@ -53,21 +53,28 @@ export interface AnalyzeProgressPanelProps {
   onComplete?: () => void;
   /** Fired once when the job transitions to status='failed'. */
   onFailed?: (error: string | null) => void;
+  /** Fired once when the job is cancelled by the user. */
+  onCancelled?: () => void;
 }
 
 export function AnalyzeProgressPanel({
   jobId,
   onComplete,
   onFailed,
+  onCancelled,
 }: AnalyzeProgressPanelProps) {
   const { state, loading, pollError } = useAnalyzeJob(jobId);
   const onCompleteRef = useRef(onComplete);
   const onFailedRef = useRef(onFailed);
+  const onCancelledRef = useRef(onCancelled);
   onCompleteRef.current = onComplete;
   onFailedRef.current = onFailed;
+  onCancelledRef.current = onCancelled;
 
-  // Fire onComplete/onFailed exactly once when the job lands.
-  const firedTerminalRef = useRef<"done" | "failed" | null>(null);
+  // Fire onComplete/onFailed/onCancelled exactly once when the job lands.
+  const firedTerminalRef = useRef<"done" | "failed" | "cancelled" | null>(
+    null
+  );
   useEffect(() => {
     if (!state) return;
     if (state.status === "done" && firedTerminalRef.current !== "done") {
@@ -77,6 +84,13 @@ export function AnalyzeProgressPanel({
     if (state.status === "failed" && firedTerminalRef.current !== "failed") {
       firedTerminalRef.current = "failed";
       onFailedRef.current?.(state.error);
+    }
+    if (
+      state.status === "cancelled" &&
+      firedTerminalRef.current !== "cancelled"
+    ) {
+      firedTerminalRef.current = "cancelled";
+      onCancelledRef.current?.();
     }
   }, [state]);
 
@@ -102,18 +116,36 @@ export function AnalyzeProgressPanel({
     );
   }
 
-  return <PanelBody state={state} pollError={pollError} />;
+  return <PanelBody state={state} pollError={pollError} jobId={jobId} />;
 }
 
 function PanelBody({
   state,
   pollError,
+  jobId,
 }: {
   state: NonNullable<ReturnType<typeof useAnalyzeJob>["state"]>;
   pollError: string | null;
+  jobId: string;
 }) {
   const isDone = state.status === "done";
   const isFailed = state.status === "failed";
+  const isCancelled = state.status === "cancelled";
+  const isTerminal = isDone || isFailed || isCancelled;
+  const [cancelling, setCancelling] = useState(false);
+
+  async function stop() {
+    setCancelling(true);
+    try {
+      await fetch(`/api/analyze-job/${jobId}/cancel`, { method: "POST" });
+      // The poll loop will pick up status='cancelled' on the next tick
+      // and the panel re-renders into the cancelled state.
+    } catch {
+      // Best-effort — if the cancel call fails the user can retry.
+    } finally {
+      setCancelling(false);
+    }
+  }
   const detectedCount =
     state.total_crops || state.payload.detected_docs?.length || 0;
 
@@ -153,16 +185,30 @@ function PanelBody({
 
   return (
     <div className="surface p-4 mt-3 bg-brand-purple/5 border-brand-purple/30 space-y-3">
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-2">
         <div className="text-sm font-bold inline-flex items-center gap-2">
           <Sparkles className="h-4 w-4 text-brand-purple" />
           Re-analysing full scan
         </div>
-        {!isDone && !isFailed && totalEtaS > 0 && (
-          <div className="text-xs text-muted-foreground">
-            ETA ~{formatEta(totalEtaS)}
-          </div>
-        )}
+        <div className="flex items-center gap-2 shrink-0">
+          {!isTerminal && totalEtaS > 0 && (
+            <span className="text-xs text-muted-foreground">
+              ETA ~{formatEta(totalEtaS)}
+            </span>
+          )}
+          {!isTerminal && (
+            <button
+              type="button"
+              onClick={stop}
+              disabled={cancelling}
+              className="text-[11px] font-bold uppercase tracking-wider text-destructive hover:bg-destructive/10 px-2 py-1 rounded inline-flex items-center gap-1 disabled:opacity-50"
+              title="Stop this scan. Receipts already extracted are kept; you can re-analyse to redo."
+            >
+              <X className="h-3.5 w-3.5" />
+              {cancelling ? "Stopping…" : "Stop"}
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Phase rows */}
@@ -181,7 +227,7 @@ function PanelBody({
           status="done"
         />
         {/* 3. Per-step extraction — current focus. */}
-        {!isDone && activeStep && (
+        {!isTerminal && activeStep && (
           <ActiveStepRow
             step={activeStep}
             total={state.total_crops}
@@ -191,8 +237,7 @@ function PanelBody({
         )}
         {/* 4. Finalising — only shown when last step done but job not yet
             flipped to done. */}
-        {!isDone &&
-          !isFailed &&
+        {!isTerminal &&
           state.completed_crops === state.total_crops &&
           state.total_crops > 0 && (
             <PhaseRow
@@ -215,6 +260,13 @@ function PanelBody({
           <PhaseRow
             icon={<AlertTriangle className="h-4 w-4" />}
             label={`Failed${state.error ? `: ${state.error}` : ""}`}
+            status="failed"
+          />
+        )}
+        {isCancelled && (
+          <PhaseRow
+            icon={<X className="h-4 w-4" />}
+            label={`Stopped — ${state.completed_crops} of ${state.total_crops} receipt${state.total_crops === 1 ? "" : "s"} processed before cancel. Re-analyse to redo.`}
             status="failed"
           />
         )}

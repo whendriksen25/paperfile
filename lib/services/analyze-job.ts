@@ -16,6 +16,41 @@ import {
 import type { DocumentExtraction } from "@/types/document";
 
 /**
+ * Retry a Dropbox (or any storage) call on transient errors. The 409
+ * conflicts and occasional 5xx we see during a busy multi-crop job are
+ * usually momentary — a short backoff clears them. Non-transient errors
+ * (404 missing file, auth) are re-thrown immediately so we don't waste
+ * the per-step budget retrying something that won't succeed.
+ */
+async function withDropboxRetry<T>(
+  fn: () => Promise<T>,
+  label: string,
+  maxAttempts = 3
+): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastErr = e;
+      const msg = e instanceof Error ? e.message : String(e);
+      // Transient if it mentions 409 (conflict), 429 (rate), or 5xx.
+      const transient = /\b(409|429|5\d\d)\b/.test(msg) ||
+        /conflict|too many requests|temporarily/i.test(msg);
+      if (!transient || attempt === maxAttempts) {
+        throw e;
+      }
+      const backoffMs = 400 * attempt;
+      console.warn(
+        `[analyze-job] ${label} attempt ${attempt} failed (${msg.slice(0, 80)}); retrying in ${backoffMs}ms`
+      );
+      await new Promise((r) => setTimeout(r, backoffMs));
+    }
+  }
+  throw lastErr;
+}
+
+/**
  * Background-job orchestration for "Re-analyse full scan" on a
  * multi-receipt scan.
  *
@@ -101,7 +136,7 @@ interface DetectResult {
 
 interface StepState {
   index: number;
-  status: "pending" | "processing" | "done" | "failed";
+  status: "pending" | "processing" | "done" | "failed" | "cancelled";
   started_at?: string | null;
   completed_at?: string | null;
   child_doc_id?: string | null;
@@ -141,7 +176,7 @@ export interface PrepareAnalyzeJobResult {
 }
 
 export interface AnalyzeStepResult {
-  status: "pending" | "processing" | "done" | "failed";
+  status: "pending" | "processing" | "done" | "failed" | "cancelled";
   done: boolean;
   completed_crops: number;
   total_crops: number;
@@ -158,7 +193,7 @@ interface JobRow {
   id: string;
   user_id: string;
   document_id: string;
-  status: "pending" | "processing" | "done" | "failed";
+  status: "pending" | "processing" | "done" | "failed" | "cancelled";
   phase: string | null;
   total_crops: number;
   completed_crops: number;
@@ -559,7 +594,13 @@ export async function processNextAnalyzeStep(
   }
   const job = jobRaw as JobRow;
 
-  if (job.status === "done" || job.status === "failed") {
+  if (
+    job.status === "done" ||
+    job.status === "failed" ||
+    job.status === "cancelled"
+  ) {
+    // Terminal states — including user cancellation — do no further
+    // work. Any children already spawned are left in place.
     return {
       status: job.status,
       done: job.status === "done",
@@ -738,8 +779,32 @@ async function runStep(
   const storage = getStorage(parent.storage_provider);
   const cropPath = job.payload.crop_paths[stepIndex] || job.payload.original_path;
 
-  // Download the crop, then re-extract via Sonnet at full resolution.
-  const cropBuffer = await storage.downloadFile(cropPath);
+  // Download the crop (with retry on transient Dropbox errors), then
+  // downsize before extraction so Sonnet responds quickly enough to fit
+  // the per-step 60s Hobby budget.
+  let cropBuffer = await withDropboxRetry(
+    () => storage.downloadFile(cropPath),
+    `download crop ${stepIndex + 1}`
+  );
+
+  // Downsize to ~1600px on the long edge. Receipt text stays legible at
+  // that size, but the smaller image meaningfully cuts Sonnet's response
+  // time — the difference between fitting and blowing the 60s budget on
+  // a slow day. Defensive: any sharp failure keeps the original buffer.
+  try {
+    const sharpMod = await import("sharp");
+    const sharp = sharpMod.default || sharpMod;
+    cropBuffer = await sharp(cropBuffer)
+      .resize({ width: 1600, height: 1600, fit: "inside", withoutEnlargement: true })
+      .jpeg({ quality: 90 })
+      .toBuffer();
+  } catch (e) {
+    console.warn(
+      "[analyze-job] crop downsize failed, using full-res:",
+      e instanceof Error ? e.message : String(e)
+    );
+  }
+
   const taxonomySnapshot = await loadTaxonomySnapshot(admin, job.user_id);
   const taxonomyHint = buildTaxonomyHint(taxonomySnapshot);
 
@@ -751,9 +816,12 @@ async function runStep(
     `${parent.file_name || "crop"}_part${stepIndex + 1}.jpg`,
     {
       taxonomyHint,
-      // Fallback re-enabled now that it's a focused single-task call
-      // (~7-10s on failures only, not a duplicate of the full prompt).
-      // Stays inside the per-step 60s Vercel budget even when it fires.
+      // ONE Sonnet call per step. The focused line-items fallback is a
+      // SECOND call that can double wall-clock on hard receipts — on a
+      // Hobby plan (hard 60s function ceiling) that's what timed steps
+      // out. Empty-line_items children can be fixed by re-analysing the
+      // individual child synchronously, where there's no per-step timer.
+      disableLineItemRetry: true,
     }
   );
   const d = ex.data;
@@ -858,7 +926,12 @@ async function finishStep(
     let shareLink: string | null = parent.dropbox_shared_link;
     try {
       const storage = getStorage(parent.storage_provider);
-      shareLink = await storage.getOrCreateShareLink(cropPath);
+      // Retry on transient 409/5xx — this share-link call is where the
+      // step-2 Dropbox 409 conflict surfaced in the last run.
+      shareLink = await withDropboxRetry(
+        () => storage.getOrCreateShareLink(cropPath),
+        `share link child crop ${stepIndex + 1}`
+      );
     } catch (e) {
       console.warn(
         `[analyze-job] share link for child crop ${stepIndex + 1} failed`,

@@ -381,6 +381,11 @@ export function RefileWidget({
             setAnalyzeJobId(null);
             setError(err || "Re-analyse job failed");
           }}
+          onCancelled={() => {
+            setAnalyzeJobId(null);
+            setDoneMessage("Scan stopped. Re-analyse to redo.");
+            router.refresh();
+          }}
         />
       )}
 
