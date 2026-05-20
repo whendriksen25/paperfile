@@ -311,10 +311,23 @@ export function cleanupPolygonsForCropping<D>(
 export async function cropAndDeskew(
   buffer: Buffer,
   polygons: ReceiptPolygon[],
-  opts?: { mask?: boolean; trim?: boolean; orientationProbe?: boolean }
+  opts?: {
+    mask?: boolean;
+    trim?: boolean;
+    orientationProbe?: boolean;
+    /** When true, do a SECOND Sonnet call on each rough crop to find
+     * the receipt's actual 4 corners and re-crop tight to that polygon.
+     * Substantially reduces bleed-through from adjacent receipts on
+     * multi-receipt scans. ~5s + ~$0.01 per crop.
+     * Falls back to the rough crop gracefully if Sonnet can't find
+     * clean corners. Skippable globally via env DISABLE_POLYGON_REFINEMENT=1.
+     * Default false (opt-in). */
+    refinePolygons?: boolean;
+  }
 ): Promise<Buffer[]> {
   const trim = opts?.trim !== false; // default true
   const probe = opts?.orientationProbe === true; // default false (opt-in)
+  const refine = opts?.refinePolygons === true; // default false (opt-in)
   // opts.mask is intentionally NOT implemented — the spec says "skip
   // this entirely if opts.mask is false; we'll just rely on the bbox
   // + rotate + trim flow." We carry the option through the signature
@@ -480,7 +493,69 @@ export async function cropAndDeskew(
       }
       // Quality 95 instead of 92 — for small receipts the extra ~10%
       // file size is worth it to keep line items legible to Sonnet.
-      const cropped = await pipeline.jpeg({ quality: 95 }).toBuffer();
+      let cropped = await pipeline.jpeg({ quality: 95 }).toBuffer();
+
+      // Optional per-crop polygon refinement. The rough crop above is
+      // axis-aligned around the detection polygon's bbox + 8% padding,
+      // so it usually contains background slivers and sometimes
+      // fragments of adjacent receipts. A second focused Sonnet call
+      // ("find the 4 corners of the receipt in THIS image") returns a
+      // tight polygon; we re-crop to that. Falls back to the rough
+      // crop silently if the refinement returns garbage or is disabled.
+      if (refine) {
+        const { refineCropPolygon } = await import(
+          "@/lib/services/polygon-refinement"
+        );
+        const refined = await refineCropPolygon(cropped);
+        if (refined && refined.vertices.length >= 3) {
+          try {
+            // Refined polygon is in crop-relative coords (0..1 of the
+            // CROPPED image, not the original scan). Compute its bbox
+            // in crop-pixel coords, then re-extract just that region.
+            const cropMeta = await sharp(cropped).metadata();
+            const cw = cropMeta.width || 0;
+            const ch = cropMeta.height || 0;
+            if (cw > 0 && ch > 0) {
+              const rb = polygonBoundingBox(refined.vertices);
+              // Tiny safety padding (1%) — Sonnet's corners are
+              // approximate and we don't want to chop printed text.
+              const rpFrac = 0.01;
+              const rx = Math.max(0, rb.x - rpFrac);
+              const ry = Math.max(0, rb.y - rpFrac);
+              const rw = Math.min(1 - rx, rb.w + rpFrac * 2);
+              const rh = Math.min(1 - ry, rb.h + rpFrac * 2);
+              const rPx = Math.floor(rx * cw);
+              const rPy = Math.floor(ry * ch);
+              const rPw = Math.max(1, Math.floor(rw * cw));
+              const rPh = Math.max(1, Math.floor(rh * ch));
+              // Only re-crop if the refined region is meaningfully
+              // smaller than the original — otherwise we're paying for
+              // a Sonnet call and a re-encode for nothing.
+              const refinedFrac = (rPw * rPh) / (cw * ch);
+              if (refinedFrac < 0.95) {
+                cropped = await sharp(cropped)
+                  .extract({
+                    left: rPx,
+                    top: rPy,
+                    width: rPw,
+                    height: rPh,
+                  })
+                  .jpeg({ quality: 95 })
+                  .toBuffer();
+                console.log(
+                  `[image-crop] refined crop: ${(refinedFrac * 100).toFixed(0)}% of rough crop`
+                );
+              }
+            }
+          } catch (e) {
+            console.warn(
+              "[image-crop] refined re-crop failed; keeping rough crop:",
+              e instanceof Error ? e.message : String(e)
+            );
+          }
+        }
+      }
+
       out.push(cropped);
     } catch (e) {
       // Per-polygon defensive: fall back to a plain bbox crop, no

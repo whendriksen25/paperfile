@@ -597,15 +597,27 @@ export async function extractDocument(
   };
 }
 
-/** Document types where we EXPECT at least one line item on a healthy
- * extraction. If the type is something else (id_document, certificate,
- * letter) we don't bother retrying — empty line_items is correct. */
-const LINE_ITEM_DOC_TYPES = new Set([
-  "receipt",
-  "invoice",
-  "medical_bill",
-  "utility_bill",
-  "bank_statement", // multi-tx CSV/PDF — different code path usually
+/** Document types where empty line_items is CORRECT (no items expected).
+ * Skip the focused fallback for these to avoid wasting a Sonnet call.
+ * Everything else (receipt, invoice, "other", null, unknown types) gets
+ * the fallback if line_items is empty.
+ *
+ * Why a denylist instead of an allowlist: in production we saw Sonnet
+ * classify marginal-quality receipt crops as `document_type: "other"`,
+ * which fell outside the previous allowlist and never got the fallback.
+ * Inverting the check covers that case while still skipping docs that
+ * genuinely have no items. */
+const SKIP_RETRY_DOC_TYPES = new Set([
+  "id_document",
+  "certificate",
+  "letter",
+  "appointment_letter",
+  "rental_agreement",
+  "contract",
+  "warranty",
+  "payment_confirmation", // a simple total-only confirmation
+  "bank_statement", // line items live in a different code path (CAMT/CSV)
+  "multi_doc_scan", // container — items live on children
 ]);
 
 /**
@@ -738,7 +750,12 @@ Return ONLY the JSON object. No markdown, no extra fields, no surrounding prose.
 
 function shouldRetryForLineItems(parsed: Record<string, unknown>): boolean {
   const docType = String(parsed["document_type"] || "").toLowerCase();
-  if (!LINE_ITEM_DOC_TYPES.has(docType)) return false;
+  // Skip if the doc type is one where empty line_items is correct
+  // (letter, id, contract, etc.). Everything else — including "other"
+  // and null/unknown — gets the fallback if line_items is empty. This
+  // covers the case where Sonnet mis-classified a marginal receipt
+  // crop as "other" and would otherwise never get the fallback.
+  if (docType && SKIP_RETRY_DOC_TYPES.has(docType)) return false;
   // line_items lives inside extracted_fields per the prompt schema.
   const ef = parsed["extracted_fields"] as
     | Record<string, unknown>

@@ -420,6 +420,13 @@ export async function prepareAnalyzeJob(
         // misalignment Sonnet missed on the busy multi-receipt scan.
         // ~$0.001 per crop, negligible.
         orientationProbe: true,
+        // Per-crop polygon refinement: second Sonnet call finds the
+        // receipt's actual 4 corners within the rough crop and re-crops
+        // tight. Eliminates bleed-through from adjacent receipts. ~5s +
+        // ~$0.01 per crop. Skippable globally via env
+        // DISABLE_POLYGON_REFINEMENT=1 (set in Vercel env vars for
+        // instant rollback if it regresses quality).
+        refinePolygons: true,
       });
       for (let i = 0; i < crops.length; i++) {
         // Crop paths sit alongside the original scan, named

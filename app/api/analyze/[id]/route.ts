@@ -448,6 +448,9 @@ export async function POST(
             // 90/180/270° misalignment Sonnet missed on the busy
             // multi-receipt scan. ~$0.001 per crop.
             orientationProbe: true,
+            // Per-crop polygon refinement (~5s + ~$0.01 per crop).
+            // Skippable globally via env DISABLE_POLYGON_REFINEMENT=1.
+            refinePolygons: true,
           });
           // Re-extract each crop at full resolution IN PARALLEL.
           // Sequential calls take 4×~20s = ~80s which alone exceeds
