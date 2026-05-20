@@ -1451,6 +1451,183 @@ Return ONLY the JSON. No prose, no markdown.`;
   }
 }
 
+/**
+ * PROOF-OF-CONCEPT diag for the classical-CV corner detection approach.
+ * Downloads a scan, runs a deterministic OpenCV pipeline to find the
+ * bright-paper regions and their precise rotated rectangles (4 corners
+ * + tilt angle), and SAVES AN ANNOTATED IMAGE so we can eyeball whether
+ * CV nails the receipts before wiring it into the live pipeline.
+ *
+ * Pipeline: grayscale → blur → Otsu threshold (light paper vs dark mat)
+ *   → morphological close (seal gaps) → findContours → area filter
+ *   → minAreaRect per contour (gives centre, size, ANGLE, 4 corners).
+ *
+ * Usage:
+ *   npm run diag detect-corners <doc-id-or-prefix> [--from-original=1] [--min-area=0.03]
+ *
+ * Output: prints each detected rectangle (centre %, size %, angle, 4
+ * corners) and writes scripts/_corners_<doc>.png with the rectangles
+ * drawn on the scan. Open that PNG to judge the result.
+ */
+async function cmdDetectCorners() {
+  const [idArg] = positional();
+  if (!idArg) throw new Error("Usage: diag detect-corners <doc-id-or-prefix> [--from-original=1]");
+  const fromOriginal = flag("from-original", "0") === "1";
+  const minAreaFrac = Number(flag("min-area", "0.03")) || 0.03;
+
+  const supabase = admin();
+  const docId = await resolveId(supabase, "documents", idArg);
+  if (!docId) {
+    console.error(`No documents row found matching "${idArg}"`);
+    process.exit(1);
+  }
+  const { data: doc } = await supabase
+    .from("documents")
+    .select("id, file_name, dropbox_path, extracted_fields")
+    .eq("id", docId)
+    .single();
+  if (!doc?.dropbox_path) {
+    console.error("Doc has no dropbox_path");
+    process.exit(1);
+  }
+  const originalPath = doc.extracted_fields?._original_scan_path || null;
+  const downloadPath =
+    fromOriginal && originalPath ? originalPath : doc.dropbox_path;
+  console.log(`doc:       ${doc.id.slice(0, 8)}`);
+  console.log(`path:      ${downloadPath}${fromOriginal ? "  (--from-original)" : ""}`);
+
+  // Download from Dropbox
+  const { Dropbox } = await import("dropbox");
+  const patchedFetch = async (input, init) => {
+    const res = await fetch(input, init);
+    if (!res.buffer) res.buffer = async () => Buffer.from(await res.arrayBuffer());
+    return res;
+  };
+  const dbx = new Dropbox({
+    clientId: process.env.DROPBOX_APP_KEY,
+    clientSecret: process.env.DROPBOX_APP_SECRET,
+    refreshToken: process.env.DROPBOX_REFRESH_TOKEN,
+    fetch: patchedFetch,
+  });
+  console.log("\nDownloading...");
+  const dl = await dbx.filesDownload({ path: downloadPath });
+  const buffer = Buffer.from((dl.result).fileBinary);
+  console.log(`downloaded ${buffer.length} bytes`);
+
+  // Decode to raw RGBA via sharp (opencv.js can't decode JPEG in Node).
+  const sharpMod = await import("sharp");
+  const sharp = sharpMod.default || sharpMod;
+  const { data: rgba, info } = await sharp(buffer)
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  const W = info.width;
+  const H = info.height;
+  console.log(`decoded ${W}x${H}`);
+
+  // Load OpenCV (WASM). @techstark/opencv-js resolves its init promise
+  // differently across versions; handle both shapes.
+  console.log("loading OpenCV (WASM)...");
+  const cvMod = await import("@techstark/opencv-js");
+  const cv = cvMod.default || cvMod;
+  await new Promise((resolve) => {
+    if (cv && typeof cv.getBuildInformation === "function") return resolve();
+    cv.onRuntimeInitialized = resolve;
+  });
+
+  // Build the source Mat from RGBA pixels.
+  const src = cv.matFromArray(H, W, cv.CV_8UC4, Array.from(rgba));
+  const gray = new cv.Mat();
+  cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+  cv.GaussianBlur(gray, gray, new cv.Size(5, 5), 0);
+  // Otsu auto-threshold: bright paper → white, dark mat → black.
+  const thresh = new cv.Mat();
+  cv.threshold(gray, thresh, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+  // Morphological close to seal small gaps inside paper (text, folds).
+  const kernel = cv.getStructuringElement(
+    cv.MORPH_RECT,
+    new cv.Size(Math.max(3, Math.round(W * 0.01)), Math.max(3, Math.round(W * 0.01)))
+  );
+  cv.morphologyEx(thresh, thresh, cv.MORPH_CLOSE, kernel);
+
+  // Find external contours.
+  const contours = new cv.MatVector();
+  const hierarchy = new cv.Mat();
+  cv.findContours(thresh, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+  const totalArea = W * H;
+  const found = [];
+  for (let i = 0; i < contours.size(); i++) {
+    const c = contours.get(i);
+    const area = cv.contourArea(c);
+    if (area / totalArea < minAreaFrac) {
+      c.delete();
+      continue;
+    }
+    const rect = cv.minAreaRect(c);
+    const pts = cv.RotatedRect.points(rect);
+    found.push({
+      areaFrac: area / totalArea,
+      cx: rect.center.x / W,
+      cy: rect.center.y / H,
+      w: rect.size.width / W,
+      h: rect.size.height / H,
+      angle: rect.angle,
+      corners: pts.map((p) => ({ x: p.x / W, y: p.y / H })),
+      ptsPx: pts,
+    });
+    c.delete();
+  }
+
+  // Sort by reading order (top-to-bottom, then left-to-right) for display.
+  found.sort((a, b) => (a.cy - b.cy) || (a.cx - b.cx));
+
+  console.log(`\n=== Detected ${found.length} bright region(s) (min area ${(minAreaFrac * 100).toFixed(0)}%) ===`);
+  for (let i = 0; i < found.length; i++) {
+    const f = found[i];
+    console.log(
+      `  #${i + 1}: area=${(f.areaFrac * 100).toFixed(1)}%  centre=(${(f.cx * 100).toFixed(0)}%, ${(f.cy * 100).toFixed(0)}%)  size=${(f.w * 100).toFixed(0)}%×${(f.h * 100).toFixed(0)}%  angle=${f.angle.toFixed(1)}°`
+    );
+    console.log(
+      `        corners: ${f.corners.map((p) => `(${(p.x * 100).toFixed(0)},${(p.y * 100).toFixed(0)})`).join(" ")}`
+    );
+  }
+
+  // Draw the rectangles on the source image and save an annotated PNG.
+  const colors = [
+    [124, 58, 237, 255], [22, 163, 74, 255], [220, 38, 38, 255],
+    [8, 145, 178, 255], [234, 88, 12, 255], [190, 24, 93, 255],
+  ];
+  for (let i = 0; i < found.length; i++) {
+    const col = colors[i % colors.length];
+    const colour = new cv.Scalar(col[0], col[1], col[2], 255);
+    const pts = found[i].ptsPx;
+    for (let j = 0; j < 4; j++) {
+      const a = pts[j];
+      const b = pts[(j + 1) % 4];
+      cv.line(
+        src,
+        new cv.Point(Math.round(a.x), Math.round(a.y)),
+        new cv.Point(Math.round(b.x), Math.round(b.y)),
+        colour,
+        Math.max(3, Math.round(W * 0.004))
+      );
+    }
+  }
+  // src is RGBA — convert back to a PNG via sharp.
+  const outRgba = Buffer.from(src.data);
+  const outName = `scripts/_corners_${doc.id.slice(0, 8)}.png`;
+  await sharp(outRgba, { raw: { width: W, height: H, channels: 4 } })
+    .png()
+    .toFile(outName);
+  console.log(`\nAnnotated image saved → ${outName}`);
+  console.log("Open it to verify the rectangles hug each receipt.");
+
+  // Clean up Mats.
+  src.delete(); gray.delete(); thresh.delete(); kernel.delete();
+  contours.delete(); hierarchy.delete();
+}
+
 async function cmdRetryFailed() {
   const limit = Number(flag("limit", "0")) || 0;
   const base = process.env.DEV_BASE_URL || "http://localhost:3002";
@@ -2211,6 +2388,7 @@ Subcommands:
   taxonomy-cleanup  [--apply]
   cleanup-multi-doc-dupes [--dry-run]
   detect-multidoc <doc-id-or-prefix> [--from-original=1]
+  detect-corners  <doc-id-or-prefix> [--from-original=1] [--min-area=0.03]
   extract-doc     <doc-id-or-prefix>  OR  --path=/Archive/...path.jpg
   pay-actions    [--limit=50]
   match-debug    <tx-id-or-prefix>
@@ -2241,6 +2419,7 @@ const dispatch = {
   "taxonomy-cleanup": cmdTaxonomyCleanup,
   "cleanup-multi-doc-dupes": cmdCleanupMultiDocDupes,
   "detect-multidoc": cmdDetectMultidoc,
+  "detect-corners": cmdDetectCorners,
   "extract-doc": cmdExtractDoc,
   "pay-actions": cmdPayActions,
   "match-debug": cmdMatchDebug,
