@@ -40,9 +40,14 @@ export async function refineCropPolygon(
       .toBuffer();
 
     const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-    const prompt = `This image is a rough crop of a SINGLE receipt with some background visible at the edges. The background may contain fragments of OTHER receipts that were near this one on the original scan — IGNORE those entirely.
+    const prompt = `This image is a rough, generously-padded crop containing ONE main receipt plus background and possibly fragments of OTHER receipts at the edges. Your job is to trace the precise paper boundary of the MAIN (central, most complete) receipt so it can be cropped out cleanly.
 
-Identify the 4 corners of THE main receipt (the printed paper boundary of the central receipt). Return STRICT JSON:
+Work in this order, like a human would:
+1. ORIENT: find the receipt's header (store name / logo at the top) and read which way the text runs. That tells you which way is "up" on the receipt.
+2. TRACE EDGES: follow the four physical paper edges of that receipt — top, right, bottom, left. The receipt may be TILTED on the page, so its corners will NOT be axis-aligned: each corner will have a different x AND a different y. Capture the FULL width including the right-hand price/amount column and the FULL height including the header and the bottom total/barcode. Do not cut the receipt short — it is critical that the right-side numbers column is inside your polygon.
+3. IGNORE fragments of any other receipt and all background.
+
+Return STRICT JSON with the 4 corner points of the main receipt:
 {
   "corners": [
     {"x": <0..1>, "y": <0..1>},
@@ -52,11 +57,11 @@ Identify the 4 corners of THE main receipt (the printed paper boundary of the ce
   ]
 }
 
-Coordinates are normalised to THIS crop's dimensions (top-left = 0,0; bottom-right = 1,1), NOT to the original scan.
-Vertices listed CLOCKWISE from the receipt's OWN top-left corner (where its printed header is).
+Coordinates normalised to THIS crop's dimensions (top-left = 0,0; bottom-right = 1,1), NOT the original scan.
+List the 4 corners CLOCKWISE starting from the receipt's OWN top-left corner (the top-left as the printed header sees it). If the receipt is tilted, that first corner might be at e.g. (0.10, 0.06) — that's correct, just trace clockwise from there.
 
-If the receipt clearly fills the entire crop with no visible background slivers, return the four image corners (0,0), (1,0), (1,1), (0,1).
-If you cannot identify a single coherent receipt in the crop (it's all background, or multiple receipts overlap, etc.), return: {"corners": null}.
+If the receipt genuinely fills the whole crop edge-to-edge, return the image corners (0,0),(1,0),(1,1),(0,1).
+If you cannot identify a single coherent receipt (all background, or two receipts equally overlap), return {"corners": null}.
 
 Return ONLY the JSON object. No prose, no markdown.`;
 

@@ -352,10 +352,14 @@ export async function cropAndDeskew(
     }
 
     // 1+2. Bbox in pixel coords + padding so rotation doesn't clip.
-    // Generous (8%) padding: experience shows 3% is too tight — small
-    // tilt corrections push receipt edges outside the crop and .trim()
-    // then bites into receipt content. Better to keep more background
-    // and let the per-receipt extraction ignore it.
+    // VERY generous padding (22%): the detection polygon is often a few
+    // % off — too far left, not far enough right — which clips critical
+    // content like a receipt's right-hand price column. Losing receipt
+    // content is unrecoverable (the refinement step can only crop
+    // INWARD), so we deliberately over-capture here. The refinement
+    // pass then traces the true edges and crops tight, discarding the
+    // extra background + any neighbour fragments. Generous-then-tighten
+    // always succeeds; tight-then-tighten can't recover clipped content.
     const bbox = polygonBoundingBox(verts);
     if (bbox.w * bbox.h < 0.01) {
       // Polygon is suspiciously small (< 1% of image area) — likely
@@ -364,7 +368,7 @@ export async function cropAndDeskew(
       out.push(buffer);
       continue;
     }
-    const padFrac = 0.08;
+    const padFrac = 0.22;
     const padX = bbox.w * padFrac;
     const padY = bbox.h * padFrac;
     const pxN = Math.max(0, bbox.x - padX);
@@ -495,13 +499,18 @@ export async function cropAndDeskew(
       // file size is worth it to keep line items legible to Sonnet.
       let cropped = await pipeline.jpeg({ quality: 95 }).toBuffer();
 
-      // Optional per-crop polygon refinement. The rough crop above is
-      // axis-aligned around the detection polygon's bbox + 8% padding,
-      // so it usually contains background slivers and sometimes
-      // fragments of adjacent receipts. A second focused Sonnet call
-      // ("find the 4 corners of the receipt in THIS image") returns a
-      // tight polygon; we re-crop to that. Falls back to the rough
-      // crop silently if the refinement returns garbage or is disabled.
+      // Optional per-crop polygon refinement. The rough crop above is a
+      // VERY generous axis-aligned region (22% padding) that's
+      // guaranteed to contain the whole receipt plus slack. A second
+      // focused Sonnet call traces the receipt's true 4 corners (which
+      // may be tilted), and we:
+      //   1. compute the receipt's tilt from the polygon's longest edge
+      //   2. crop the polygon's bbox (small 1.5% safety pad)
+      //   3. rotate by the tilt to deskew
+      //   4. trim residual background
+      // Net: a tight, straightened crop with no clipped content and no
+      // neighbour bleed. Falls back to the rough crop if refinement
+      // returns garbage or is disabled.
       if (refine) {
         const { refineCropPolygon } = await import(
           "@/lib/services/polygon-refinement"
@@ -509,17 +518,14 @@ export async function cropAndDeskew(
         const refined = await refineCropPolygon(cropped);
         if (refined && refined.vertices.length >= 3) {
           try {
-            // Refined polygon is in crop-relative coords (0..1 of the
-            // CROPPED image, not the original scan). Compute its bbox
-            // in crop-pixel coords, then re-extract just that region.
             const cropMeta = await sharp(cropped).metadata();
             const cw = cropMeta.width || 0;
             const ch = cropMeta.height || 0;
             if (cw > 0 && ch > 0) {
               const rb = polygonBoundingBox(refined.vertices);
-              // Tiny safety padding (1%) — Sonnet's corners are
-              // approximate and we don't want to chop printed text.
-              const rpFrac = 0.01;
+              // 1.5% safety pad — Sonnet's corners are approximate and
+              // we never want to chop printed text.
+              const rpFrac = 0.015;
               const rx = Math.max(0, rb.x - rpFrac);
               const ry = Math.max(0, rb.y - rpFrac);
               const rw = Math.min(1 - rx, rb.w + rpFrac * 2);
@@ -528,22 +534,44 @@ export async function cropAndDeskew(
               const rPy = Math.floor(ry * ch);
               const rPw = Math.max(1, Math.floor(rw * cw));
               const rPh = Math.max(1, Math.floor(rh * ch));
-              // Only re-crop if the refined region is meaningfully
-              // smaller than the original — otherwise we're paying for
-              // a Sonnet call and a re-encode for nothing.
               const refinedFrac = (rPw * rPh) / (cw * ch);
-              if (refinedFrac < 0.95) {
-                cropped = await sharp(cropped)
-                  .extract({
-                    left: rPx,
-                    top: rPy,
-                    width: rPw,
-                    height: rPh,
-                  })
-                  .jpeg({ quality: 95 })
-                  .toBuffer();
+
+              // Compute the receipt's tilt from the refined polygon's
+              // longest edge. On an upright receipt the long edge is
+              // vertical (~±90° from horizontal); the deviation from
+              // vertical is the tilt we should undo.
+              const edgeDeg = polygonLongestEdgeAngleDegrees(
+                refined.vertices
+              );
+              let refineTilt = edgeDeg > 0 ? edgeDeg - 90 : edgeDeg + 90;
+              // Guard: only deskew for a real tilt (3°..45°). Outside
+              // that, leave orientation alone (the upstream probe +
+              // detection already handle big rotations).
+              const doDeskew =
+                Number.isFinite(refineTilt) &&
+                Math.abs(refineTilt) >= 3 &&
+                Math.abs(refineTilt) <= 45;
+
+              // Re-crop if the refined region is meaningfully smaller
+              // OR a deskew is warranted (a tilted receipt in a
+              // same-size bbox still needs straightening).
+              if (refinedFrac < 0.95 || doDeskew) {
+                let p = sharp(cropped).extract({
+                  left: rPx,
+                  top: rPy,
+                  width: rPw,
+                  height: rPh,
+                });
+                if (doDeskew) {
+                  // rotate(angle) is clockwise; undo a clockwise tilt
+                  // with -tilt.
+                  p = p
+                    .rotate(-refineTilt, { background: "#ffffff" })
+                    .trim();
+                }
+                cropped = await p.jpeg({ quality: 95 }).toBuffer();
                 console.log(
-                  `[image-crop] refined crop: ${(refinedFrac * 100).toFixed(0)}% of rough crop`
+                  `[image-crop] refined crop: ${(refinedFrac * 100).toFixed(0)}% of rough${doDeskew ? `, deskewed ${refineTilt.toFixed(1)}°` : ""}`
                 );
               }
             }
