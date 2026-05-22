@@ -434,46 +434,131 @@ export async function prepareAnalyzeJob(
     };
   }
 
-  // 6. Crop + upload. Only images support cropping (sharp can't open
-  // PDFs); if the original is a PDF we still create the job but with
-  // crop_paths set to the original path so per-crop extraction sees the
-  // shared image. In practice multi-receipt scans are always images.
+  // 5b. CLEAN SLATE: delete any existing children of this parent (and their
+  //     actions) BEFORE re-splitting. Re-analyse REPLACES the receipt set, so
+  //     wiping first prevents children from prior runs — or interrupted /
+  //     cancelled jobs whose finalize never ran — from accumulating as
+  //     duplicates. The fresh children are spawned per-step below.
+  try {
+    const { data: oldKids } = await admin
+      .from("documents")
+      .select("id")
+      .eq("parent_document_id", documentId);
+    const oldIds = (oldKids || []).map((r) => (r as { id: string }).id);
+    if (oldIds.length > 0) {
+      await admin.from("actions").delete().in("document_id", oldIds);
+      await admin.from("documents").delete().in("id", oldIds);
+      console.log(
+        `[analyze-job] cleared ${oldIds.length} existing child doc(s) before re-split for ${documentId}`
+      );
+    }
+  } catch (e) {
+    console.warn("[analyze-job] pre-split child cleanup failed:", e);
+  }
+
+  // 6. Crop + upload — CV method, OVERLAPS ALLOWED. Detection gave a rough
+  // centre per receipt; classical CV (connected components → oriented edge
+  // box with trimmed extents) turns each into a tight box. We crop the
+  // axis-aligned box with generous padding and NO seam-clipping, so a crop
+  // never clips a receipt (neighbour bleed is fine). Each crop is stored as
+  // {stem}_part{i+1}{ext} alongside the original and becomes that receipt's
+  // own image; the per-receipt step then re-extracts it at full resolution
+  // (the only way to read small line-item print reliably). Only images can
+  // be cropped (sharp can't open PDFs) — PDFs fall through to the shared
+  // image per step.
   const isImage = /\.(jpe?g|png|webp|gif|heic|heif)$/i.test(
     doc.file_name || ""
   );
   const cropPaths: string[] = [];
-  if (
-    isImage &&
-    polygons.length === docs.length &&
-    polygons.length > 0
-  ) {
+  if (isImage && polygons.length === docs.length && polygons.length > 0) {
     try {
-      const { cropAndDeskew } = await import("@/lib/services/image-crop");
-      const crops = await cropAndDeskew(buffer, polygons, {
-        trim: true,
-        // Haiku probe on each crop after deskew — catches any 90/180/270°
-        // misalignment Sonnet missed on the busy multi-receipt scan.
-        // ~$0.001 per crop, negligible.
-        orientationProbe: true,
-      });
-      for (let i = 0; i < crops.length; i++) {
-        // Crop paths sit alongside the original scan, named
-        // {stem}_part{i+1}{ext} — same convention as the inline route.
-        // Base the path off downloadPath (the original) so siblings line
-        // up in Dropbox; the inline route does the same.
-        const cropPath = buildCropPath(downloadPath, i);
+      const sharpMod = await import("sharp");
+      const sharp = sharpMod.default || sharpMod;
+      const meta = await sharp(buffer).metadata();
+      const W = meta.width || 0;
+      const H = meta.height || 0;
+      const padFrac = 0.06;
+
+      // Crop boxes. Preferred = the pure-JS connected-components segmentation
+      // (threshold the bright paper → label the white blobs → box each
+      // receipt). It snaps each crop to the actual receipt blob the LLM seed
+      // sits in, which is far tighter + more accurate than the raw LLM box,
+      // and it's pure JavaScript (no WASM) so it can't hang. If it fails or a
+      // given seed doesn't resolve to a blob, we fall back to that seed's
+      // rough polygon bounding box.
+      let boxes: Array<{ x: number; y: number; width: number; height: number } | null> =
+        docs.map(() => null);
+      try {
+        const seeds = polygons.map((p) => {
+          const vs = Array.isArray(p.vertices) ? p.vertices : [];
+          let sx = 0,
+            sy = 0;
+          for (const v of vs) {
+            sx += Number(v.x) || 0;
+            sy += Number(v.y) || 0;
+          }
+          const k = vs.length || 1;
+          return { x: sx / k, y: sy / k };
+        });
+        const { segmentReceiptBoxes } = await import(
+          "@/lib/services/receipt-segmentation"
+        );
+        boxes = await segmentReceiptBoxes(buffer, seeds, { padFrac });
+      } catch (e) {
+        console.warn(
+          "[analyze-job] CC segmentation failed — using polygon-bbox crops:",
+          e instanceof Error ? e.message : String(e)
+        );
+      }
+
+      // Fallback box for receipt i: the polygon's axis-aligned bounding box
+      // (normalised → px) + generous padding, clamped to the image.
+      const polyBox = (i: number) => {
+        const vs = Array.isArray(polygons[i]?.vertices)
+          ? polygons[i].vertices
+          : [];
+        if (!vs.length || !W || !H) return null;
+        let minx = 1,
+          miny = 1,
+          maxx = 0,
+          maxy = 0;
+        for (const v of vs) {
+          const x = Math.min(1, Math.max(0, Number(v.x) || 0));
+          const y = Math.min(1, Math.max(0, Number(v.y) || 0));
+          minx = Math.min(minx, x);
+          miny = Math.min(miny, y);
+          maxx = Math.max(maxx, x);
+          maxy = Math.max(maxy, y);
+        }
+        let x0 = minx * W,
+          y0 = miny * H,
+          x1 = maxx * W,
+          y1 = maxy * H;
+        const pad = padFrac * Math.max(x1 - x0, y1 - y0);
+        x0 = Math.max(0, Math.floor(x0 - pad));
+        y0 = Math.max(0, Math.floor(y0 - pad));
+        x1 = Math.min(W, Math.ceil(x1 + pad));
+        y1 = Math.min(H, Math.ceil(y1 + pad));
+        return { x: x0, y: y0, width: x1 - x0, height: y1 - y0 };
+      };
+
+      for (let i = 0; i < docs.length; i++) {
+        const cv = boxes[i];
+        const b = cv && cv.width >= 40 && cv.height >= 40 ? cv : polyBox(i);
+        if (!b || b.width < 40 || b.height < 40) continue; // gap-filled below
         try {
-          await storage.uploadAt({
-            buffer: crops[i],
-            path: cropPath,
-          });
+          const cropBuf = await sharp(buffer)
+            .extract({ left: b.x, top: b.y, width: b.width, height: b.height })
+            .jpeg({ quality: 92 })
+            .toBuffer();
+          const cropPath = buildCropPath(downloadPath, i);
+          await storage.uploadAt({ buffer: cropBuf, path: cropPath });
           cropPaths[i] = cropPath;
         } catch (e) {
           console.warn(
-            `[analyze-job] crop ${i + 1} upload failed, will fall back to original path:`,
+            `[analyze-job] crop ${i + 1} failed, will use shared image:`,
             e instanceof Error ? e.message : String(e)
           );
-          cropPaths[i] = downloadPath; // fallback: per-crop step uses shared image
         }
       }
     } catch (e) {
@@ -481,7 +566,6 @@ export async function prepareAnalyzeJob(
         "[analyze-job] crop step failed — every step will use the shared image:",
         e
       );
-      // Fall through: cropPaths will be filled with the original.
     }
   }
   // Fill any gaps with the original path so every step has SOMETHING.
@@ -809,12 +893,16 @@ async function runStep(
     `${parent.file_name || "crop"}_part${stepIndex + 1}.jpg`,
     {
       taxonomyHint,
-      // ONE Sonnet call per step. The focused line-items fallback is a
-      // SECOND call that can double wall-clock on hard receipts — on a
-      // Hobby plan (hard 60s function ceiling) that's what timed steps
-      // out. Empty-line_items children can be fixed by re-analysing the
-      // individual child synchronously, where there's no per-step timer.
-      disableLineItemRetry: true,
+      // Re-enable the focused line-items fallback per step. The old
+      // concern was that this SECOND call doubled wall-clock — but that
+      // was when ONE call extracted the WHOLE multi-receipt scan. Now each
+      // step is a SINGLE downsized (~1600px) receipt crop, so the first
+      // extract is ~10-20s and the focused fallback ~7-10s — comfortably
+      // inside the 60s per-step budget. Without this, receipts whose first
+      // pass returns `line_items: []` (e.g. the small Ekoplaza receipt,
+      // whose summary lists the items but the array came back empty) never
+      // get their line items, even though they're clearly printed.
+      disableLineItemRetry: false,
     }
   );
   const d = ex.data;
@@ -910,6 +998,68 @@ async function finishStep(
   const actionType =
     extraction.action_type || (needsAction ? "pay" : null);
 
+  // IDEMPOTENCY GUARD (prevents duplicate children under worker races).
+  // The job is driven by BOTH the per-step self-chain AND the GET-poll
+  // auto-kick, and the per-step claim isn't truly atomic — so two workers
+  // can extract the SAME step concurrently, or one worker can still be
+  // mid-extraction when finalizeJob() flips the job to 'done'. Either way
+  // a naive insert here spawns a duplicate child. Re-read the job FRESH
+  // right before inserting and bail if:
+  //   (a) the job already finalized/cancelled  → don't add a late dup, or
+  //   (b) this step's slot already holds a live child (another worker beat
+  //       us to it) → return that child instead of inserting a second.
+  try {
+    const { data: freshJob } = await admin
+      .from("analyze_jobs")
+      .select("status, steps_state")
+      .eq("id", job.id)
+      .maybeSingle();
+    if (freshJob) {
+      const fj = freshJob as { status: string; steps_state: StepState[] };
+      if (
+        fj.status === "done" ||
+        fj.status === "failed" ||
+        fj.status === "cancelled"
+      ) {
+        return {
+          status: fj.status as AnalyzeStepResult["status"],
+          done: fj.status === "done",
+          completed_crops: job.completed_crops,
+          total_crops: job.total_crops,
+        };
+      }
+      const slot = (fj.steps_state || []).find((s) => s.index === stepIndex);
+      if (slot && slot.status === "done" && slot.child_doc_id) {
+        const { data: existingChild } = await admin
+          .from("documents")
+          .select("id")
+          .eq("id", slot.child_doc_id)
+          .maybeSingle();
+        if (existingChild) {
+          console.log(
+            `[analyze-job] step ${stepIndex + 1} already completed by another worker — skipping duplicate insert`
+          );
+          return {
+            status: "processing",
+            done: false,
+            completed_crops: job.completed_crops,
+            total_crops: job.total_crops,
+            step: {
+              index: stepIndex,
+              child_doc_id: slot.child_doc_id,
+              sender: extraction.sender || null,
+              amount: extraction.amount ?? null,
+            },
+          };
+        }
+      }
+    }
+  } catch (e) {
+    // Best-effort guard — if the re-read fails, fall through to insert
+    // (the finalize-time content-dedup remains a backstop).
+    console.warn("[analyze-job] idempotency re-read failed:", e);
+  }
+
   {
     // EVERY step inserts a new CHILD doc row. The parent never gets
     // repurposed as receipt #1 anymore — it stays as the container
@@ -998,8 +1148,21 @@ async function finishStep(
     }
   }
 
-  // Advance job state — mark this step done, bump completed_crops.
-  const updatedSteps = job.steps_state.map((s) =>
+  // Advance job state — mark THIS step done. Re-read the job FRESH first:
+  // the per-step claim isn't atomic, so a sibling worker may have completed
+  // a different step while we were extracting. Building the update from our
+  // stale start-of-step snapshot would clobber that sibling's progress
+  // (resetting its step to pending → re-claimed → duplicate child). Merge
+  // onto the authoritative current array and recompute the counters from it.
+  const { data: curJob } = await admin
+    .from("analyze_jobs")
+    .select("steps_state")
+    .eq("id", job.id)
+    .maybeSingle();
+  const baseSteps: StepState[] =
+    (curJob as { steps_state?: StepState[] } | null)?.steps_state ||
+    job.steps_state;
+  const updatedSteps = baseSteps.map((s) =>
     s.index === stepIndex
       ? {
           ...s,
@@ -1009,8 +1172,14 @@ async function finishStep(
         }
       : s
   );
-  const newCompleted = job.completed_crops + 1;
-  const allDone = newCompleted >= job.total_crops;
+  const newCompleted = updatedSteps.filter(
+    (s) => s.status === "done" || s.status === "failed"
+  ).length;
+  // Finalize only when EVERY step has reached a terminal state — never off a
+  // stale +1 counter (which could trip finalize early and orphan a step).
+  const allDone = updatedSteps.every(
+    (s) => s.status === "done" || s.status === "failed"
+  );
 
   await admin
     .from("analyze_jobs")
@@ -1103,6 +1272,107 @@ async function finalizeJob(
     console.warn("[analyze-job] dedup-on-resplit cleanup failed:", e);
   }
 
+  // 1b. Content-dedup: two crops can land on the SAME physical receipt
+  //     (overlapping seed boxes, or a non-atomic step re-claim). Those
+  //     survive block 1 because both ids ARE in spawnedIds, yet they're
+  //     the same receipt. Collapse children that share a strong content
+  //     key, keeping the richest extraction. Only dedup when a key is
+  //     actually present so genuinely-distinct receipts are never merged.
+  try {
+    const ids = Array.from(spawnedIds);
+    if (ids.length > 1) {
+      const { data: kidRowsRaw } = await admin
+        .from("documents")
+        .select(
+          "id, sender, amount, currency, document_date, ocr_text, extracted_fields, review_notes, created_at"
+        )
+        .in("id", ids);
+      type KidRow = {
+        id: string;
+        sender: string | null;
+        amount: number | null;
+        currency: string | null;
+        document_date: string | null;
+        ocr_text: string | null;
+        extracted_fields: Record<string, unknown> | null;
+        review_notes: string | null;
+        created_at: string | null;
+      };
+      const kidRows = (kidRowsRaw || []) as KidRow[];
+
+      // Strong explicit identifier if the AI captured one, else a
+      // composite of sender+amount+currency+date. Returns "" when there
+      // isn't enough to safely call two rows the same receipt.
+      const dedupKey = (k: KidRow): string => {
+        const ef = (k.extracted_fields || {}) as Record<string, unknown>;
+        const refFields = [
+          "transaction_reference",
+          "transaction_id",
+          "receipt_number",
+          "receipt_id",
+          "invoice_number",
+        ];
+        for (const f of refFields) {
+          const v = ef[f];
+          if (v != null && String(v).trim()) {
+            return "ref:" + String(v).trim().toLowerCase();
+          }
+        }
+        // Composite fallback — require an amount so two empty/fallback
+        // rows don't collapse into one.
+        if (typeof k.amount === "number") {
+          return [
+            "cmp",
+            (k.sender || "").trim().toLowerCase(),
+            k.amount.toFixed(2),
+            (k.currency || "").trim().toLowerCase(),
+            (k.document_date || "").trim(),
+          ].join("|");
+        }
+        return "";
+      };
+
+      // Richness score — keep the most complete extraction in a group.
+      const score = (k: KidRow): number => {
+        let s = 0;
+        if (!k.review_notes) s += 100; // not a fallback row
+        s += (k.ocr_text || "").length / 100; // more OCR text = richer
+        const ef = (k.extracted_fields || {}) as Record<string, unknown>;
+        const li = ef["line_items"];
+        if (Array.isArray(li)) s += li.length;
+        return s;
+      };
+
+      const groups = new Map<string, KidRow[]>();
+      for (const k of kidRows) {
+        const key = dedupKey(k);
+        if (!key) continue;
+        const arr = groups.get(key);
+        if (arr) arr.push(k);
+        else groups.set(key, [k]);
+      }
+
+      const dupIds: string[] = [];
+      for (const arr of Array.from(groups.values())) {
+        if (arr.length < 2) continue;
+        arr.sort((a, b) => score(b) - score(a));
+        // arr[0] is the keeper; the rest are duplicates.
+        for (let i = 1; i < arr.length; i++) dupIds.push(arr[i].id);
+      }
+
+      if (dupIds.length > 0) {
+        await admin.from("actions").delete().in("document_id", dupIds);
+        await admin.from("documents").delete().in("id", dupIds);
+        for (const id of dupIds) spawnedIds.delete(id);
+        console.log(
+          `[analyze-job] content-dedup removed ${dupIds.length} duplicate child doc(s) for ${job.document_id}`
+        );
+      }
+    }
+  } catch (e) {
+    console.warn("[analyze-job] content-dedup failed:", e);
+  }
+
   // 2. Reset parent to "container" state. The parent represents the
   //    ORIGINAL full multi-receipt scan, not any one receipt on it.
   //    Aggregate sender/amount/date from the spawned children so the
@@ -1151,7 +1421,8 @@ async function finalizeJob(
     }
 
     // Container title — concise and identifiable in the inbox listing.
-    const n = job.total_crops;
+    // Use the SURVIVING child count (after dedup), not the raw crop count.
+    const n = childIds.length || job.total_crops;
     const title = aggregateSender
       ? `${aggregateSender} — ${n}-receipt scan`
       : `Multi-receipt scan (${n} receipts)`;

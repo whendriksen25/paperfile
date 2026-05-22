@@ -122,6 +122,23 @@ export async function POST(
     }
 
     const result = await processNextAnalyzeStep(admin, jobId);
+
+    // Self-chain: if the job still has work, fire-and-forget the next step.
+    // This drives the job to completion even with NO UI polling (fresh
+    // uploads), and just races harmlessly with the progress panel's poll
+    // for re-analyse (the per-step claim handles concurrency). One step per
+    // invocation keeps each receipt inside its own 60s budget.
+    if (result && !result.done && result.status === "processing") {
+      try {
+        const url = `${request.nextUrl.origin}/api/analyze-step/${jobId}`;
+        void fetch(url, {
+          method: "POST",
+          headers: { cookie: request.headers.get("cookie") || "" },
+        }).catch(() => {});
+      } catch {
+        /* best-effort */
+      }
+    }
     return NextResponse.json(result);
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : "Step failed";

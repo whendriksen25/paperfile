@@ -358,27 +358,17 @@ export async function POST(
 
     // Multi-document detection. If Claude returned { documents: [...] }
     // — meaning the scan contains multiple distinct documents (e.g. 4
-    // receipts on one photo) — we treat documents[0] as the primary
-    // for this row, and stash documents[1..] to spawn as child rows
-    // after the main flow finishes for the primary. The children share
-    // the same dropbox_path (one physical scan, multiple records).
+    // receipts on one photo) — every receipt becomes a CHILD row and the
+    // parent becomes a lightweight container. All children share the
+    // parent scan's dropbox_path (one physical scan, multiple records).
     let multiDocChildren: DocumentExtraction[] = [];
     let extraction: DocumentExtraction;
-    // Per-crop image buffers from option-3 cropping. Index 0 = parent's
-    // crop, [1..N] = child crops. Empty until the cropping block runs.
-    let perCropDropboxBuffers: Buffer[] | null = null;
-    // Filled by the file-move section once per-crop Dropbox paths exist.
-    // Used by the child-spawn loop to set each child's dropbox_path.
-    const perCropDropboxPaths: string[] = [];
-    // Polygons that drove the per-crop split. Persisted on the parent's
-    // extracted_fields._multidoc so the UI can render an overlay later
-    // ("the top-left receipt is doc B") and child-doc pages can describe
-    // their original position on the parent scan.
-    let savedMultiDocPolygons:
-      | import("@/lib/ai/extract").ReceiptPolygon[]
-      | null = null;
+    // True when the scan held multiple receipts. Drives parent-as-container
+    // handling + persisting _original_scan_path so the parent stays
+    // re-analysable.
+    let isMultiDocScan = false;
     if (isMultiDoc(result)) {
-      let docs = result.documents;
+      const docs = result.documents;
       if (docs.length === 0) {
         await admin
           .from("documents")
@@ -395,168 +385,68 @@ export async function POST(
         );
       }
 
-      // ★ Per-receipt cropped re-extraction (option 3).
-      // If Claude gave us polygons (or legacy bounding_boxes — the
-      // extract.ts parser auto-converts those) AND the original is an
-      // image, crop each receipt out + deskew so it sits upright, then
-      // re-run extractDocument on each crop in full resolution.
-      //
-      // Per-crop dropbox paths are remembered so the parent / children
-      // rows can each point at THEIR receipt's crop (not the original
-      // full scan). The original full scan is retained in Dropbox for
-      // recovery; only the row pointers move to the crops.
-      const multi = result as MultiDocumentExtraction;
-      // Prefer polygons (content-aware, tight, tilted-receipt-aware).
-      // Fall back to converting legacy bounding_boxes if the parser
-      // didn't already do it. polygons[i] ↔ documents[i].
-      let polygons = Array.isArray(multi.polygons) ? multi.polygons : null;
-      if (!polygons && Array.isArray(multi.bounding_boxes)) {
-        const { bboxToPolygon } = await import("@/lib/ai/extract");
-        polygons = multi.bounding_boxes.map(bboxToPolygon);
-      }
-      // Cleanup: drop tiny phantom polygons + resolve pairwise overlaps
-      // by midpoint-split. Catches Sonnet's two common mis-detections
-      // on multi-receipt scans. Updates docs[] in lockstep so per-doc
-      // indices stay aligned with the cleaned polygons[].
-      if (polygons && polygons.length > 0) {
-        const { cleanupPolygonsForCropping } = await import(
-          "@/lib/services/image-crop"
-        );
-        const cleaned = cleanupPolygonsForCropping(polygons, docs);
-        polygons = cleaned.polygons;
-        docs = cleaned.documents;
-      }
-      extraction = docs[0];
-      multiDocChildren = docs.slice(1);
+      isMultiDocScan = true;
+
+      // Multi-receipt scan. This inline call just FILES the scan and writes
+      // a lightweight CONTAINER row (aggregate sender/amount/date for the
+      // inbox card). The real per-receipt work — CV crop (overlaps allowed)
+      // + full-resolution per-receipt extraction + one child per receipt —
+      // is handed off to the background job AFTER this row is updated below,
+      // so each receipt runs in its own pass (no 60s cram). We do NOT spawn
+      // children here; the job does, pointing each at its stored crop.
+      const totalAmount = docs
+        .map((r) => r.amount)
+        .filter((a): a is number => typeof a === "number")
+        .reduce((s, n) => s + n, 0);
+      const sendersSet = new Set(
+        docs.map((r) => (r.sender || "").trim()).filter(Boolean)
+      );
+      const commonSender =
+        sendersSet.size === 1 ? Array.from(sendersSet)[0] : null;
+      const currenciesSet = new Set(
+        docs.map((r) => (r.currency || "").trim()).filter(Boolean)
+      );
+      const commonCurrency =
+        currenciesSet.size === 1 ? Array.from(currenciesSet)[0] : null;
+      const allDates = docs
+        .map((r) => r.document_date)
+        .filter((d): d is string => !!d)
+        .sort();
+      const latestDate =
+        allDates.length > 0 ? allDates[allDates.length - 1] : null;
+      const n = docs.length;
+      const containerExtraction: DocumentExtraction = {
+        document_type: "multi_doc_scan",
+        document_subtype: null,
+        confidence: 1,
+        document_date: latestDate,
+        sender: commonSender,
+        recipient: null,
+        language: null,
+        profile_hint: null,
+        amount: totalAmount || null,
+        currency: commonCurrency,
+        purchase_category: null,
+        title: commonSender
+          ? `${commonSender} — ${n}-receipt scan`
+          : `Multi-receipt scan (${n} receipts)`,
+        summary:
+          totalAmount > 0
+            ? `${n} receipts on one scan totalling ${commonCurrency || "EUR"} ${totalAmount.toFixed(2)}.`
+            : `${n} receipts detected on one scan.`,
+        tags: [],
+        extracted_fields: { _is_multidoc_container: true, _child_count: n },
+        ocr_text: undefined,
+        needs_action: false,
+        action_type: null,
+        due_date: null,
+        action_summary: null,
+      };
+      extraction = containerExtraction;
+      multiDocChildren = []; // the per-receipt job spawns the children
       console.log(
-        `[api/analyze] multi-doc detected: ${docs.length} documents on this scan (post-cleanup)`
+        `[api/analyze] multi-doc: ${n} receipts — filing scan + handing off to per-receipt job`
       );
-      const isImage = /\.(jpe?g|png|webp|gif|heic|heif)$/i.test(
-        doc.file_name || ""
-      );
-      if (
-        isImage &&
-        Array.isArray(polygons) &&
-        polygons.length === docs.length &&
-        polygons.length > 0
-      ) {
-        try {
-          const { cropAndDeskew } = await import("@/lib/services/image-crop");
-          const crops = await cropAndDeskew(buffer, polygons, {
-            trim: true,
-            // Haiku probe on each crop after deskew — catches any
-            // 90/180/270° misalignment Sonnet missed on the busy
-            // multi-receipt scan. ~$0.001 per crop.
-            orientationProbe: true,
-          });
-          // Re-extract each crop at full resolution IN PARALLEL.
-          // Sequential calls take 4×~20s = ~80s which alone exceeds
-          // Vercel's 60s Hobby cap. Parallel collapses wall-clock to
-          // max(per-call) ≈ 20-25s. Anthropic's rate limits are fine
-          // with 4 parallel for personal-scale traffic.
-          const extResults = await Promise.all(
-            crops.map((c, i) =>
-              extractDocument(c, `${doc.file_name || "crop"}_part${i + 1}.jpg`, {
-                taxonomyHint,
-              })
-            )
-          );
-          const reExtracted: DocumentExtraction[] = [];
-          for (let i = 0; i < extResults.length; i++) {
-            const ex = extResults[i];
-            aiUsage = {
-              input_tokens: aiUsage.input_tokens + (ex.usage?.input_tokens || 0),
-              output_tokens:
-                aiUsage.output_tokens + (ex.usage?.output_tokens || 0),
-            };
-            const d = ex.data;
-            // If the per-crop extraction failed or also detected multi-doc,
-            // fall back to the original low-res extraction for that index.
-            if (!d || "error" in d || isMultiDoc(d)) {
-              reExtracted.push(docs[i]);
-              console.warn(
-                `[api/analyze] per-crop re-extract failed for crop ${i + 1}, falling back to low-res`
-              );
-            } else {
-              reExtracted.push(d as DocumentExtraction);
-            }
-          }
-          // NEW MODEL: parent stays as the original scan container; ALL
-          // N receipts become children (not N-1 with receipt #1 folded
-          // into the parent). Build a synthetic container extraction for
-          // the parent row — aggregated sender/amount/date so the inbox
-          // shows useful metadata at a glance.
-          const totalAmount = reExtracted
-            .map((r) => r.amount)
-            .filter((a): a is number => typeof a === "number")
-            .reduce((s, n) => s + n, 0);
-          const sendersSet = new Set(
-            reExtracted
-              .map((r) => (r.sender || "").trim())
-              .filter(Boolean)
-          );
-          const commonSender =
-            sendersSet.size === 1 ? Array.from(sendersSet)[0] : null;
-          const currenciesSet = new Set(
-            reExtracted
-              .map((r) => (r.currency || "").trim())
-              .filter(Boolean)
-          );
-          const commonCurrency =
-            currenciesSet.size === 1 ? Array.from(currenciesSet)[0] : null;
-          const allDates = reExtracted
-            .map((r) => r.document_date)
-            .filter((d): d is string => !!d)
-            .sort();
-          const latestDate = allDates.length > 0 ? allDates[allDates.length - 1] : null;
-          const n = reExtracted.length;
-          const containerExtraction: DocumentExtraction = {
-            document_type: "multi_doc_scan",
-            document_subtype: null,
-            confidence: 1,
-            document_date: latestDate,
-            sender: commonSender,
-            recipient: null,
-            language: null,
-            profile_hint: null,
-            amount: totalAmount || null,
-            currency: commonCurrency,
-            purchase_category: null,
-            title: commonSender
-              ? `${commonSender} — ${n}-receipt scan`
-              : `Multi-receipt scan (${n} receipts)`,
-            summary:
-              totalAmount > 0
-                ? `${n} receipts on one scan totalling ${commonCurrency || "EUR"} ${totalAmount.toFixed(2)}.`
-                : `${n} receipts detected on one scan.`,
-            tags: [],
-            extracted_fields: { _is_multidoc_container: true, _child_count: n },
-            ocr_text: undefined,
-            needs_action: false,
-            action_type: null,
-            due_date: null,
-            action_summary: null,
-          };
-          extraction = containerExtraction;
-          // EVERY receipt is a child under the new model.
-          multiDocChildren = reExtracted;
-          // Upload each crop to Dropbox and stash the resulting paths so
-          // the file-move + child-spawn code below uses them.
-          perCropDropboxBuffers = crops;
-          // Remember the polygons that drove the split so we can
-          // persist them on the parent (for overlays + per-child
-          // "originally top-left of the scan" hints).
-          savedMultiDocPolygons = polygons;
-          console.log(
-            `[api/analyze] cropped + re-extracted ${crops.length} sub-receipts at full res`
-          );
-        } catch (e) {
-          console.warn(
-            "[api/analyze] crop+re-extract failed, falling back to low-res shared-image extractions:",
-            e
-          );
-        }
-      }
     } else {
       // After the two early returns above, `result` is necessarily a
       // DocumentExtraction. TS can't narrow through the in-check, so cast.
@@ -657,11 +547,16 @@ export async function POST(
     // Always run Claude's suggestion so we can surface its ranking on the
     // detail page, even when the user pre-pinned a profile at upload or
     // we already deterministically matched. Useful for explainability.
+    // Skip the AI suggestion for a multi-receipt CONTAINER — it's a scan,
+    // not a profile-bearing document, and each receipt child is matched
+    // individually below. Saves a Claude call on the 60s-budget critical path.
     let suggestion: Awaited<ReturnType<typeof suggestProfile>> | null = null;
-    try {
-      suggestion = await suggestProfile(extraction, profiles);
-    } catch (e) {
-      console.warn("[api/analyze] suggestProfile failed", e);
+    if (!isMultiDocScan) {
+      try {
+        suggestion = await suggestProfile(extraction, profiles);
+      } catch (e) {
+        console.warn("[api/analyze] suggestProfile failed", e);
+      }
     }
 
     if (profileId) {
@@ -750,49 +645,12 @@ export async function POST(
       console.warn("[api/analyze] move/share failed, keeping inbox path", e);
     }
 
-    // 4a. Multi-doc cropping (option 3): when we have per-crop buffers,
-    // upload each crop alongside the moved original and remember each
-    // crop's path. Parent's dropbox_path then gets repointed to crop[0]
-    // (the most useful preview for the parent's extraction); children
-    // each get crop[i]. Original full scan stays where the move put it
-    // for recoverability AND so the parent can later trigger a fresh
-    // multi-doc split via ?from_original=1.
+    // 4a. Multi-receipt parent: keep the full scan as the parent's image
+    // and remember its path. "View original full scan" + "Re-analyse full
+    // scan" read this, and every child shares this same dropbox_path.
     let originalScanPath: string | null = null;
-    if (perCropDropboxBuffers && perCropDropboxBuffers.length > 0) {
-      try {
-        const originalPath = newPath;
-        originalScanPath = originalPath; // remember for parent's extracted_fields
-        const dotIdx = originalPath.lastIndexOf(".");
-        const stem =
-          dotIdx > 0 ? originalPath.slice(0, dotIdx) : originalPath;
-        const ext = dotIdx > 0 ? originalPath.slice(dotIdx) : ".jpg";
-        for (let i = 0; i < perCropDropboxBuffers.length; i++) {
-          const cropPath = `${stem}_part${i + 1}${ext}`;
-          try {
-            await storage.uploadAt({
-              buffer: perCropDropboxBuffers[i],
-              path: cropPath,
-            });
-            perCropDropboxPaths[i] = cropPath;
-          } catch (e) {
-            console.warn(
-              `[api/analyze] crop ${i + 1} upload failed (keeping original path):`,
-              e instanceof Error ? e.message : String(e)
-            );
-          }
-        }
-        // NEW MODEL: parent stays at the original full scan; do NOT
-        // repoint to crop[0]. Children get their own crop paths via
-        // perCropDropboxPaths[childIdx].
-        console.log(
-          `[api/analyze] uploaded ${perCropDropboxPaths.filter(Boolean).length}/${perCropDropboxBuffers.length} crops; parent stays at ${newPath}`
-        );
-      } catch (e) {
-        console.warn(
-          "[api/analyze] per-crop upload block failed (continuing):",
-          e
-        );
-      }
+    if (isMultiDocScan) {
+      originalScanPath = newPath;
     }
 
     // 5. Merge tags
@@ -958,19 +816,6 @@ export async function POST(
           // image instead of just re-extracting crop[0].
           ...(originalScanPath
             ? { _original_scan_path: originalScanPath }
-            : {}),
-          // Polygons + per-doc detection metadata from the multi-doc
-          // split, stored on the PARENT row. The child-doc detail page
-          // reads polygons[childIdx + 1] to describe where each child
-          // originally sat on the scan ("top-left of the original scan").
-          // childIdx 0 in polygons corresponds to the parent itself.
-          ...(savedMultiDocPolygons
-            ? {
-                _multidoc: {
-                  polygons: savedMultiDocPolygons,
-                  total: 1 + multiDocChildren.length,
-                },
-              }
             : {}),
           _profile_match: profileMatchReason
             ? {
@@ -1308,35 +1153,50 @@ export async function POST(
       console.log(
         `[api/analyze] spawning ${multiDocChildren.length} multi-doc children for parent ${id}`
       );
-      for (let childIdx = 0; childIdx < multiDocChildren.length; childIdx++) {
-        const child = multiDocChildren[childIdx];
-        try {
-          // Per-child profile match. Each receipt on a scan can legitimately
-          // belong to a different profile (e.g. one for the family, one
-          // for the business), so we re-run the matcher.
-          let childProfileId: number | null = null;
-          let childProfileMatchConfidence = 0;
-          let childProfileMatchReason = "";
+      // Per-child profile match runs ONE Claude call each. Do them all in
+      // PARALLEL so N receipts don't serialise into N×~5s and blow the 60s
+      // function budget. Each receipt can legitimately belong to a
+      // different profile, so we still match every child independently.
+      const childMatches = await Promise.all(
+        multiDocChildren.map(async (child) => {
+          let cid: number | null = null;
+          let conf = 0;
+          let reason = "";
           try {
-            const childSuggestion = await suggestProfile(child, profiles);
-            if (childSuggestion && childSuggestion.profileId != null) {
-              childProfileId = childSuggestion.profileId;
-              childProfileMatchConfidence = childSuggestion.confidence;
-              childProfileMatchReason = childSuggestion.reason;
+            const s = await suggestProfile(child, profiles);
+            if (s && s.profileId != null) {
+              cid = s.profileId;
+              conf = s.confidence;
+              reason = s.reason;
             }
           } catch (e) {
             console.warn("[api/analyze] child suggestProfile failed", e);
           }
-          if (!childProfileId && child.profile_hint) {
+          if (!cid && child.profile_hint) {
             const m = matchProfileByHint(child.profile_hint, profiles);
             if (m) {
-              childProfileId = m.id;
-              childProfileMatchReason = "Name-token fallback";
-              childProfileMatchConfidence = 0.5;
+              cid = m.id;
+              reason = "Name-token fallback";
+              conf = 0.5;
             }
           }
           // Fallback to parent's profile if the child didn't resolve.
-          if (!childProfileId) childProfileId = profileId;
+          if (!cid) cid = profileId;
+          return {
+            childProfileId: cid,
+            childProfileMatchConfidence: conf,
+            childProfileMatchReason: reason,
+          };
+        })
+      );
+      for (let childIdx = 0; childIdx < multiDocChildren.length; childIdx++) {
+        const child = multiDocChildren[childIdx];
+        try {
+          const {
+            childProfileId,
+            childProfileMatchConfidence,
+            childProfileMatchReason,
+          } = childMatches[childIdx];
 
           // payment_status handling — same logic as parent.
           const childEf = child.extracted_fields || {};
@@ -1357,15 +1217,9 @@ export async function POST(
 
           const childInsert = {
             user_id: doc.user_id,
-            // Point THIS child at its own crop file. NEW MODEL:
-            // every receipt is a child (no parent-takes-crop-0), so the
-            // child at index `childIdx` uses perCropDropboxPaths[childIdx]
-            // directly. Falls back to the parent's path if for some
-            // reason the crop upload failed (rare, defensive).
-            dropbox_path:
-              perCropDropboxPaths[childIdx] ||
-              newPath ||
-              doc.dropbox_path,
+            // Every child shares the parent scan's image — one physical
+            // file in storage, multiple records. No per-receipt crop.
+            dropbox_path: newPath || doc.dropbox_path,
             dropbox_shared_link: shareLink || doc.dropbox_shared_link,
             storage_provider: doc.storage_provider,
             file_name: doc.file_name,
@@ -1459,6 +1313,33 @@ export async function POST(
         });
       } catch (e) {
         console.warn("[api/analyze] multi_doc_split log insert failed", e);
+      }
+    }
+
+    // Multi-receipt hand-off: the parent is now filed + flagged as a
+    // container with _original_scan_path. Kick the per-receipt background
+    // job (its own function + budget) to crop each receipt (CV, overlaps
+    // allowed), store each crop, and spawn one child per receipt. We
+    // fire-and-forget so this request returns promptly; the job's steps
+    // self-chain to completion (no UI polling required for fresh uploads).
+    if (isMultiDocScan) {
+      try {
+        const origin = request.nextUrl.origin;
+        void fetch(`${origin}/api/analyze-job/start`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            cookie: request.headers.get("cookie") || "",
+          },
+          body: JSON.stringify({
+            documentId: id,
+            fromOriginal: true,
+            forceProfile,
+          }),
+        }).catch(() => {});
+        console.log(`[api/analyze] handed off multi-doc scan ${id} to per-receipt job`);
+      } catch (e) {
+        console.warn("[api/analyze] per-receipt job hand-off failed:", e);
       }
     }
 

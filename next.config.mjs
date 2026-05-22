@@ -13,6 +13,10 @@ const nextConfig = {
     serverActions: {
       bodySizeLimit: "25mb",
     },
+    // Keep these out of the webpack server bundle — they must be required
+    // from node_modules at runtime. opencv-js does Node fs/path requires +
+    // ships embedded WASM; sharp ships a native binary.
+    serverComponentsExternalPackages: ["@techstark/opencv-js", "sharp"],
   },
 };
 

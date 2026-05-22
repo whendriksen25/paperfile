@@ -20,6 +20,7 @@ import { DocumentPreview } from "@/components/inbox/document-preview";
 import { ReconciliationPanel } from "@/components/inbox/reconciliation-panel";
 import { TruncationBanner } from "@/components/inbox/truncation-banner";
 import { ParentScanBanner } from "@/components/inbox/parent-scan-banner";
+import { BackToLibraryLink } from "@/components/back-to-library-link";
 import { estimateAiCostEur, formatAiCostEur } from "@/lib/ai/pricing";
 import {
   ProfileMatchPanel,
@@ -28,7 +29,6 @@ import {
 import { parseStoragePath } from "@/lib/utils/storage-path";
 import type { DocumentRow, ProfileRow, ActionRow } from "@/types/document";
 import {
-  ArrowLeft,
   ExternalLink,
   Sparkles,
   CircleDot,
@@ -173,6 +173,11 @@ export default async function DocumentDetail({
       .order("created_at", { ascending: true });
     siblings = (siblingData || []) as SiblingRow[];
   }
+  // Receipts = the children only (the parent is the scan container, not a
+  // receipt). Used for "X of N" labels and counts so a 4-receipt scan
+  // shows a Parent scan + receipts "1 of 4".."4 of 4" (not "1 of 5").
+  const childSiblings = siblings.filter((s) => s.parent_document_id != null);
+  const receiptCount = childSiblings.length;
 
   // Parent-scan banner data — only relevant for child rows (rows with
   // a parent_document_id set). We fetch the parent's fields once;
@@ -207,26 +212,13 @@ export default async function DocumentDetail({
         dropbox_path: string | null;
         extracted_fields: Record<string, unknown> | null;
       };
-      // Order siblings by dropbox_path (matches the _part1/_part2/...
-      // naming convention used when crops are written to storage).
-      // Fall back to created_at order for any row without a path.
-      const sorted = [...siblings].sort((a, b) => {
-        const ap = a.dropbox_path || "";
-        const bp = b.dropbox_path || "";
-        if (ap === bp) return 0;
-        return ap < bp ? -1 : 1;
-      });
-      const myPath = doc.dropbox_path || "";
-      // 1-based position: count of siblings whose path is <= mine.
-      let siblingPosition = 0;
-      for (const s of sorted) {
-        const sp = s.dropbox_path || "";
-        if (sp <= myPath) siblingPosition += 1;
-      }
-      // Defensive: position must be ≥ 1 so the banner reads correctly
-      // even if dropbox_path comparison goes weird.
-      if (siblingPosition === 0) siblingPosition = 1;
-      const siblingTotal = sorted.length;
+      // Position among RECEIPTS (children), excluding the parent. All
+      // siblings share the parent scan's dropbox_path (one physical file —
+      // no per-receipt crops), so order by creation: the siblings query
+      // returns created_at ascending.
+      const myIndex = childSiblings.findIndex((s) => s.id === doc.id);
+      const siblingPosition = myIndex >= 0 ? myIndex + 1 : 1;
+      const siblingTotal = childSiblings.length;
 
       // Spatial position. The parent persists polygons on
       // extracted_fields._multidoc.polygons; polygons[0] is the parent
@@ -379,13 +371,7 @@ export default async function DocumentDetail({
 
   return (
     <div className="px-5 md:px-10 py-6 md:py-10 max-w-5xl mx-auto">
-      <Link
-        href="/inbox"
-        className="text-xs font-semibold text-muted-foreground hover:text-foreground inline-flex items-center gap-1 mb-4"
-      >
-        <ArrowLeft className="h-3.5 w-3.5" />
-        Back to library
-      </Link>
+      <BackToLibraryLink />
 
       <header className="mb-6">
         {isMultiDocContainer && (
@@ -421,46 +407,62 @@ export default async function DocumentDetail({
             className="btn-secondary text-xs !py-2 mt-3 inline-flex"
           >
             <Images className="h-3.5 w-3.5" />
-            View original full scan ({siblings.length}{" "}
-            {siblings.length === 1 ? "receipt" : "receipts"})
+            View original full scan ({receiptCount}{" "}
+            {receiptCount === 1 ? "receipt" : "receipts"})
           </a>
         )}
 
         {siblings.length > 1 && (
           <div className="mt-3 surface p-3 bg-brand-purple/5 border-brand-purple/30">
             <div className="text-[10px] uppercase tracking-wider font-bold text-brand-purple mb-1.5">
-              Part of a {siblings.length}-document scan
+              Part of a {receiptCount}-receipt scan
             </div>
             <div className="flex flex-wrap gap-1.5">
-              {siblings.map((s, i) => {
-                const isCurrent = s.id === doc.id;
-                const label = `${i + 1} of ${siblings.length}`;
-                const summary = [
-                  s.sender || "—",
-                  s.amount != null
-                    ? formatMoney(s.amount, s.currency)
-                    : null,
-                  s.document_date ? formatDate(s.document_date) : null,
-                ]
-                  .filter(Boolean)
-                  .join(" · ");
-                return isCurrent ? (
-                  <span
-                    key={s.id}
-                    className="text-[11px] font-semibold inline-flex items-center gap-1.5 px-2 py-1 rounded bg-brand-purple text-white"
-                  >
-                    {label} — {summary || "this doc"}
-                  </span>
-                ) : (
-                  <Link
-                    key={s.id}
-                    href={`/document/${s.id}`}
-                    className="text-[11px] font-semibold inline-flex items-center gap-1.5 px-2 py-1 rounded border border-brand-purple/30 text-brand-purple hover:bg-brand-purple/10"
-                  >
-                    {label} — {summary || "view"}
-                  </Link>
+              {(() => {
+                // Parent container first (labelled "Parent scan"), then the
+                // receipts numbered "1 of N".."N of N" — the parent is the
+                // scan, not a receipt, so it isn't counted.
+                const parentSib = siblings.find(
+                  (s) => s.parent_document_id == null
                 );
-              })}
+                const ordered: Array<{ row: SiblingRow; label: string }> = [
+                  ...(parentSib
+                    ? [{ row: parentSib, label: "Parent scan" }]
+                    : []),
+                  ...childSiblings.map((s, i) => ({
+                    row: s,
+                    label: `${i + 1} of ${receiptCount}`,
+                  })),
+                ];
+                return ordered.map(({ row, label }) => {
+                  const isCurrent = row.id === doc.id;
+                  const summary = [
+                    row.sender || "—",
+                    row.amount != null
+                      ? formatMoney(row.amount, row.currency)
+                      : null,
+                    row.document_date ? formatDate(row.document_date) : null,
+                  ]
+                    .filter(Boolean)
+                    .join(" · ");
+                  return isCurrent ? (
+                    <span
+                      key={row.id}
+                      className="text-[11px] font-semibold inline-flex items-center gap-1.5 px-2 py-1 rounded bg-brand-purple text-white"
+                    >
+                      {label} — {summary || "this doc"}
+                    </span>
+                  ) : (
+                    <Link
+                      key={row.id}
+                      href={`/document/${row.id}`}
+                      className="text-[11px] font-semibold inline-flex items-center gap-1.5 px-2 py-1 rounded border border-brand-purple/30 text-brand-purple hover:bg-brand-purple/10"
+                    >
+                      {label} — {summary || "view"}
+                    </Link>
+                  );
+                });
+              })()}
             </div>
           </div>
         )}
@@ -814,6 +816,7 @@ export default async function DocumentDetail({
             <LineItemsSection
               items={items as LineItem[]}
               currency={doc.currency}
+              receiptTotal={doc.amount}
             />
           );
         })()

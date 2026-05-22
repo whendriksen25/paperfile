@@ -57,6 +57,12 @@ function flag(name, def = null) {
   const hit = rest.find((a) => a.startsWith(p));
   return hit ? hit.slice(p.length) : def;
 }
+// Boolean flag: true for a bare `--name` OR `--name=1|true`.
+function boolFlag(name) {
+  if (rest.includes(`--${name}`)) return true;
+  const v = flag(name, null);
+  return v === "1" || v === "true";
+}
 function positional() {
   return rest.filter((a) => !a.startsWith("--"));
 }
@@ -1452,40 +1458,183 @@ Return ONLY the JSON. No prose, no markdown.`;
 }
 
 /**
- * PROOF-OF-CONCEPT diag for the classical-CV corner detection approach.
- * Downloads a scan, runs a deterministic OpenCV pipeline to find the
- * bright-paper regions and their precise rotated rectangles (4 corners
- * + tilt angle), and SAVES AN ANNOTATED IMAGE so we can eyeball whether
- * CV nails the receipts before wiring it into the live pipeline.
+ * Ask the vision LLM ONLY for the count + a rough centre point per
+ * document. This is the LLM's strength (semantic "how many / roughly
+ * where"); it deliberately does NOT ask for precise corners — those come
+ * from CV. Returns an array of {x,y} fractions, or null on failure.
+ */
+async function llmDetectCentroids(buffer, fileName) {
+  if (!process.env.ANTHROPIC_API_KEY) {
+    console.warn("  ⚠ ANTHROPIC_API_KEY missing; skipping LLM seeds");
+    return null;
+  }
+  const { default: Anthropic } = await import("@anthropic-ai/sdk");
+  const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  const isImage = /\.(jpe?g|png|webp|gif|heic|heif)$/i.test(fileName);
+  const mediaType = isImage
+    ? /png$/i.test(fileName)
+      ? "image/png"
+      : "image/jpeg"
+    : "application/pdf";
+  const model = process.env.ANTHROPIC_MODEL_SMART || "claude-sonnet-4-6";
+  const prompt = `This scan may contain several separate paper documents (receipts / invoices) laid on a surface.
+
+Identify each DISTINCT physical document by its printed content (store header, line items, total). Count two pieces of paper that touch or overlap as TWO documents. Ignore the background, keyboards, hands, cables and other clutter.
+
+Return STRICT JSON: {"centers":[{"x":<0..1>,"y":<0..1>}, ...]} with ONE point roughly at the centre of each document (normalised, top-left origin). If there is only one document, return one center. No prose, no markdown.`;
+  const stream = client.messages.stream({
+    model,
+    max_tokens: 1000,
+    temperature: 0,
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: prompt },
+          isImage
+            ? { type: "image", source: { type: "base64", media_type: mediaType, data: buffer.toString("base64") } }
+            : { type: "document", source: { type: "base64", media_type: mediaType, data: buffer.toString("base64") } },
+        ],
+      },
+    ],
+  });
+  const resp = await stream.finalMessage();
+  const text = resp.content.filter((b) => b.type === "text").map((b) => b.text).join("");
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const body = (fence ? fence[1] : text).trim();
+  try {
+    const p = JSON.parse(body);
+    const c = Array.isArray(p.centers) ? p.centers : [];
+    return c.map((v) => ({ x: Number(v.x) || 0, y: Number(v.y) || 0 }));
+  } catch {
+    console.warn("  ⚠ LLM seed parse failed; raw:", text.slice(0, 160));
+    return null;
+  }
+}
+
+/**
+ * Ask the vision LLM for its OWN precise corners per receipt (4 vertices,
+ * normalised). This is the model's WEAK skill (coordinate regression) and
+ * exists only for the --ai overlay so we can see, on a real scan, how loose
+ * the model's coordinates are vs the CV boxes. Returns array of vertex arrays.
+ */
+async function llmDetectQuads(buffer, fileName) {
+  if (!process.env.ANTHROPIC_API_KEY) return null;
+  const { default: Anthropic } = await import("@anthropic-ai/sdk");
+  const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  const isImage = /\.(jpe?g|png|webp|gif|heic|heif)$/i.test(fileName);
+  const mediaType = isImage
+    ? /png$/i.test(fileName) ? "image/png" : "image/jpeg"
+    : "application/pdf";
+  const model = process.env.ANTHROPIC_MODEL_SMART || "claude-sonnet-4-6";
+  const prompt = `This scan contains one or more paper receipts on a surface.
+
+For EACH receipt, return the 4 corner points that tightly bound that receipt's paper, as normalised coordinates (x and y each 0..1, top-left origin). List the 4 corners clockwise starting from the receipt's own top-left. Receipts may be tilted or overlapping — the corners must hug the actual paper edges.
+
+Return STRICT JSON: {"receipts":[{"corners":[{"x":..,"y":..},{"x":..,"y":..},{"x":..,"y":..},{"x":..,"y":..}]}, ...]}. No prose.`;
+  const stream = client.messages.stream({
+    model,
+    max_tokens: 2000,
+    temperature: 0,
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: prompt },
+          isImage
+            ? { type: "image", source: { type: "base64", media_type: mediaType, data: buffer.toString("base64") } }
+            : { type: "document", source: { type: "base64", media_type: mediaType, data: buffer.toString("base64") } },
+        ],
+      },
+    ],
+  });
+  const resp = await stream.finalMessage();
+  const text = resp.content.filter((b) => b.type === "text").map((b) => b.text).join("");
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const body = (fence ? fence[1] : text).trim();
+  try {
+    const p = JSON.parse(body);
+    const rs = Array.isArray(p.receipts) ? p.receipts : [];
+    return rs.map((r) => (Array.isArray(r.corners) ? r.corners.map((v) => ({ x: Number(v.x) || 0, y: Number(v.y) || 0 })) : [])).filter((c) => c.length >= 3);
+  } catch {
+    console.warn("  ⚠ AI quad parse failed; raw:", text.slice(0, 160));
+    return null;
+  }
+}
+
+/**
+ * Hybrid receipt-segmentation diag. The LLM supplies only the COUNT and a
+ * rough centre per document (its strength); classical CV supplies the
+ * precise geometry (its strength):
  *
- * Pipeline: grayscale → blur → Otsu threshold (light paper vs dark mat)
- *   → morphological close (seal gaps) → findContours → area filter
- *   → minAreaRect per contour (gives centre, size, ANGLE, 4 corners).
+ *   grayscale → blur → Otsu threshold → open (despeckle) → fill internal
+ *   holes (barcodes/text) → connectedComponents.
+ *
+ * Each blob is then resolved against the LLM seeds:
+ *   - 1 seed inside a blob   → whole blob is that document (exact CV box)
+ *   - ≥2 seeds inside a blob → touching documents; split pixels by nearest
+ *                              seed, then box each half
+ *   - 0 seeds inside a blob  → distractor (keyboard / floor) → dropped
+ *
+ * minAreaRect on each region gives centre, size, ANGLE and 4 corners.
  *
  * Usage:
- *   npm run diag detect-corners <doc-id-or-prefix> [--from-original=1] [--min-area=0.03]
+ *   npm run diag detect-corners <doc-id|prefix|filename> [--from-original=1]
+ *       [--seeds="x,y x,y"]   manual seeds (fractions), skips the LLM
+ *       [--no-llm]            pure CV: one box per blob (debug)
+ *       [--min-area=0.03] [--open=0.012]
  *
- * Output: prints each detected rectangle (centre %, size %, angle, 4
- * corners) and writes scripts/_corners_<doc>.png with the rectangles
- * drawn on the scan. Open that PNG to judge the result.
+ * Writes scripts/_corners_<doc>.png (boxes on the scan) and
+ * scripts/_corners_<doc>_mask.png (threshold mask). Open them to judge.
  */
 async function cmdDetectCorners() {
   const [idArg] = positional();
-  if (!idArg) throw new Error("Usage: diag detect-corners <doc-id-or-prefix> [--from-original=1]");
+  if (!idArg) throw new Error("Usage: diag detect-corners <doc-id|prefix|filename> [--from-original=1] [--seeds=\"x,y x,y\"] [--no-llm]");
   const fromOriginal = flag("from-original", "0") === "1";
   const minAreaFrac = Number(flag("min-area", "0.03")) || 0.03;
+  const seedsFlag = flag("seeds", "");
+  const noLlm = boolFlag("no-llm");
+  const showAi = boolFlag("ai"); // overlay the model's own corners
 
   const supabase = admin();
+  let doc = null;
   const docId = await resolveId(supabase, "documents", idArg);
-  if (!docId) {
+  if (docId) {
+    const { data } = await supabase
+      .from("documents")
+      .select("id, file_name, dropbox_path, extracted_fields, parent_document_id")
+      .eq("id", docId)
+      .single();
+    doc = data || null;
+  }
+  // Fall back to a filename fragment match (e.g. "20251022_etos").
+  if (!doc) {
+    const { data: matches } = await supabase
+      .from("documents")
+      .select("id, file_name, dropbox_path, extracted_fields, parent_document_id")
+      .ilike("dropbox_path", `%${idArg}%`)
+      .order("created_at", { ascending: false })
+      .limit(50);
+    if (matches && matches.length) {
+      // Prefer the parent scan (no parent_document_id) and a path without "_part".
+      const ranked = [...matches].sort((a, b) => {
+        const score = (r) =>
+          (r.parent_document_id ? 0 : 2) +
+          (/_part/i.test(r.dropbox_path || "") ? 0 : 1);
+        return score(b) - score(a);
+      });
+      doc = ranked[0];
+      if (matches.length > 1) {
+        console.warn(
+          `  ⚠ "${idArg}" matched ${matches.length} rows; using ${doc.dropbox_path}`
+        );
+      }
+    }
+  }
+  if (!doc) {
     console.error(`No documents row found matching "${idArg}"`);
     process.exit(1);
   }
-  const { data: doc } = await supabase
-    .from("documents")
-    .select("id, file_name, dropbox_path, extracted_fields")
-    .eq("id", docId)
-    .single();
   if (!doc?.dropbox_path) {
     console.error("Doc has no dropbox_path");
     process.exit(1);
@@ -1511,12 +1660,25 @@ async function cmdDetectCorners() {
   });
   console.log("\nDownloading...");
   const dl = await dbx.filesDownload({ path: downloadPath });
-  const buffer = Buffer.from((dl.result).fileBinary);
+  let buffer = Buffer.from((dl.result).fileBinary);
   console.log(`downloaded ${buffer.length} bytes`);
 
   // Decode to raw RGBA via sharp (opencv.js can't decode JPEG in Node).
   const sharpMod = await import("sharp");
   const sharp = sharpMod.default || sharpMod;
+
+  // Match production: bake in EXIF orientation before any pixel work so
+  // both the LLM and the CV operate on the same upright pixels.
+  try {
+    const meta = await sharp(buffer).metadata();
+    if (meta.orientation && meta.orientation !== 1) {
+      buffer = await sharp(buffer).rotate().jpeg({ quality: 92 }).toBuffer();
+      console.log(`auto-rotated (EXIF=${meta.orientation})`);
+    }
+  } catch (e) {
+    console.warn("auto-rotate skipped:", e.message);
+  }
+
   const { data: rgba, info } = await sharp(buffer)
     .ensureAlpha()
     .raw()
@@ -1543,46 +1705,336 @@ async function cmdDetectCorners() {
   // Otsu auto-threshold: bright paper → white, dark mat → black.
   const thresh = new cv.Mat();
   cv.threshold(gray, thresh, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
-  // Morphological close to seal small gaps inside paper (text, folds).
-  const kernel = cv.getStructuringElement(
-    cv.MORPH_RECT,
-    new cv.Size(Math.max(3, Math.round(W * 0.01)), Math.max(3, Math.round(W * 0.01)))
-  );
-  cv.morphologyEx(thresh, thresh, cv.MORPH_CLOSE, kernel);
+  // Morphology. Two opposing needs:
+  //   - CLOSE seals gaps INSIDE a receipt (text holes, faded strips) so
+  //     it stays one blob — but too much CLOSE bridges the gap BETWEEN
+  //     adjacent receipts, merging them.
+  //   - OPEN (erode→dilate) breaks thin bridges between receipts — but
+  //     too much fragments a single receipt.
+  // The previous 1%-kernel CLOSE merged the two top receipts. Tunable
+  // via flags so we can find the sweet spot:
+  //   --close=<frac>  kernel size as fraction of width (default 0, off)
+  //   --open=<frac>   erosion to separate touching blobs (default 0.012)
+  const closeFrac = Number(flag("close", "0")) || 0;
+  const openFrac = Number(flag("open", "0.012"));
+  if (openFrac > 0) {
+    const k = cv.getStructuringElement(
+      cv.MORPH_RECT,
+      new cv.Size(
+        Math.max(3, Math.round(W * openFrac)),
+        Math.max(3, Math.round(W * openFrac))
+      )
+    );
+    cv.morphologyEx(thresh, thresh, cv.MORPH_OPEN, k);
+    k.delete();
+  }
+  if (closeFrac > 0) {
+    const k = cv.getStructuringElement(
+      cv.MORPH_RECT,
+      new cv.Size(
+        Math.max(3, Math.round(W * closeFrac)),
+        Math.max(3, Math.round(W * closeFrac))
+      )
+    );
+    cv.morphologyEx(thresh, thresh, cv.MORPH_CLOSE, k);
+    k.delete();
+  }
 
-  // Find external contours.
+  // Save the binary threshold mask for inspection — shows exactly where
+  // blobs are separated vs merged BEFORE contour finding.
+  {
+    const maskRgba = new cv.Mat();
+    cv.cvtColor(thresh, maskRgba, cv.COLOR_GRAY2RGBA);
+    const maskName = `scripts/_corners_${doc.id.slice(0, 8)}_mask.png`;
+    await sharp(Buffer.from(maskRgba.data), {
+      raw: { width: W, height: H, channels: 4 },
+    })
+      .png()
+      .toFile(maskName);
+    maskRgba.delete();
+    console.log(`threshold mask saved → ${maskName}`);
+  }
+
+  // ---- Seeds: COUNT + rough centre per document ---------------------------
+  // Manual (--seeds) for offline testing, else the LLM, else none (pure CV).
+  let seeds = null;
+  if (seedsFlag) {
+    seeds = seedsFlag.trim().split(/\s+/).map((s) => {
+      const [x, y] = s.split(",").map(Number);
+      return { x, y };
+    });
+    console.log(`seeds:     ${seeds.length} (manual)`);
+  } else if (!noLlm) {
+    console.log("\nAsking the LLM for document count + rough centres...");
+    seeds = await llmDetectCentroids(buffer, doc.file_name || "scan.jpg");
+    if (seeds) {
+      console.log(
+        `seeds:     ${seeds.length} (LLM) — ${seeds
+          .map((s) => `(${(s.x * 100).toFixed(0)},${(s.y * 100).toFixed(0)})`)
+          .join(" ")}`
+      );
+    } else {
+      console.log("seeds:     LLM failed → falling back to pure CV (one box per blob)");
+    }
+  } else {
+    console.log("seeds:     none (--no-llm; pure CV, one box per blob)");
+  }
+
+  // ---- Fill internal holes so each document is one solid blob -------------
+  // Barcodes / dense text print as dark holes; left unfilled they fragment a
+  // single receipt into many components. Drawing the external contours solid
+  // fills holes WITHOUT bridging separate receipts (unlike a morphological
+  // close, which does bridge them).
   const contours = new cv.MatVector();
   const hierarchy = new cv.Mat();
   cv.findContours(thresh, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-
-  const totalArea = W * H;
-  const found = [];
+  const filled = cv.Mat.zeros(H, W, cv.CV_8UC1);
   for (let i = 0; i < contours.size(); i++) {
-    const c = contours.get(i);
-    const area = cv.contourArea(c);
-    if (area / totalArea < minAreaFrac) {
-      c.delete();
-      continue;
+    cv.drawContours(filled, contours, i, new cv.Scalar(255), -1);
+  }
+
+  // ---- Connected components → one label per blob --------------------------
+  const labels = new cv.Mat();
+  const nLabels = cv.connectedComponents(filled, labels);
+  const lab = labels.data32S; // Int32Array view, row-major
+  const totalArea = W * H;
+
+  // Collect foreground pixels grouped by blob label in a single pass.
+  const pixByLabel = new Map(); // label → flat [x,y,x,y,...]
+  for (let y = 0; y < H; y++) {
+    const row = y * W;
+    for (let x = 0; x < W; x++) {
+      const l = lab[row + x];
+      if (l === 0) continue; // background
+      let arr = pixByLabel.get(l);
+      if (!arr) { arr = []; pixByLabel.set(l, arr); }
+      arr.push(x, y);
     }
-    const rect = cv.minAreaRect(c);
-    const pts = cv.RotatedRect.points(rect);
-    found.push({
-      areaFrac: area / totalArea,
+  }
+
+  // --raw-rect forces plain minAreaRect (debug); default = oriented edge box.
+  const useEdges = !boolFlag("raw-rect");
+  const D2R = Math.PI / 180;
+
+  // Build a binary mask from a flat [x,y,...] pixel list and close tiny gaps
+  // so its outline is a clean single boundary for edge detection.
+  const maskFromFlat = (flat) => {
+    const m = cv.Mat.zeros(H, W, cv.CV_8UC1);
+    for (let k = 0; k < flat.length; k += 2) m.data[flat[k + 1] * W + flat[k]] = 255;
+    const k9 = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(9, 9));
+    cv.morphologyEx(m, m, cv.MORPH_CLOSE, k9);
+    k9.delete();
+    return m;
+  };
+
+  // Dominant edge direction θ (degrees, in [0,90)) of a region: Canny its
+  // boundary, Hough the straight edge segments, take the length-weighted peak
+  // of their angles folded mod 90 (a receipt's two edge pairs are 90° apart,
+  // so both fold to the same θ). Even 2 long edges fix θ reliably. Returns
+  // null if too few segments — caller falls back to the minAreaRect angle.
+  const edgeAngle = (flat) => {
+    const mask = maskFromFlat(flat);
+    const edges = new cv.Mat();
+    cv.Canny(mask, edges, 50, 150);
+    const lines = new cv.Mat();
+    const minLen = Math.max(40, Math.round(Math.sqrt(flat.length / 2) * 0.25));
+    cv.HoughLinesP(edges, lines, 1, Math.PI / 180, 50, minLen, 40);
+    const bins = new Array(90).fill(0);
+    let nSeg = 0;
+    for (let i = 0; i < lines.rows; i++) {
+      const x1 = lines.data32S[i * 4], y1 = lines.data32S[i * 4 + 1];
+      const x2 = lines.data32S[i * 4 + 2], y2 = lines.data32S[i * 4 + 3];
+      const len = Math.hypot(x2 - x1, y2 - y1);
+      let ang = Math.atan2(y2 - y1, x2 - x1) * 180 / Math.PI;
+      ang = ((ang % 90) + 90) % 90;
+      bins[Math.floor(ang)] += len;
+      nSeg++;
+    }
+    mask.delete(); edges.delete(); lines.delete();
+    if (nSeg < 2) return null;
+    let theta = 0, best = -1;
+    for (let a = 0; a < 90; a++) {
+      const w = bins[a] + bins[(a + 1) % 90] + bins[(a + 89) % 90];
+      if (w > best) { best = w; theta = a; }
+    }
+    return theta;
+  };
+
+  // Oriented edge box: take θ (dominant edge direction), then TRIMMED extents
+  // (1st/99th percentile) of the region's pixels along (θ, θ+90). The trim
+  // discards curl / torn-corner outliers that would otherwise expand the box —
+  // unlike minAreaRect, which is pinned by the most extreme pixels. Result is
+  // a tilt-aligned rectangle (your "two pairs of parallel lines"). Returns 4
+  // {x,y} px corners.
+  const orientedBox = (flat, thetaDeg) => {
+    const th = thetaDeg * D2R;
+    const ux = Math.cos(th), uy = Math.sin(th), vx = -Math.sin(th), vy = Math.cos(th);
+    const n = flat.length / 2;
+    let cx = 0, cy = 0;
+    for (let k = 0; k < flat.length; k += 2) { cx += flat[k]; cy += flat[k + 1]; }
+    cx /= n; cy /= n;
+    const A = new Float64Array(n), B = new Float64Array(n);
+    for (let k = 0, j = 0; k < flat.length; k += 2, j++) {
+      const dx = flat[k] - cx, dy = flat[k + 1] - cy;
+      A[j] = dx * ux + dy * uy;
+      B[j] = dx * vx + dy * vy;
+    }
+    const As = Array.from(A).sort((a, b) => a - b);
+    const Bs = Array.from(B).sort((a, b) => a - b);
+    const trim = 0.01;
+    const pick = (s, p) => s[Math.min(s.length - 1, Math.max(0, Math.round(p * (s.length - 1))))];
+    const aLo = pick(As, trim), aHi = pick(As, 1 - trim);
+    const bLo = pick(Bs, trim), bHi = pick(Bs, 1 - trim);
+    const corner = (a, b) => ({ x: cx + a * ux + b * vx, y: cy + a * uy + b * vy });
+    return [corner(aLo, bLo), corner(aHi, bLo), corner(aHi, bHi), corner(aLo, bHi)];
+  };
+
+  // Geometry for a region's pixel list: minAreaRect scalars (centre/size/angle
+  // for sorting + display + fallback θ) plus the oriented edge box (ptsBox).
+  const geomFromFlat = (flat) => {
+    const m = cv.matFromArray(flat.length / 2, 1, cv.CV_32SC2, flat);
+    const rect = cv.minAreaRect(m);
+    const ptsRect = cv.RotatedRect.points(rect).map((p) => ({ x: p.x, y: p.y }));
+    m.delete();
+    let ptsBox = ptsRect;
+    if (useEdges) {
+      let theta = edgeAngle(flat);
+      if (theta == null) theta = ((rect.angle % 90) + 90) % 90;
+      ptsBox = orientedBox(flat, theta);
+    }
+    return {
+      areaFrac: flat.length / 2 / totalArea,
       cx: rect.center.x / W,
       cy: rect.center.y / H,
       w: rect.size.width / W,
       h: rect.size.height / H,
       angle: rect.angle,
-      corners: pts.map((p) => ({ x: p.x / W, y: p.y / H })),
-      ptsPx: pts,
+      ptsBox,
+    };
+  };
+
+  // Clip a polygon (array of {x,y}) to seed i's Voronoi cell within a blob:
+  // for every OTHER seed j sharing the blob, keep the half-plane of points
+  // closer to i than to j. This makes touching documents split along their
+  // seam instead of each minAreaRect bleeding across it. Sutherland–Hodgman.
+  const clipToVoronoi = (poly, i, sIdx, seedPx) => {
+    let out = poly;
+    for (const j of sIdx) {
+      if (j === i) continue;
+      const A = seedPx[i], B = seedPx[j];
+      // keep P where P·(B−A) ≤ (|B|²−|A|²)/2  (closer to A than to B)
+      const nx = B.x - A.x, ny = B.y - A.y;
+      const t = (B.x * B.x + B.y * B.y - (A.x * A.x + A.y * A.y)) / 2;
+      const clipped = [];
+      for (let k = 0; k < out.length; k++) {
+        const cur = out[k], nxt = out[(k + 1) % out.length];
+        const dc = cur.x * nx + cur.y * ny - t;
+        const dn = nxt.x * nx + nxt.y * ny - t;
+        if (dc <= 0) clipped.push(cur);
+        if ((dc <= 0) !== (dn <= 0)) {
+          const a = dc / (dc - dn);
+          clipped.push({ x: cur.x + a * (nxt.x - cur.x), y: cur.y + a * (nxt.y - cur.y) });
+        }
+      }
+      out = clipped;
+      if (out.length < 3) break;
+    }
+    return out;
+  };
+
+  // Snap a seed to the nearest foreground pixel (LLM centres can land on a
+  // dark logo or just outside the paper). Expanding-ring search.
+  const snapToFg = (sx, sy) => {
+    sx = Math.min(W - 1, Math.max(0, Math.round(sx)));
+    sy = Math.min(H - 1, Math.max(0, Math.round(sy)));
+    if (lab[sy * W + sx] !== 0) return { x: sx, y: sy };
+    const maxR = Math.round(W * 0.12);
+    for (let r = 2; r <= maxR; r += 2) {
+      for (let dy = -r; dy <= r; dy += 2) {
+        const yy = sy + dy;
+        if (yy < 0 || yy >= H) continue;
+        for (let dx = -r; dx <= r; dx += 2) {
+          if (Math.abs(dx) !== r && Math.abs(dy) !== r) continue; // ring only
+          const xx = sx + dx;
+          if (xx < 0 || xx >= W) continue;
+          if (lab[yy * W + xx] !== 0) return { x: xx, y: yy };
+        }
+      }
+    }
+    return null;
+  };
+
+  // Finalise a region record: attach its display polygon (clipped or not)
+  // plus normalised corners, then push.
+  const pushRegion = (r, polyPx) => {
+    r.polyPx = polyPx;
+    r.corners = polyPx.map((p) => ({ x: p.x / W, y: p.y / H }));
+    found.push(r);
+  };
+
+  const found = [];
+  let droppedSeedless = 0;
+  if (!seeds || seeds.length === 0) {
+    // Pure CV: every blob over the area floor becomes a region.
+    for (const [, flat] of pixByLabel) {
+      if (flat.length / 2 / totalArea < minAreaFrac) continue;
+      const r = geomFromFlat(flat);
+      pushRegion(r, r.ptsBox);
+    }
+  } else {
+    // Map each seed to the blob it lands in (after snapping).
+    const seedPx = seeds.map((s) => snapToFg(s.x * W, s.y * H));
+    const byLabel = new Map(); // blobLabel → [seedIndex,...]
+    seedPx.forEach((p, i) => {
+      if (!p) return;
+      const l = lab[p.y * W + p.x];
+      if (l === 0) return;
+      let arr = byLabel.get(l);
+      if (!arr) { arr = []; byLabel.set(l, arr); }
+      arr.push(i);
     });
-    c.delete();
+    // Blobs with no seed = distractors (keyboard / floor / glare) → dropped.
+    for (const [l, flat] of pixByLabel) {
+      if (!byLabel.has(l) && flat.length / 2 / totalArea >= minAreaFrac) {
+        droppedSeedless++;
+      }
+    }
+    for (const [l, sIdx] of byLabel) {
+      const flat = pixByLabel.get(l);
+      if (!flat) continue;
+      if (sIdx.length === 1) {
+        if (flat.length / 2 / totalArea < minAreaFrac) continue;
+        const r = geomFromFlat(flat);
+        pushRegion(r, r.ptsBox);
+      } else {
+        // Touching documents in one blob: split pixels by nearest seed, then
+        // clip each region to its Voronoi cell so crops never overlap.
+        const groups = new Map(sIdx.map((i) => [i, []]));
+        for (let k = 0; k < flat.length; k += 2) {
+          const x = flat[k], y = flat[k + 1];
+          let best = sIdx[0], bd = Infinity;
+          for (const i of sIdx) {
+            const dx = x - seedPx[i].x, dy = y - seedPx[i].y;
+            const d = dx * dx + dy * dy;
+            if (d < bd) { bd = d; best = i; }
+          }
+          groups.get(best).push(x, y);
+        }
+        for (const [i, g] of groups) {
+          if (g.length / 2 / totalArea < minAreaFrac) continue;
+          const r = geomFromFlat(g);
+          const poly = clipToVoronoi(r.ptsBox, i, sIdx, seedPx);
+          if (poly.length >= 3) pushRegion(r, poly);
+        }
+      }
+    }
   }
 
   // Sort by reading order (top-to-bottom, then left-to-right) for display.
   found.sort((a, b) => (a.cy - b.cy) || (a.cx - b.cx));
 
-  console.log(`\n=== Detected ${found.length} bright region(s) (min area ${(minAreaFrac * 100).toFixed(0)}%) ===`);
+  const seedNote = seeds ? `, ${seeds.length} seed(s), ${droppedSeedless} seedless blob(s) dropped` : "";
+  console.log(`\n=== Detected ${found.length} region(s) (min area ${(minAreaFrac * 100).toFixed(0)}%${seedNote}) ===`);
   for (let i = 0; i < found.length; i++) {
     const f = found[i];
     console.log(
@@ -1601,10 +2053,10 @@ async function cmdDetectCorners() {
   for (let i = 0; i < found.length; i++) {
     const col = colors[i % colors.length];
     const colour = new cv.Scalar(col[0], col[1], col[2], 255);
-    const pts = found[i].ptsPx;
-    for (let j = 0; j < 4; j++) {
+    const pts = found[i].polyPx;
+    for (let j = 0; j < pts.length; j++) {
       const a = pts[j];
-      const b = pts[(j + 1) % 4];
+      const b = pts[(j + 1) % pts.length];
       cv.line(
         src,
         new cv.Point(Math.round(a.x), Math.round(a.y)),
@@ -1614,6 +2066,31 @@ async function cmdDetectCorners() {
       );
     }
   }
+  // --ai: overlay the model's OWN corners (bright yellow) so we can compare
+  // them directly against the CV boxes on the same scan.
+  if (showAi) {
+    console.log("\nAsking the LLM for its own per-receipt corners (--ai)...");
+    const quads = await llmDetectQuads(buffer, doc.file_name || "scan.jpg");
+    if (quads && quads.length) {
+      console.log(`AI returned ${quads.length} receipt quad(s) (yellow overlay)`);
+      const yellow = new cv.Scalar(250, 204, 21, 255);
+      for (const q of quads) {
+        for (let j = 0; j < q.length; j++) {
+          const a = q[j], b = q[(j + 1) % q.length];
+          cv.line(
+            src,
+            new cv.Point(Math.round(a.x * W), Math.round(a.y * H)),
+            new cv.Point(Math.round(b.x * W), Math.round(b.y * H)),
+            yellow,
+            Math.max(3, Math.round(W * 0.006))
+          );
+        }
+      }
+    } else {
+      console.log("AI returned no usable quads");
+    }
+  }
+
   // src is RGBA — convert back to a PNG via sharp.
   const outRgba = Buffer.from(src.data);
   const outName = `scripts/_corners_${doc.id.slice(0, 8)}.png`;
@@ -1624,8 +2101,154 @@ async function cmdDetectCorners() {
   console.log("Open it to verify the rectangles hug each receipt.");
 
   // Clean up Mats.
-  src.delete(); gray.delete(); thresh.delete(); kernel.delete();
+  src.delete(); gray.delete(); thresh.delete();
   contours.delete(); hierarchy.delete();
+  filled.delete(); labels.delete();
+}
+
+/**
+ * Resolve a doc (UUID prefix OR filename fragment), download it from Dropbox,
+ * and bake in EXIF orientation. Returns { doc, buffer }.
+ */
+async function loadScan(idArg, fromOriginal) {
+  const supabase = admin();
+  let doc = null;
+  const docId = await resolveId(supabase, "documents", idArg);
+  if (docId) {
+    const { data } = await supabase
+      .from("documents")
+      .select("id, file_name, dropbox_path, extracted_fields, parent_document_id")
+      .eq("id", docId)
+      .single();
+    doc = data || null;
+  }
+  if (!doc) {
+    const { data: matches } = await supabase
+      .from("documents")
+      .select("id, file_name, dropbox_path, extracted_fields, parent_document_id")
+      .ilike("dropbox_path", `%${idArg}%`)
+      .order("created_at", { ascending: false })
+      .limit(50);
+    if (matches && matches.length) {
+      const ranked = [...matches].sort((a, b) => {
+        const score = (r) => (r.parent_document_id ? 0 : 2) + (/_part/i.test(r.dropbox_path || "") ? 0 : 1);
+        return score(b) - score(a);
+      });
+      doc = ranked[0];
+    }
+  }
+  if (!doc?.dropbox_path) throw new Error(`No documents row found matching "${idArg}"`);
+  const originalPath = doc.extracted_fields?._original_scan_path || null;
+  const downloadPath = fromOriginal && originalPath ? originalPath : doc.dropbox_path;
+  console.log(`doc:       ${doc.id.slice(0, 8)}`);
+  console.log(`path:      ${downloadPath}${fromOriginal ? "  (--from-original)" : ""}`);
+
+  const { Dropbox } = await import("dropbox");
+  const patchedFetch = async (input, init) => {
+    const res = await fetch(input, init);
+    if (!res.buffer) res.buffer = async () => Buffer.from(await res.arrayBuffer());
+    return res;
+  };
+  const dbx = new Dropbox({
+    clientId: process.env.DROPBOX_APP_KEY,
+    clientSecret: process.env.DROPBOX_APP_SECRET,
+    refreshToken: process.env.DROPBOX_REFRESH_TOKEN,
+    fetch: patchedFetch,
+  });
+  const dl = await dbx.filesDownload({ path: downloadPath });
+  let buffer = Buffer.from((dl.result).fileBinary);
+  try {
+    const sharpMod = await import("sharp");
+    const sharp = sharpMod.default || sharpMod;
+    const meta = await sharp(buffer).metadata();
+    if (meta.orientation && meta.orientation !== 1) {
+      buffer = await sharp(buffer).rotate().jpeg({ quality: 92 }).toBuffer();
+    }
+  } catch { /* leave as-is */ }
+  return { doc, buffer };
+}
+
+/**
+ * Reframe test: send the WHOLE multi-receipt scan to the model in ONE call
+ * and ask for one structured record per receipt — no cropping, no geometry.
+ * Prints each receipt's store/date/total/line-items so we can judge whether
+ * the model keeps them cleanly separated (the only thing that matters for the
+ * "don't bother cropping" approach).
+ *
+ *   npm run diag extract-multi <doc-id|prefix|filename> [--from-original=1]
+ */
+async function cmdExtractMulti() {
+  const [idArg] = positional();
+  if (!idArg) throw new Error("Usage: diag extract-multi <doc-id|prefix|filename> [--from-original=1]");
+  if (!process.env.ANTHROPIC_API_KEY) { console.error("ANTHROPIC_API_KEY missing"); process.exit(1); }
+  const fromOriginal = flag("from-original", "0") === "1";
+  const { doc, buffer } = await loadScan(idArg, fromOriginal);
+  console.log(`bytes:     ${buffer.length}`);
+
+  const isImage = /\.(jpe?g|png|webp|gif|heic|heif)$/i.test(doc.file_name || "");
+  const mediaType = isImage ? (/png$/i.test(doc.file_name || "") ? "image/png" : "image/jpeg") : "application/pdf";
+  const model = process.env.ANTHROPIC_MODEL_SMART || "claude-sonnet-4-6";
+  const prompt = `This scan shows one or more SEPARATE paper receipts laid on a surface. Read EACH receipt independently and capture its full content.
+
+Return STRICT JSON: {"receipts":[ ... ]} with ONE object per physical receipt, in reading order (top-to-bottom, then left-to-right). Each object:
+{
+  "store": "<merchant/store name>",
+  "document_date": "YYYY-MM-DD|null",
+  "time": "HH:MM|null",
+  "currency": "EUR|...|null",
+  "total": <number|null>,
+  "payment_method": "<pin/cash/card/...|null>",
+  "line_items": [ { "description": "<item>", "quantity": <number|null>, "unit_price": <number|null>, "amount": <number|null> } ]
+}
+
+CRITICAL RULES:
+- One object per physical receipt. Do NOT merge two receipts into one.
+- Never let a line item, total, or date from one receipt appear under another. Keep each receipt's data with that receipt.
+- Capture ALL line items you can read for each receipt.
+- Use null where a value is absent. Return ONLY the JSON object, no prose.`;
+
+  const { default: Anthropic } = await import("@anthropic-ai/sdk");
+  const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  console.log(`\nmodel:     ${model}\nCalling (full scan, one pass)...`);
+  const t0 = Date.now();
+  const stream = client.messages.stream({
+    model,
+    max_tokens: 8000,
+    temperature: 0,
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: prompt },
+          isImage
+            ? { type: "image", source: { type: "base64", media_type: mediaType, data: buffer.toString("base64") } }
+            : { type: "document", source: { type: "base64", media_type: mediaType, data: buffer.toString("base64") } },
+        ],
+      },
+    ],
+  });
+  const resp = await stream.finalMessage();
+  const ms = Date.now() - t0;
+  const text = resp.content.filter((b) => b.type === "text").map((b) => b.text).join("");
+  console.log(`responded in ${ms}ms · in=${resp.usage?.input_tokens} out=${resp.usage?.output_tokens} stop=${resp.stop_reason}`);
+
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const body = (fence ? fence[1] : text).trim();
+  let parsed;
+  try { parsed = JSON.parse(body); }
+  catch { console.log("\n!!! Could not parse JSON. Raw:\n" + text.slice(0, 1200)); return; }
+  const receipts = Array.isArray(parsed.receipts) ? parsed.receipts : [];
+  console.log(`\n=== ${receipts.length} receipt(s) ===`);
+  receipts.forEach((r, i) => {
+    const items = Array.isArray(r.line_items) ? r.line_items : [];
+    const sum = items.reduce((s, it) => s + (Number(it.amount) || 0), 0);
+    console.log(`\n#${i + 1}: ${r.store || "—"} · ${r.document_date || "—"} ${r.time || ""} · ${r.currency || ""} ${r.total ?? "—"} · ${r.payment_method || ""}`);
+    console.log(`     ${items.length} line item(s)  (Σ amounts = ${sum.toFixed(2)})`);
+    items.slice(0, 12).forEach((it) => {
+      console.log(`       - ${String(it.description || "").slice(0, 40).padEnd(40)} ${it.quantity ?? ""}\t${it.unit_price ?? ""}\t${it.amount ?? ""}`);
+    });
+    if (items.length > 12) console.log(`       … +${items.length - 12} more`);
+  });
 }
 
 async function cmdRetryFailed() {
@@ -2388,7 +3011,8 @@ Subcommands:
   taxonomy-cleanup  [--apply]
   cleanup-multi-doc-dupes [--dry-run]
   detect-multidoc <doc-id-or-prefix> [--from-original=1]
-  detect-corners  <doc-id-or-prefix> [--from-original=1] [--min-area=0.03]
+  detect-corners  <doc-id|prefix|filename> [--from-original=1] [--ai] [--seeds="x,y x,y"] [--no-llm] [--min-area=0.03]
+  extract-multi   <doc-id|prefix|filename> [--from-original=1]   (full-scan → per-receipt data, no cropping)
   extract-doc     <doc-id-or-prefix>  OR  --path=/Archive/...path.jpg
   pay-actions    [--limit=50]
   match-debug    <tx-id-or-prefix>
@@ -2420,6 +3044,7 @@ const dispatch = {
   "cleanup-multi-doc-dupes": cmdCleanupMultiDocDupes,
   "detect-multidoc": cmdDetectMultidoc,
   "detect-corners": cmdDetectCorners,
+  "extract-multi": cmdExtractMulti,
   "extract-doc": cmdExtractDoc,
   "pay-actions": cmdPayActions,
   "match-debug": cmdMatchDebug,

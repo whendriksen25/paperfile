@@ -62,8 +62,16 @@ export default async function InboxPage({
   // the count without ever finding the doc.
   const triage = sp.needs_review === "1";
 
+  // Compute the search query up-front. When the user is actively searching
+  // we deliberately IGNORE the active profile filter so the search spans the
+  // WHOLE archive. Otherwise a search runs scoped to the currently-selected
+  // profile (default "Me"), so a query like "Ekoplaza" returns nothing
+  // because those receipts are filed under "Pa" — the #1 "search finds
+  // nothing" trap. (Same spirit as the triage view ignoring the filter.)
+  const searchQuery = (sp.q || "").trim();
+
   if (sp.batch) q = q.eq("batch", sp.batch);
-  if (sp.profile_id && !triage) {
+  if (sp.profile_id && !triage && !searchQuery) {
     q = q.eq("primary_profile_id", Number(sp.profile_id));
   }
   if (sp.type) q = q.eq("document_type", sp.type);
@@ -72,7 +80,6 @@ export default async function InboxPage({
   }
   // Search: uses the existing `fts` GIN index (same machinery as /search).
   // websearch syntax accepts quoted phrases and AND/OR semantics naturally.
-  const searchQuery = (sp.q || "").trim();
   if (searchQuery) {
     q = q.textSearch("fts", searchQuery, {
       type: "websearch",

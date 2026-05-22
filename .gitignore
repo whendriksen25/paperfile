@@ -35,3 +35,6 @@ next-env.d.ts
 # Local notes
 supabase-db-password.txt
 dropbox-token-response.json
+
+# diag scratch output (annotated PNGs, throwaway probes)
+scripts/_*

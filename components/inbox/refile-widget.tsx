@@ -173,26 +173,20 @@ export function RefileWidget({
   }
 
   /**
-   * Smart re-analyse. ONE button, three behaviours:
+   * Smart re-analyse. ONE button, two behaviours:
    *
    *  1. Multi-doc parent (hasOriginalScan || isMultiDocParent):
-   *     route through /api/analyze-job/start with fromOriginal=true so
-   *     the pipeline downloads the FULL original multi-receipt scan (not
-   *     the parent's current dropbox_path, which after a previous split
-   *     points at _part1.jpg of just one receipt). The job-based
-   *     background pipeline shows a live progress panel below.
+   *     start the per-receipt background job via /api/analyze-job/start
+   *     (fromOriginal=true → reads the ORIGINAL full scan). The job crops
+   *     each receipt (CV, overlaps allowed), stores each crop, and extracts
+   *     ONE receipt per step — so each runs in its own budget. The live
+   *     progress panel renders below. If detection now sees a single doc,
+   *     fall back to the inline route.
    *
-   *  2. Single doc: standard synchronous re-analyse via the existing
-   *     /api/analyze/[id] route. Fits in Vercel's 60s budget easily.
+   *  2. Single doc: synchronous re-analyse via /api/analyze/[id].
    *
-   *  3. Multi-doc parent but the start endpoint reports only one
-   *     document was detected this time (e.g. boxes changed, original
-   *     was actually a single doc): fall back to the synchronous path
-   *     against the original scan.
-   *
-   * force_profile=1 / forceProfile=true tells the analyze pipeline to
-   * ignore any pre-pinned primary_profile_id and let Claude re-rank
-   * profiles from scratch — what "Re-analyse" should always do.
+   * force_profile tells the pipeline to ignore any pre-pinned
+   * primary_profile_id and let Claude re-rank profiles from scratch.
    */
   async function reanalyse() {
     setReanalysing(true);
@@ -200,8 +194,7 @@ export function RefileWidget({
     setDoneMessage(null);
     try {
       if (isMultiDoc) {
-        // Multi-doc parent → job pipeline, downloads the original full
-        // scan and re-splits all receipts.
+        // Multi-doc parent → per-receipt background job.
         const res = await fetch(`/api/analyze-job/start`, {
           method: "POST",
           headers: { "content-type": "application/json" },
@@ -221,14 +214,9 @@ export function RefileWidget({
           fallback?: string;
         };
         if (json.jobId) {
-          // Render the live progress panel.
-          setAnalyzeJobId(json.jobId);
+          setAnalyzeJobId(json.jobId); // renders the live progress panel
         } else if (json.fallback === "single_doc_synchronous") {
-          // Detection now finds only 1 doc — fall back to the inline
-          // analyze route against the original scan.
-          setDoneMessage(
-            "Only one document detected — running a normal re-analyse instead…"
-          );
+          // Detection now finds only 1 doc — fall back to inline analyse.
           const ires = await fetch(
             `/api/analyze/${documentId}?from_original=1&force_profile=1`,
             { method: "POST" }

@@ -50,13 +50,16 @@ export async function GET(request: NextRequest) {
     .order("created_at", { ascending: false })
     .limit(limit);
 
-  if (q) query = query.textSearch("fts", q, { type: "websearch", config: "simple" });
+  const hasSearch = !!(q && q.trim());
+  if (hasSearch) query = query.textSearch("fts", q!, { type: "websearch", config: "simple" });
   if (type) query = query.eq("document_type", type);
   if (batch) query = query.eq("batch", batch);
-  // Profile filter is intentionally suppressed in triage mode — same logic
-  // as the server-rendered inbox page (otherwise an unassigned doc gets
-  // hidden behind an active profile filter when paginating).
-  if (profileId && !triage) query = query.eq("primary_profile_id", Number(profileId));
+  // Profile filter is intentionally suppressed in triage mode AND while
+  // searching — same logic as the server-rendered inbox page. Otherwise an
+  // unassigned doc (triage) or a doc filed under another profile (search)
+  // gets hidden behind the active profile filter when paginating, so the
+  // load-more results wouldn't match page 1.
+  if (profileId && !triage && !hasSearch) query = query.eq("primary_profile_id", Number(profileId));
   if (triage) {
     query = query.or("primary_profile_id.is.null,needs_review.eq.true");
   }

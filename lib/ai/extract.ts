@@ -522,65 +522,137 @@ export async function extractDocument(
       );
     }
 
-    // Empty-line_items fallback. Pattern we hit in production: Sonnet
-    // returns basic fields (sender, amount, date) but `line_items: []`
-    // even though items are clearly printed. The diag proved Sonnet CAN
-    // read those items — the full extraction prompt's "you may omit
-    // line_items if there's no itemised breakdown" escape hatch + the
-    // heavy per-line schema makes it skip them on marginal-quality crops.
+    // ---- Line-items improvement (image receipts only) ----
+    // Two focused stages, both gated to receipt-shaped image docs and
+    // skipped on retry / when disabled / on doc types that don't have
+    // line items (contracts, IDs, ...):
     //
-    // Fallback strategy: when line_items is empty, fire a SECOND call
-    // with a focused stripped prompt (just name/qty/price) and merge
-    // that array back into the original extraction's extracted_fields.
-    // Doesn't re-do anything else — sender/amount/date from the first
-    // call are kept. ~7-10s wall clock on failures; cheap.
+    //   STAGE 1 — FILL. Pattern we hit in production: Sonnet returns the
+    //     basic fields (sender, amount, date) but `line_items: []` even
+    //     though items are clearly printed (the full prompt's "you may
+    //     omit line_items" escape hatch + heavy per-line schema makes it
+    //     skip them on marginal crops). When empty, a focused stripped
+    //     prompt (name/qty/price only) reliably reads what's there.
     //
-    // Scope of fallback:
-    //   - input must be an image (PDF/CSV have their own structure)
-    //   - parsed result must be a SINGLE doc shape (multi-doc handles
-    //     line items per-crop later)
-    //   - document_type must be a receipt-like type where line items
-    //     are expected
-    //   - line_items must be missing or empty
-    //   - guard against infinite recursion via opts.__isRetry flag
+    //   STAGE 2 — RECONCILE. line_items are present but don't sum to the
+    //     receipt total → some line was missed or misread. Fire a focused
+    //     pass that is TOLD the gap (e.g. "you have €14.27 of €17.79,
+    //     ~€3.52 is missing") and asked ONLY for the missing lines. Append
+    //     them only if they bring the sum CLOSER to the total — that guard
+    //     rejects a retry that just duplicated an existing line (which
+    //     would overshoot and increase the error). Never makes it worse.
+    //
+    // Both stages keep sender/amount/date from the first call untouched.
+    // Recursion is impossible (the helpers are standalone calls, not
+    // extractDocument), but we still respect opts.__isRetry as a kill switch.
+    let liInTokens = 0;
+    let liOutTokens = 0;
     if (
       !isMultiDocShape &&
       mimeType.startsWith("image/") &&
       !opts.__isRetry &&
       !opts.disableLineItemRetry &&
-      shouldRetryForLineItems(parsed)
+      lineItemsExpected(parsed)
     ) {
-      console.log(
-        "[ai/extract] empty line_items — firing focused line-items fallback"
-      );
-      const fallback = await extractLineItemsFocused(
-        fileBuffer,
-        mimeType,
-        opts.taxonomyHint
-      );
-      if (fallback.line_items.length > 0) {
-        const orig = parsed as Record<string, unknown>;
-        const origEf = (orig["extracted_fields"] as Record<string, unknown>) || {};
-        orig["extracted_fields"] = {
-          ...origEf,
-          line_items: fallback.line_items,
-        };
-        return {
-          data: orig as unknown as ExtractionData,
-          usage: {
-            input_tokens: usage.input_tokens + fallback.usage.input_tokens,
-            output_tokens:
-              usage.output_tokens + fallback.usage.output_tokens,
-          },
-          stop_reason: response.stop_reason || null,
-          max_tokens_cap: maxTokens,
-        };
+      const orig = parsed as Record<string, unknown>;
+      const ef = (orig["extracted_fields"] as Record<string, unknown>) || {};
+      let items: Array<Record<string, unknown>> = Array.isArray(ef["line_items"])
+        ? (ef["line_items"] as Array<Record<string, unknown>>)
+        : [];
+
+      const lineTotal = (it: Record<string, unknown>): number | null => {
+        const t = it["total"];
+        if (typeof t === "number" && Number.isFinite(t)) return t;
+        // Focused/missing items carry `price` as the line amount.
+        const p = it["price"];
+        return typeof p === "number" && Number.isFinite(p) ? p : null;
+      };
+      const sumOf = (arr: Array<Record<string, unknown>>): number =>
+        arr.reduce((s, it) => s + (lineTotal(it) ?? 0), 0);
+      // Basic {name,price,quantity} → display schema the UI reads.
+      const toRow = (x: {
+        name: string;
+        price: number | null;
+        quantity: number;
+      }): Record<string, unknown> => ({
+        description: x.name,
+        total: x.price,
+        quantity: x.quantity,
+        category: null,
+      });
+
+      // STAGE 1 — fill empties.
+      if (items.length === 0) {
+        console.log(
+          "[ai/extract] empty line_items — firing focused line-items fallback"
+        );
+        const filled = await extractLineItemsFocused(
+          fileBuffer,
+          mimeType,
+          opts.taxonomyHint
+        );
+        liInTokens += filled.usage.input_tokens;
+        liOutTokens += filled.usage.output_tokens;
+        if (filled.line_items.length > 0) items = filled.line_items.map(toRow);
+      }
+
+      // STAGE 2 — reconcile against the receipt total.
+      const receiptTotal =
+        typeof orig["amount"] === "number" && Number.isFinite(orig["amount"])
+          ? (orig["amount"] as number)
+          : null;
+      const numWithTotal = items.filter((it) => lineTotal(it) != null).length;
+      if (items.length > 0 && receiptTotal != null && numWithTotal > 0) {
+        const sum = sumOf(items);
+        const tol = Math.max(0.02, Math.abs(receiptTotal) * 0.005);
+        if (Math.abs(sum - receiptTotal) > tol) {
+          console.log(
+            `[ai/extract] line-items short by ${(receiptTotal - sum).toFixed(2)} ` +
+              `(have ${sum.toFixed(2)} of ${receiptTotal.toFixed(2)}) — firing reconcile retry`
+          );
+          const missing = await extractMissingLineItems(fileBuffer, mimeType, {
+            existing: items.map((it) => ({
+              name: String(it["description"] ?? it["name"] ?? "").trim(),
+              total: lineTotal(it),
+            })),
+            foundSum: sum,
+            receiptTotal,
+            currency:
+              typeof orig["currency"] === "string"
+                ? (orig["currency"] as string)
+                : null,
+          });
+          liInTokens += missing.usage.input_tokens;
+          liOutTokens += missing.usage.output_tokens;
+          if (missing.line_items.length > 0) {
+            const merged = items.concat(missing.line_items.map(toRow));
+            const newSum = sumOf(merged);
+            if (Math.abs(newSum - receiptTotal) < Math.abs(sum - receiptTotal)) {
+              items = merged;
+              console.log(
+                `[ai/extract] reconcile retry added ${missing.line_items.length} line(s); ` +
+                  `sum ${sum.toFixed(2)} -> ${newSum.toFixed(2)} (total ${receiptTotal.toFixed(2)})`
+              );
+            } else {
+              console.log(
+                `[ai/extract] reconcile retry rejected — ${newSum.toFixed(2)} not closer to ${receiptTotal.toFixed(2)}`
+              );
+            }
+          }
+        }
+      }
+
+      if (items.length > 0) {
+        orig["extracted_fields"] = { ...ef, line_items: items };
       }
     }
 
     return {
       data: parsed as unknown as ExtractionData,
-      usage,
+      usage: {
+        input_tokens: usage.input_tokens + liInTokens,
+        output_tokens: usage.output_tokens + liOutTokens,
+      },
       stop_reason: response.stop_reason || null,
       max_tokens_cap: maxTokens,
     };
@@ -748,19 +820,153 @@ Return ONLY the JSON object. No markdown, no extra fields, no surrounding prose.
   }
 }
 
-function shouldRetryForLineItems(parsed: Record<string, unknown>): boolean {
+/**
+ * Reconciliation-guided line-items retry. Fired when line_items ARE
+ * present but don't sum to the receipt total. Unlike the empty-fill
+ * fallback, this call is TOLD the gap and the names it already has, then
+ * asked ONLY for the lines that are still missing — turning a blind
+ * "list everything" into a targeted search for a known shortfall, which
+ * vision models handle far better. Returns basic {name,price,quantity}
+ * rows for the caller to append (and accept only if they close the gap).
+ */
+async function extractMissingLineItems(
+  fileBuffer: Buffer,
+  mimeType: SupportedMediaType,
+  ctx: {
+    existing: Array<{ name: string; total: number | null }>;
+    foundSum: number;
+    receiptTotal: number;
+    currency: string | null;
+  }
+): Promise<{
+  line_items: Array<{ name: string; price: number | null; quantity: number }>;
+  usage: { input_tokens: number; output_tokens: number };
+}> {
+  const cur = ctx.currency ? `${ctx.currency} ` : "";
+  const gap = ctx.receiptTotal - ctx.foundSum;
+  const haveList =
+    ctx.existing
+      .map(
+        (e) =>
+          `- ${e.name || "(unnamed)"}${
+            e.total != null ? ` = ${cur}${e.total.toFixed(2)}` : ""
+          }`
+      )
+      .join("\n") || "(none)";
+
+  const prompt = `This receipt's printed TOTAL is ${cur}${ctx.receiptTotal.toFixed(
+    2
+  )}.
+
+So far these line items have been read (summing to ${cur}${ctx.foundSum.toFixed(
+    2
+  )}):
+${haveList}
+
+That leaves about ${cur}${gap.toFixed(
+    2
+  )} unaccounted for — meaning ONE OR MORE printed lines were missed (or a price was misread). Look very carefully at the receipt, especially faint or tightly-spaced lines, and find the lines that are NOT already in the list above.
+
+Return STRICT JSON with ONLY the MISSING line items (do NOT repeat any line already listed above):
+{
+  "line_items": [
+    { "name": "<item name as printed>", "price": <line amount as a number, or null>, "quantity": <number, default 1> }
+  ]
+}
+
+Rules:
+- Only include lines that are genuinely missing from the list above.
+- "price" is the line's printed amount (negative for a discount line).
+- If, after looking carefully, you cannot find any additional lines, return {"line_items": []}.
+- Return ONLY the JSON object. No markdown, no prose.`;
+
+  const contentBlocks: Anthropic.ContentBlockParam[] = [
+    { type: "text", text: prompt },
+  ];
+  if (mimeType === "application/pdf") {
+    contentBlocks.push({
+      type: "document",
+      source: {
+        type: "base64",
+        media_type: "application/pdf",
+        data: fileBuffer.toString("base64"),
+      },
+    } as unknown as Anthropic.ContentBlockParam);
+  } else {
+    contentBlocks.push({
+      type: "image",
+      source: {
+        type: "base64",
+        media_type: mimeType as "image/jpeg" | "image/png" | "image/gif" | "image/webp",
+        data: fileBuffer.toString("base64"),
+      },
+    });
+  }
+  try {
+    const stream = client.messages.stream({
+      model: AI_MODEL_SMART,
+      max_tokens: 8000,
+      temperature: 0,
+      messages: [{ role: "user", content: contentBlocks }],
+    });
+    const resp = await stream.finalMessage();
+    const text =
+      resp.content
+        .filter((b) => b.type === "text")
+        .map((b) => (b as { type: "text"; text: string }).text)
+        .join("") || "";
+    const parsed = safeParseJSON(text);
+    const usage = {
+      input_tokens: resp.usage?.input_tokens || 0,
+      output_tokens: resp.usage?.output_tokens || 0,
+    };
+    if (!parsed) {
+      console.warn("[ai/extract] reconcile retry parse failed");
+      return { line_items: [], usage };
+    }
+    const raw = Array.isArray(parsed["line_items"])
+      ? (parsed["line_items"] as unknown[])
+      : [];
+    const cleaned = raw
+      .map((it) => {
+        if (!it || typeof it !== "object") return null;
+        const o = it as Record<string, unknown>;
+        const name = typeof o.name === "string" ? o.name.trim() : "";
+        if (!name) return null;
+        const priceRaw = o.price;
+        const price =
+          typeof priceRaw === "number" && Number.isFinite(priceRaw)
+            ? priceRaw
+            : null;
+        const qtyRaw = o.quantity;
+        const quantity =
+          typeof qtyRaw === "number" && Number.isFinite(qtyRaw) && qtyRaw > 0
+            ? qtyRaw
+            : 1;
+        return { name, price, quantity };
+      })
+      .filter(
+        (x): x is { name: string; price: number | null; quantity: number } =>
+          x !== null
+      );
+    console.log(
+      `[ai/extract] reconcile retry returned ${cleaned.length} candidate line(s) (in=${usage.input_tokens} out=${usage.output_tokens})`
+    );
+    return { line_items: cleaned, usage };
+  } catch (e) {
+    console.warn(
+      "[ai/extract] reconcile retry threw:",
+      e instanceof Error ? e.message : String(e)
+    );
+    return { line_items: [], usage: { input_tokens: 0, output_tokens: 0 } };
+  }
+}
+
+/** True when the doc type is one where line items are expected (so the
+ * fill/reconcile passes should run). Inverse of the SKIP denylist — a
+ * denylist (not an allowlist) so that marginal receipts mis-classified as
+ * "other" still get the line-items passes. */
+function lineItemsExpected(parsed: Record<string, unknown>): boolean {
   const docType = String(parsed["document_type"] || "").toLowerCase();
-  // Skip if the doc type is one where empty line_items is correct
-  // (letter, id, contract, etc.). Everything else — including "other"
-  // and null/unknown — gets the fallback if line_items is empty. This
-  // covers the case where Sonnet mis-classified a marginal receipt
-  // crop as "other" and would otherwise never get the fallback.
-  if (docType && SKIP_RETRY_DOC_TYPES.has(docType)) return false;
-  // line_items lives inside extracted_fields per the prompt schema.
-  const ef = parsed["extracted_fields"] as
-    | Record<string, unknown>
-    | undefined;
-  const li = ef?.["line_items"];
-  if (!Array.isArray(li)) return true; // null / missing → retry
-  return li.length === 0;
+  return !(docType && SKIP_RETRY_DOC_TYPES.has(docType));
 }

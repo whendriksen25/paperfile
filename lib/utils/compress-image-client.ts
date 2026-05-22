@@ -80,8 +80,13 @@ export async function compressImageInBrowser(
   file: File,
   opts: { maxDimension?: number; quality?: number } = {}
 ): Promise<File> {
-  const maxDimension = opts.maxDimension ?? 2000;
-  const quality = opts.quality ?? 0.85;
+  // We crop each receipt out of the scan and read it on its own, and a
+  // single-receipt crop sits UNDER Claude's ~1.15MP per-image ceiling — so
+  // uploaded resolution now genuinely helps line items (more real pixels
+  // per receipt). 3000px keeps a multi-receipt scan well under Vercel's
+  // 4.5MB body limit at q0.92 while giving each crop ~900-1200px of detail.
+  const maxDimension = opts.maxDimension ?? 3000;
+  const quality = opts.quality ?? 0.92;
 
   // 1. Get an Image we can draw — try native decode first, HEIC fallback if that fails
   let img: HTMLImageElement;

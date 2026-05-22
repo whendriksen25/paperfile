@@ -101,16 +101,53 @@ function rollup(items: LineItem[]): { category: string; total: number; count: nu
     .sort((a, b) => Math.abs(b.total) - Math.abs(a.total));
 }
 
+/**
+ * Reconcile the line items against the receipt's printed total.
+ *
+ * Sums the per-line `total` column (the same numbers shown in the table —
+ * negative discount lines included) and compares it to the receipt total.
+ * A small tolerance absorbs cent-level rounding. Returns null when there's
+ * nothing meaningful to check (no receipt total, or no line carries a
+ * numeric total — e.g. a focused fallback that read names but not prices).
+ */
+function reconcileTotals(
+  items: LineItem[],
+  receiptTotal: number | null | undefined
+): { sum: number; expected: number; diff: number; ok: boolean } | null {
+  if (typeof receiptTotal !== "number" || !Number.isFinite(receiptTotal)) {
+    return null;
+  }
+  const withTotal = items.filter(
+    (it) => typeof it.total === "number" && Number.isFinite(it.total)
+  );
+  if (withTotal.length === 0) return null;
+  const sum = withTotal.reduce((s, it) => s + (it.total as number), 0);
+  const diff = sum - receiptTotal;
+  // Allow the larger of 2 cents or 0.5% of the total for rounding noise.
+  const tolerance = Math.max(0.02, Math.abs(receiptTotal) * 0.005);
+  return {
+    sum,
+    expected: receiptTotal,
+    diff,
+    ok: Math.abs(diff) <= tolerance,
+  };
+}
+
 export function LineItemsSection({
   items,
   currency,
+  receiptTotal,
 }: {
   items: LineItem[];
   currency?: string | null;
+  /** The receipt's printed grand total, used to verify the line items add
+   *  up. Omit (or null) to skip the reconciliation row. */
+  receiptTotal?: number | null;
 }) {
   if (!items || items.length === 0) return null;
 
   const buckets = rollup(items);
+  const reconcile = reconcileTotals(items, receiptTotal);
 
   return (
     <div className="surface p-5 mb-5">
@@ -221,6 +258,40 @@ export function LineItemsSection({
           </tbody>
         </table>
       </div>
+
+      {/* Reconciliation: do the line items add up to the receipt total? */}
+      {reconcile && (
+        <div
+          className={`mt-4 rounded-lg px-3 py-2.5 text-xs flex items-start gap-2 ${
+            reconcile.ok
+              ? "bg-brand-green/10 text-brand-green"
+              : "bg-amber-50 text-amber-800"
+          }`}
+        >
+          <span className="font-bold mt-px">{reconcile.ok ? "✓" : "⚠"}</span>
+          {reconcile.ok ? (
+            <span>
+              Line items reconcile with the receipt total
+              {" ("}
+              {formatMoney(reconcile.sum, currency || null)}
+              {")."}
+            </span>
+          ) : (
+            <span>
+              Line items add up to{" "}
+              <span className="font-bold">
+                {formatMoney(reconcile.sum, currency || null)}
+              </span>
+              , but the receipt total is{" "}
+              <span className="font-bold">
+                {formatMoney(reconcile.expected, currency || null)}
+              </span>{" "}
+              (off by {formatMoney(Math.abs(reconcile.diff), currency || null)}).
+              A line may be missing or misread.
+            </span>
+          )}
+        </div>
+      )}
     </div>
   );
 }

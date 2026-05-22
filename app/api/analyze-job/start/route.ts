@@ -80,6 +80,20 @@ export async function POST(request: NextRequest) {
       });
     }
 
+    // Kick the first step so the job self-drives. Each step self-chains the
+    // next (see the analyze-step route), so the job runs to completion even
+    // with NO UI polling — essential for fresh uploads handed off here. For
+    // re-analyse the progress panel also polls, which just races harmlessly.
+    try {
+      const origin = request.nextUrl.origin;
+      void fetch(`${origin}/api/analyze-step/${result.jobId}`, {
+        method: "POST",
+        headers: { cookie: request.headers.get("cookie") || "" },
+      }).catch(() => {});
+    } catch {
+      /* best-effort */
+    }
+
     return NextResponse.json({
       jobId: result.jobId,
       totalCrops: result.totalCrops,
