@@ -114,6 +114,172 @@ function findCol(headers: string[], needle: string): string | undefined {
   return headers.find((h) => h.toLowerCase().includes(lower));
 }
 
+/**
+ * Detect whether the buffer looks like a Rabobank CREDIT CARD CSV export
+ * (separate format from the checking-account one above — different columns).
+ *
+ * Header signature, no quotes, comma-separated:
+ *   Tegenpartij IBAN,Valuta,Creditcardnummer,Productnaam,Kaartregel1,
+ *   Kaartregel2,Transactiereferentie,Datum,Bedrag,Omschrijving,
+ *   Instructiebedrag,Instructievaluta,Wisselkoers
+ *
+ * Matching on "Creditcardnummer" alone is enough — it's unique to this
+ * export — plus the usual Datum/Bedrag/Omschrijving trio that proves it's
+ * the transaction shape and not just metadata.
+ */
+export function looksLikeRabobankCreditCardCsv(buffer: Buffer): boolean {
+  const head = buffer.toString("utf8", 0, Math.min(2048, buffer.length));
+  if (!head.includes(",")) return false;
+  return (
+    /Creditcardnummer/i.test(head) &&
+    /Transactiereferentie/i.test(head) &&
+    /\bDatum\b/i.test(head) &&
+    /\bBedrag\b/i.test(head) &&
+    /Omschrijving/i.test(head)
+  );
+}
+
+/**
+ * Deterministic parser for the Rabobank credit-card CSV export.
+ *
+ * Notes vs the checking-account parser:
+ *   - There is no "account IBAN" in the bank-statement sense; the card
+ *     itself is the account. We expose `card_last4` (the Creditcardnummer
+ *     column) and `card_product` (Productnaam, e.g. "Rabo GoldCard Visa")
+ *     via the parsed statement's `account_iban` slot is left null and the
+ *     card data is returned alongside so the caller can put it into
+ *     extracted_fields.
+ *   - Each transaction has one Datum, no separate value date — we mirror
+ *     it into both booking_date and value_date so downstream code that
+ *     prefers value_date still gets something.
+ *   - The merchant lives in Omschrijving; we use it as the description AND
+ *     as a synthetic counterparty_name so the reconciliation panel has
+ *     something to display.
+ */
+export interface ParsedCreditCardStatement extends ParsedStatement {
+  card_last4: string | null;
+  card_product: string | null;
+}
+
+export function parseRabobankCreditCardCsv(
+  text: string
+): ParsedCreditCardStatement {
+  const firstLine = text.split(/\r?\n/, 1)[0] || "";
+  const commaCount = (firstLine.match(/,/g) || []).length;
+  const semiCount = (firstLine.match(/;/g) || []).length;
+  const delimiter = semiCount > commaCount ? ";" : ",";
+
+  const rows = csvParse(text, {
+    columns: true,
+    delimiter,
+    skip_empty_lines: true,
+    trim: true,
+    bom: true,
+    relax_column_count: true,
+    relax_quotes: true,
+  }) as Record<string, string>[];
+
+  if (rows.length === 0) {
+    return {
+      account_iban: null,
+      account_holder: null,
+      period_start: null,
+      period_end: null,
+      opening_balance: null,
+      closing_balance: null,
+      currency: "EUR",
+      transactions: [],
+      card_last4: null,
+      card_product: null,
+    };
+  }
+
+  const headers = Object.keys(rows[0]);
+  const colSettleIban = findCol(headers, "Tegenpartij IBAN");
+  const colCurrency = findCol(headers, "Valuta");
+  const colCardNum = findCol(headers, "Creditcardnummer");
+  const colProduct = findCol(headers, "Productnaam");
+  const colCardHolder = findCol(headers, "Kaartregel1");
+  const colTransRef = findCol(headers, "Transactiereferentie");
+  const colDate = findCol(headers, "Datum");
+  const colAmount = findCol(headers, "Bedrag");
+  const colDesc = findCol(headers, "Omschrijving");
+  // Foreign-currency original amount, currency, exchange rate — captured
+  // into the description if present so the user still sees "USD 2.99".
+  const colOrigAmt = findCol(headers, "Instructiebedrag");
+  const colOrigCur = findCol(headers, "Instructievaluta");
+
+  // Card-level metadata (same across all rows of one export).
+  const cardLast4 = colCardNum ? (rows[0][colCardNum] || "").trim() || null : null;
+  const cardProduct = colProduct ? (rows[0][colProduct] || "").trim() || null : null;
+  const cardHolder = colCardHolder ? (rows[0][colCardHolder] || "").trim() || null : null;
+  const settleIban = colSettleIban
+    ? (rows[0][colSettleIban] || "").replace(/\s+/g, "").toUpperCase() || null
+    : null;
+  const currency = (colCurrency ? rows[0][colCurrency] : null) || "EUR";
+
+  // Pull the merchant city/country off the end of an Omschrijving like
+  // "EV CHARGE SESSION  ROTTERDAM  NLD  Token: 4xxxx5670". Trim out the
+  // token marker — that's the masked card number, not the merchant name.
+  function cleanMerchant(raw: string | null | undefined): string | null {
+    if (!raw) return null;
+    const tokenless = raw.replace(/\bToken:\s*\S+/i, "").trim();
+    return tokenless.replace(/\s{2,}/g, " ") || null;
+  }
+
+  const transactions: ParsedTransaction[] = [];
+  let minDate: string | null = null;
+  let maxDate: string | null = null;
+
+  for (const row of rows) {
+    const amt = colAmount ? parseAmount(row[colAmount]) : NaN;
+    if (!Number.isFinite(amt)) continue;
+    const date = colDate ? parseDate(row[colDate]) : null;
+    const desc = colDesc ? (row[colDesc] || "").trim() : "";
+    const origAmt = colOrigAmt ? (row[colOrigAmt] || "").trim() : "";
+    const origCur = colOrigCur ? (row[colOrigCur] || "").trim() : "";
+    const transRef = colTransRef ? (row[colTransRef] || "").trim() : "";
+    const merchant = cleanMerchant(desc);
+    const fx = origAmt && origCur && origCur !== currency
+      ? ` (${origCur} ${origAmt})`
+      : "";
+    const description = desc ? `${desc}${fx}` : null;
+
+    transactions.push({
+      amount: amt,
+      currency,
+      booking_date: date,
+      value_date: date,
+      counterparty_name: merchant,
+      counterparty_iban: null,
+      reference: transRef || merchant,
+      transaction_id: transRef || null,
+      description,
+    });
+
+    if (date) {
+      if (!minDate || date < minDate) minDate = date;
+      if (!maxDate || date > maxDate) maxDate = date;
+    }
+  }
+
+  return {
+    // No statement IBAN — credit cards don't have one. settleIban (the
+    // bank account that pays the card) goes into the doc's extracted
+    // fields as account_iban so reconciliation can still match by it.
+    account_iban: settleIban,
+    account_holder: cardHolder,
+    period_start: minDate,
+    period_end: maxDate,
+    opening_balance: null,
+    closing_balance: null,
+    currency,
+    transactions,
+    card_last4: cardLast4,
+    card_product: cardProduct,
+  };
+}
+
 export function parseRabobankCsv(text: string): ParsedStatement {
   // Auto-detect separator: Rabobank uses comma, but some exports semicolon.
   const firstLine = text.split(/\r?\n/, 1)[0] || "";

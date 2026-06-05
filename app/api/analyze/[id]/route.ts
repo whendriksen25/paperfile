@@ -21,6 +21,8 @@ import { looksLikeCamt053, parseCamt053 } from "@/lib/utils/camt-parser";
 import {
   looksLikeRabobankCsv,
   parseRabobankCsv,
+  looksLikeRabobankCreditCardCsv,
+  parseRabobankCreditCardCsv,
 } from "@/lib/utils/rabobank-csv-parser";
 import { reconcileBankStatement } from "@/lib/services/bank-reconciliation";
 import { replaceStatementTransactions } from "@/lib/services/bank-transactions";
@@ -284,6 +286,85 @@ export async function POST(
       } catch (e) {
         console.warn(
           "[api/analyze] Rabobank CSV parse failed, falling back to Claude:",
+          e
+        );
+        const ex = await extractDocument(buffer, doc.file_name || "file.csv", { taxonomyHint });
+        result = ex.data;
+        aiUsage = ex.usage;
+        aiStopReason = ex.stop_reason;
+        aiMaxCap = ex.max_tokens_cap;
+      }
+    } else if (looksLikeRabobankCreditCardCsv(buffer)) {
+      // 1.7. Rabobank credit-card CSV fast path. The "RA_CC_*.csv" exports
+      // use a different column set (Tegenpartij IBAN, Creditcardnummer,
+      // Productnaam, Kaartregel1/2, Transactiereferentie, Datum, Bedrag,
+      // Omschrijving, Instructiebedrag/valuta, Wisselkoers) and would
+      // otherwise fall through to Claude and return zero line_items on a
+      // statement that clearly has dozens of merchant rows. Parse it
+      // deterministically — same shape downstream as the checking-account
+      // path so the bank_transactions writer below just works.
+      try {
+        const csvText = buffer.toString("utf8");
+        const stmt = parseRabobankCreditCardCsv(csvText);
+        const debits = stmt.transactions.filter((t) => t.amount < 0);
+        const credits = stmt.transactions.filter((t) => t.amount > 0);
+        const totalDebit = debits.reduce((s, t) => s + Math.abs(t.amount), 0);
+        const totalCredit = credits.reduce((s, t) => s + t.amount, 0);
+        const productLabel = stmt.card_product
+          ? `${stmt.card_product}${stmt.card_last4 ? ` …${stmt.card_last4}` : ""}`
+          : "Rabobank credit card";
+        const synthetic: DocumentExtraction = {
+          document_type: "bank_statement",
+          document_subtype: "credit_card",
+          confidence: 1,
+          document_date: stmt.period_end,
+          sender: "Rabobank",
+          recipient: stmt.account_holder,
+          language: "nl",
+          profile_hint: stmt.account_holder,
+          amount: null,
+          currency: stmt.currency || "EUR",
+          purchase_category: null,
+          title: `${productLabel} – Transactions ${stmt.period_start || ""} – ${stmt.period_end || ""}`.trim(),
+          summary: `${stmt.transactions.length} credit-card transactions (${debits.length} debits totalling €${totalDebit.toFixed(2)}, ${credits.length} credits totalling €${totalCredit.toFixed(2)}).`,
+          tags: ["bank_statement", "rabobank", "csv", "credit_card"],
+          extracted_fields: {
+            // settleIban (the bank account paying the card) lives here so
+            // the reconciliation matcher + the bookkeeping push can route
+            // the statement to the right account by IBAN.
+            account_iban: stmt.account_iban,
+            account_holder: stmt.account_holder,
+            card_last4: stmt.card_last4,
+            card_product: stmt.card_product,
+            period_start: stmt.period_start,
+            period_end: stmt.period_end,
+            currency: stmt.currency,
+            line_items: stmt.transactions.map((t) => ({
+              description: t.description || t.counterparty_name || "(unspecified)",
+              category: "other",
+              total: t.amount,
+              currency: t.currency,
+              reference: t.reference,
+              counterparty_name: t.counterparty_name,
+              counterparty_iban: t.counterparty_iban,
+              transaction_id: t.transaction_id,
+              booking_date: t.booking_date,
+              value_date: t.value_date,
+            })),
+          },
+          ocr_text: undefined,
+          needs_action: false,
+          action_type: null,
+          due_date: null,
+          action_summary: null,
+        };
+        result = synthetic;
+        console.log(
+          `[api/analyze] Rabobank credit-card CSV fast-path: ${stmt.transactions.length} transactions parsed (${stmt.card_product || "?"} …${stmt.card_last4 || "????"})`
+        );
+      } catch (e) {
+        console.warn(
+          "[api/analyze] Rabobank credit-card CSV parse failed, falling back to Claude:",
           e
         );
         const ex = await extractDocument(buffer, doc.file_name || "file.csv", { taxonomyHint });
