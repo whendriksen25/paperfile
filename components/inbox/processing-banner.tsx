@@ -28,6 +28,12 @@ export function ProcessingBanner({ intervalMs = 3000 }: { intervalMs?: number })
   const router = useRouter();
   const [inProgress, setInProgress] = useState<number | null>(null);
   const [retrying, setRetrying] = useState(0);
+  // Last count we acted on — used to fire router.refresh() ONLY when the
+  // number actually changes, WITHOUT doing it inside a setState updater
+  // (that ran during render and triggered "Cannot update Router while
+  // rendering ProcessingBanner", plus a refresh storm that reset inbox
+  // select-mode mid-interaction).
+  const prevCountRef = useRef<number | null>(null);
   // Tracks doc IDs we've fired analyze for, with the timestamp of the last
   // attempt. Prevents back-to-back retries — wait at least 60s before retrying
   // the same doc again so we don't pile up duplicate Claude calls.
@@ -69,10 +75,14 @@ export function ProcessingBanner({ intervalMs = 3000 }: { intervalMs?: number })
         const count = typeof json.count === "number" ? json.count : 0;
         const stuck: StuckDoc[] = Array.isArray(json.stuck) ? json.stuck : [];
 
-        setInProgress((prev) => {
-          if (prev !== count) router.refresh();
-          return count;
-        });
+        setInProgress(count);
+        // Refresh the server-rendered inbox only when the count actually
+        // changes — and OUTSIDE the state updater, so we never call
+        // router.refresh() during render.
+        if (prevCountRef.current !== count) {
+          prevCountRef.current = count;
+          router.refresh();
+        }
 
         if (stuck.length > 0) retry(stuck);
       } catch {

@@ -126,10 +126,11 @@ export function InboxBulkControls({
       <button
         type="button"
         onClick={() => setSelectMode(false)}
-        className="text-xs font-bold inline-flex items-center gap-1 px-2 py-1.5 rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted"
+        className="text-xs font-bold inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-border text-muted-foreground hover:text-foreground hover:bg-muted"
         title="Exit select mode"
       >
         <X className="h-3.5 w-3.5" />
+        Cancel
       </button>
       <span className="text-xs font-bold inline-flex items-center gap-1 px-2 py-1.5 rounded-lg bg-brand-purple/10 text-brand-purple">
         <CheckSquare className="h-3.5 w-3.5" />
