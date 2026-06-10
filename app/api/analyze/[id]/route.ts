@@ -986,11 +986,18 @@ export async function POST(
     // 7b. send_to_bookkeeping action for any invoice/receipt/bill that
     //     hasn't already been pushed. Independent of payment status —
     //     even paid invoices still need to land in the books.
+    // Bank and credit-card statements are included: bookkeeping imports
+    // their transaction lines (and dedupes them by fingerprint, so
+    // re-sending is safe).
     const isBookkeepingCandidate = [
       "invoice",
       "receipt",
       "bill",
       "utility_bill",
+      "payslip",
+      "credit_note",
+      "bank_statement",
+      "credit_card_statement",
     ].includes(extraction.document_type || "");
     const alreadySent = !!doc.sent_to_bookkeeping_at;
 
