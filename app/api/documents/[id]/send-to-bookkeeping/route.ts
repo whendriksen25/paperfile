@@ -4,7 +4,7 @@ import { getStorage } from "@/lib/storage";
 import { getUserSettings } from "@/lib/services/user-settings";
 
 export const runtime = "nodejs";
-export const maxDuration = 60;
+export const maxDuration = 300;
 
 /**
  * POST /api/documents/[id]/send-to-bookkeeping
@@ -71,15 +71,31 @@ export async function POST(
   // duplicating Paperfile's parser. Skipped for non-statement docs.
   let bank_transactions: Array<Record<string, unknown>> | undefined = undefined;
   if (doc.document_type === "bank_statement") {
-    const { data: txns } = await admin
-      .from("bank_transactions")
-      .select(
-        "id, position, amount, currency, booking_date, value_date, counterparty_name, counterparty_iban, description, reference, transaction_id, category, notes"
-      )
-      .eq("statement_id", doc.id)
-      .order("position", { ascending: true, nullsFirst: false })
-      .order("booking_date", { ascending: true, nullsFirst: false });
-    bank_transactions = (txns || []) as Array<Record<string, unknown>>;
+    // Paged fetch — Supabase caps a single select at 1000 rows, and big
+    // account statements exceed that. Without paging the push would
+    // silently truncate the statement.
+    const PAGE = 1000;
+    const all: Array<Record<string, unknown>> = [];
+    for (let from = 0; ; from += PAGE) {
+      const { data: txns, error: txErr } = await admin
+        .from("bank_transactions")
+        .select(
+          "id, position, amount, currency, booking_date, value_date, counterparty_name, counterparty_iban, description, reference, transaction_id, category, notes"
+        )
+        .eq("statement_id", doc.id)
+        .order("position", { ascending: true, nullsFirst: false })
+        .order("booking_date", { ascending: true, nullsFirst: false })
+        .range(from, from + PAGE - 1);
+      if (txErr) {
+        return NextResponse.json(
+          { error: `Could not load statement transactions: ${txErr.message}` },
+          { status: 500 }
+        );
+      }
+      all.push(...((txns || []) as Array<Record<string, unknown>>));
+      if (!txns || txns.length < PAGE) break;
+    }
+    bank_transactions = all;
   }
 
   // 3b. Generate a temporary download link so aiutofin can fetch the
@@ -138,7 +154,14 @@ export async function POST(
   //    temporary link or its own Dropbox credentials).
   const target = `${baseUrl}/api/external/paperfile-import`;
 
-  let pushed: { ok: boolean; bookkeeping_doc_id?: string | null; error?: string } = {
+  let pushed: {
+    ok: boolean;
+    bookkeeping_doc_id?: string | null;
+    imported?: number;
+    skipped_duplicates?: number;
+    classification?: { processed: number; assigned: number; remaining: number };
+    error?: string;
+  } = {
     ok: false,
   };
   try {
@@ -158,9 +181,18 @@ export async function POST(
         { status: 502 }
       );
     }
+    const j = json as {
+      id?: string;
+      imported?: number;
+      skipped_duplicates?: number;
+      classification?: { processed: number; assigned: number; remaining: number };
+    };
     pushed = {
       ok: true,
-      bookkeeping_doc_id: (json as { id?: string }).id || null,
+      bookkeeping_doc_id: j.id || null,
+      imported: j.imported,
+      skipped_duplicates: j.skipped_duplicates,
+      classification: j.classification,
     };
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : "network error";
@@ -170,6 +202,36 @@ export async function POST(
       },
       { status: 502 }
     );
+  }
+
+  // 5. Large statements: the receiver may not finish AI profile
+  //    classification within its own request. Drain the backlog with
+  //    follow-up calls so the transactions show up classified without the
+  //    user having to do anything. Non-fatal — the data is already stored.
+  if (pushed.classification && pushed.classification.remaining > 0) {
+    const classifyTarget = `${baseUrl}/api/bank-statements/classify`;
+    for (let attempt = 0; attempt < 6; attempt++) {
+      try {
+        const res = await fetch(classifyTarget, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...(token ? { "x-paperfile-token": token } : {}),
+          },
+          body: JSON.stringify({ user_email: user.email, time_budget_ms: 30_000 }),
+        });
+        if (!res.ok) break;
+        const j = (await res.json().catch(() => ({}))) as { remaining?: number };
+        pushed.classification = {
+          ...pushed.classification,
+          remaining: j.remaining ?? 0,
+        };
+        if (!j.remaining) break;
+      } catch (e) {
+        console.log("[send-to-bookkeeping] classify drain stopped:", e instanceof Error ? e.message : e);
+        break;
+      }
+    }
   }
 
   // 6. Record on the doc + close any open action
@@ -198,5 +260,8 @@ export async function POST(
     ok: true,
     bookkeeping_doc_id: pushed.bookkeeping_doc_id,
     bookkeeping_url: baseUrl,
+    imported: pushed.imported ?? null,
+    skipped_duplicates: pushed.skipped_duplicates ?? null,
+    classification: pushed.classification ?? null,
   });
 }

@@ -63,10 +63,12 @@ export default async function SettingsPage() {
       <Card>
         <div className="section-label mb-3">Bookkeeping handoff</div>
         <p className="text-xs text-muted-foreground mb-4">
-          When Paperfile recognises a doc as an invoice, receipt, or bill, an
-          action appears in your Action Center to send it to your bookkeeping
-          app. Paste the URL below and the &quot;Send&quot; button on those
-          actions will start working.
+          When Paperfile recognises a doc as an invoice, receipt, bill, or
+          bank/credit-card statement, an action appears in your Action Center
+          to send it to your bookkeeping app. Statements are forwarded as
+          structured transactions (no re-parsing on the other side). Paste the
+          URL below and the &quot;Send&quot; button on those actions will start
+          working.
         </p>
         <BookkeepingSettings />
       </Card>

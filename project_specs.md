@@ -228,21 +228,37 @@ single user, returns success.
   iOS Safari, install prompt on Android Chrome.
 - Basic service worker. Not offline-first — uploads need network.
 
-## Future bookkeeping handoff (out of v1, opt-in, in spec for clarity)
+## Bookkeeping handoff (implemented)
 
 - This is a **convenience for Wim** when he wants the archiver to forward a financial
-  doc to bookkeeping. It's not a required pipeline.
+  doc to bookkeeping. It's not a required pipeline; both apps stay independent.
 - Behaviour: after successful extraction, if `document_type IN ('invoice', 'receipt',
-  'bill', 'payslip', 'bank_statement')`, the user is shown a "Send to bookkeeping"
-  button on the document detail page. Tapping it POSTs the file + extracted JSON to
-  bookkeeping-aiuto's upload endpoint.
-- Optionally a per-profile toggle "Auto-send financial docs to bookkeeping" can be
-  enabled, in which case the push happens automatically post-extraction.
-- Bookkeeping treats it as new intake and runs its own (deeper, accounting-specific)
-  extraction.
-- The archiver records the handoff in `archive.documents.handoff_status` (`pending`,
-  `sent`, `failed`, `acked`, `not_applicable`) — schema column reserved now, code
-  added later.
+  'bill', 'payslip', 'bank_statement')`, a `send_to_bookkeeping` action appears in the
+  Action Center (and a "Re-send" button on the document page). Tapping it calls
+  `POST /api/documents/[id]/send-to-bookkeeping`.
+- What gets sent: **JSON only, never the file binary.** The payload contains all
+  extracted metadata (type, date, sender, amounts, tags, extracted_fields, OCR text),
+  the Dropbox path + a temporary download link, and the paperfile doc id. Bookkeeping
+  stores the Dropbox location and fetches the original from Dropbox when it needs to
+  display it — one canonical file, no second copy.
+- Bank statements additionally include **every parsed transaction row** (paged fetch
+  in batches of 1000 — statements over 1000 rows are sent complete, not truncated).
+  The receiver books per-transaction without re-parsing the statement.
+- The receiver (`bookkeeping-aiuto /api/external/paperfile-import`, authenticated via
+  the shared `x-paperfile-token`) dedupes by paperfile doc id and per-transaction
+  fingerprint, then classifies transactions to profiles. For large statements the
+  receiver may not finish classification in one request; this route then drains the
+  backlog with follow-up calls to `POST {bookkeeping}/api/bank-statements/classify`
+  (max 6 × 30s budget) so transactions arrive classified without user action.
+- Route timeout is `maxDuration = 300`. The push response records imported /
+  skipped-duplicate / classification counts and is surfaced to the UI.
+- On success the doc gets `sent_to_bookkeeping_at`, `bookkeeping_doc_id`,
+  `bookkeeping_url`, and any open `send_to_bookkeeping` action is closed.
+- Settings (Settings page → Bookkeeping handoff): bookkeeping base URL + shared
+  secret. Sent as `x-paperfile-token`; must equal `PAPERFILE_INBOUND_TOKEN` in the
+  bookkeeping app's environment.
+- Still future / not built: per-profile "auto-send after extraction" toggle, and the
+  `handoff_status` column bookkeeping-ack flow.
 
 ## What "done" looks like for v1
 
@@ -267,8 +283,8 @@ single user, returns success.
 
 - Multi-user collaboration, sharing, document-level permissions.
 - Editing the original PDF/image.
-- Bookkeeping handoff (column reserved, push not implemented).
-- Bank-statement transaction extraction (already covered by bookkeeping-aiuto).
+- Auto-send-to-bookkeeping toggle (manual send per doc IS implemented, see
+  "Bookkeeping handoff" above).
 - Receipts-to-tax export.
 - Calendar integration for action due-dates.
 
