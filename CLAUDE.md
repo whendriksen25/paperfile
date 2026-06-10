@@ -261,3 +261,52 @@ the browser.
 # Scope
 
 Only build what's in `project_specs.md`. Ask before scope changes.
+---
+
+# Command Logging
+
+Keep an append-only running log of everything you do in this project at
+**`./.claude-log.md`** in the project root. The file is committed to git so
+the history stays visible in VS Code (open it as a pinned tab at the start
+of every session) and is recoverable across machines.
+
+Every entry MUST:
+
+- Begin with an ISO‑8601 timestamp accurate to the second, with the local
+  timezone offset, e.g. `2026-06-05T19:41:23+02:00`. Use `date -Iseconds`
+  (Linux/macOS) or the equivalent in your shell to generate it — never
+  fabricate the time.
+- Be one short line per command, in plain English, with the actual shell
+  command (or file path being edited, or API endpoint being called) in
+  backticks. Multi-line commands collapse to a single backticked entry.
+- Append to the bottom of the file. NEVER rewrite or delete earlier
+  entries — if something was wrong, log a correction, don't edit the past.
+
+Cover EVERY action you take in this project:
+
+- Shell commands (`bash`, `npm`, `node`, `git`, `curl`, …) — including any
+  run from inside the VS Code integrated terminal.
+- File writes / edits / deletes (path + a one-clause "why").
+- Git operations (`add`, `commit`, `push`, branch ops, merges).
+- External service calls (Supabase RPC/admin ops, Vercel deploys, Stripe,
+  Anthropic API, Dropbox, etc.).
+- Database migrations or direct SQL runs.
+
+Flush the log before responding at the end of every turn so the file in
+VS Code is always up to date with what just happened.
+
+If `.claude-log.md` doesn't exist yet, create it with this two-line header
+and start logging from there:
+
+```
+# Claude session log
+
+```
+
+Format example:
+
+```
+2026-06-05T19:41:23+02:00 — `npm install csv-parse` — added Rabobank credit-card CSV parser dependency
+2026-06-05T19:41:55+02:00 — edited `lib/utils/rabobank-csv-parser.ts` — new looksLikeRabobankCreditCardCsv detector + parseRabobankCreditCardCsv function
+2026-06-05T19:42:08+02:00 — `git commit -m "Rabobank credit-card CSV fast-path"`
+```
