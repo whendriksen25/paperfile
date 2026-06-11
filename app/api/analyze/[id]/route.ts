@@ -158,9 +158,19 @@ export async function POST(
     let aiUsage = { input_tokens: 0, output_tokens: 0 };
     let aiStopReason: string | null = "end_turn";
     let aiMaxCap = 0;
+    // Bank exports are often Windows-1252 rather than UTF-8. Decoding them
+    // as UTF-8 corrupts accented characters ("Zürich" → "Z�rich") in every
+    // stored transaction. Try strict UTF-8 first, fall back to 1252.
+    const decodeBankText = (buf: Buffer): string => {
+      try {
+        return new TextDecoder("utf-8", { fatal: true }).decode(buf);
+      } catch {
+        return new TextDecoder("windows-1252").decode(buf);
+      }
+    };
     if (looksLikeCamt053(buffer)) {
       try {
-        const xmlText = buffer.toString("utf8");
+        const xmlText = decodeBankText(buffer);
         const stmt = parseCamt053(xmlText);
         const debits = stmt.transactions.filter((t) => t.amount < 0);
         const credits = stmt.transactions.filter((t) => t.amount > 0);
@@ -234,7 +244,7 @@ export async function POST(
       // (IBAN/BBAN + Bedrag + Datum + at least one of the Rabobank
       // Dutch-only columns).
       try {
-        const csvText = buffer.toString("utf8");
+        const csvText = decodeBankText(buffer);
         const stmt = parseRabobankCsv(csvText);
         const debits = stmt.transactions.filter((t) => t.amount < 0);
         const credits = stmt.transactions.filter((t) => t.amount > 0);
@@ -304,7 +314,7 @@ export async function POST(
       // deterministically — same shape downstream as the checking-account
       // path so the bank_transactions writer below just works.
       try {
-        const csvText = buffer.toString("utf8");
+        const csvText = decodeBankText(buffer);
         const stmt = parseRabobankCreditCardCsv(csvText);
         const debits = stmt.transactions.filter((t) => t.amount < 0);
         const credits = stmt.transactions.filter((t) => t.amount > 0);
