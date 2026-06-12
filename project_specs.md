@@ -279,6 +279,55 @@ single user, returns success.
 - [ ] iOS Shortcut uploads via Share Sheet.
 - [ ] All of the above works on the deployed Vercel URL, not just localhost.
 
+## Paperfile Assistant (global AI chat) — implemented
+
+Code: `lib/ai/assistant-tools.ts` (tool schemas + read executors + proposal
+previews), `app/api/assistant/route.ts` (Claude tool-use loop),
+`app/api/assistant/execute/route.ts` (confirmed proposals; mutations reuse
+the existing API routes via internal fetch with forwarded cookies, so
+re-filing, action updates, bookkeeping pushes and re-analysis behave exactly
+like their UI buttons), `components/assistant/assistant-chat.tsx` (floating
+chat panel, mounted in the app layout).
+
+A floating chat button (bottom-right, every page — same pattern as Aiuto's
+Booking Assistant) opening a panel where Wim can ask anything about his
+archive. Claude tool-use agent, three layers, mirroring the proven Aiuto
+assistant architecture:
+
+**1. Find & explain (read-only, no confirmation).** The primary use case.
+Tools:
+- `search_documents` — full-text search over title, summary, sender, tags
+  and OCR text; filters for profile, document type, date range. Returns top
+  matches with links.
+- `get_document` — full details of one document (extracted fields, actions,
+  filing location, bookkeeping status).
+- `list_actions` — open/done actions, filterable by profile and document.
+Typical questions: "where is my insurance policy from 2024?", "which CJIB
+fines are still open?", "what did I file under Pa last month?"
+
+**2. Act on instruction (confirm-first).** The agent can do what the user
+asks, but every mutation is returned as a PROPOSAL the user must confirm in
+the chat before the server executes it (POST `/api/assistant/execute`):
+- `refile_document` — change profile / document type, triggers re-filing.
+- `create_action` / `complete_action` / `dismiss_action` — manage the
+  Action Center.
+- `send_to_bookkeeping` — trigger the Aiutofin push for a document.
+- `reanalyze_document` — re-run AI extraction.
+
+**3. Navigate.** A `navigate` directive the panel uses to route the user to
+the right page (document page, filtered inbox, actions search) so the items
+under discussion are on screen.
+
+Implementation notes: endpoint `POST /api/assistant` (Claude Sonnet,
+tool-use loop, short client-held history), tool executors in
+`lib/ai/assistant-tools.ts`, all queries scoped to the session user.
+Search backed by Postgres `ilike`/full-text over documents incl. `ocr_text`.
+
+Done when: `npm run build` passes; "where is my insurance policy from
+2024?" answers with correct linked documents; a refile and an action
+completion both work end-to-end via chat confirmation; a document can be
+pushed to bookkeeping from the chat.
+
 ## Out of scope for v1
 
 - Multi-user collaboration, sharing, document-level permissions.

@@ -1,6 +1,7 @@
 import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import { AppShell } from "@/components/layout/app-shell";
+import { AssistantChat } from "@/components/assistant/assistant-chat";
 
 export default async function AppLayout({
   children,
@@ -16,5 +17,10 @@ export default async function AppLayout({
     redirect("/login");
   }
 
-  return <AppShell>{children}</AppShell>;
+  return (
+    <AppShell>
+      {children}
+      <AssistantChat />
+    </AppShell>
+  );
 }
