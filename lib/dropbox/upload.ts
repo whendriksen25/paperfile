@@ -47,6 +47,59 @@ export async function uploadToDropboxInbox(params: {
 }
 
 /**
+ * Returns a one-time, credential-free upload URL the browser can send the raw
+ * file bytes to (POST, application/octet-stream), landing the file directly in
+ * the inbox staging folder WITHOUT the bytes passing through our app server.
+ *
+ * This is what lets large / multipage documents bypass Vercel's ~4.5 MB
+ * request-body limit: the phone talks straight to Dropbox. The Dropbox token
+ * stays server-side — the client only ever sees this short-lived link.
+ *
+ * Temporary upload links accept a single file up to 150 MB and expire after a
+ * few hours. Returns the link plus the canonical inbox path the bytes land at.
+ */
+export async function getTemporaryUploadLink(params: {
+  filename: string;
+}): Promise<{ uploadUrl: string; path: string }> {
+  const dbx = createDropbox();
+  const root = dropboxRootFolder();
+  const filename = safeSegment(params.filename);
+  const stamp = Date.now();
+  const path = `${root}/_inbox/${stamp}_${filename}`;
+
+  const res = await dbx.filesGetTemporaryUploadLink({
+    commit_info: {
+      path,
+      mode: { ".tag": "add" },
+      autorename: true,
+      mute: true,
+    },
+  });
+
+  console.log("[dropbox/upload] issued temporary upload link for:", path);
+  return { uploadUrl: res.result.link, path };
+}
+
+/**
+ * Authoritative file size (bytes) for a Dropbox path, or null if the file
+ * isn't found / isn't a file. Used by the finalize step to confirm a
+ * direct-to-Dropbox upload actually landed before we insert a document row.
+ */
+export async function getDropboxFileSize(path: string): Promise<number | null> {
+  const dbx = createDropbox();
+  try {
+    const res = await dbx.filesGetMetadata({ path });
+    const meta = res.result as { ".tag"?: string; size?: number };
+    if (meta[".tag"] === "file" && typeof meta.size === "number") {
+      return meta.size;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Pull the file extension off the original upload, defaulting sensibly.
  * Always lowercase, always with leading dot.
  */

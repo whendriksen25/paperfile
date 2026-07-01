@@ -67,6 +67,20 @@ export interface StorageAdapter {
   getTemporaryLink(path: string): Promise<string>;
 
   /**
+   * Get a one-time, credential-free URL the browser can send file bytes to,
+   * landing the file in the inbox staging area. Lets large / multipage files
+   * bypass the app server's request-body limit (the client uploads straight to
+   * the storage backend). Returns the upload URL plus the canonical inbox path
+   * the bytes will land at.
+   */
+  getTemporaryUploadLink(params: {
+    filename: string;
+  }): Promise<{ uploadUrl: string; path: string }>;
+
+  /** Authoritative file size in bytes, or null if the file isn't found. */
+  getFileSize(path: string): Promise<number | null>;
+
+  /**
    * Upload a buffer to an explicit path (used by export features that need
    * to write to a known location, not the inbox staging folder).
    */

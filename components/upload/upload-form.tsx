@@ -21,6 +21,8 @@ import {
   compressImageInBrowser,
   shouldCompress,
 } from "@/lib/utils/compress-image-client";
+import { directUpload } from "@/lib/utils/direct-upload-client";
+import { combineImagesToPdfClient } from "@/lib/utils/combine-images-client";
 
 interface PendingFile {
   id: string;
@@ -102,20 +104,27 @@ export function UploadForm() {
     // tally is accurate (state closure is stale at end-of-run).
     let dupsThisRun = 0;
 
-    // ----- Step 1: client-side compression -----
-    // Shrink + HEIC-convert images in the browser BEFORE upload. Avoids
-    // Vercel's 4.5 MB body limit AND fixes iPhone HEIC docs that the server's
-    // sharp can't always decode. PDFs and small JPEGs are skipped.
+    // ----- Step 1: client-side compression / normalisation -----
+    // Shrink + HEIC-convert images in the browser. Two reasons it still
+    // matters even though the bytes now go straight to Dropbox (no 4.5 MB
+    // server-body limit): (1) smaller JPEGs upload faster and sit under
+    // Claude's per-image pixel ceiling, improving extraction; (2) in COMBINE
+    // mode every page must be JPEG so pdf-lib can stitch it in the browser.
     //
-    // We replace each PendingFile's `.file` with the compressed version,
-    // then proceed to upload as before.
+    // We replace each PendingFile's `.file` with the compressed version.
     const compressed: PendingFile[] = [];
     for (const item of pending) {
       if (item.progress === "done") {
         compressed.push(item);
         continue;
       }
-      if (!shouldCompress(item.file)) {
+      // Combine mode: force-normalise EVERY image page to JPEG (the browser
+      // PDF stitch embeds JPEG). Single mode: only large images need it.
+      const isImage =
+        item.file.type.startsWith("image/") ||
+        /\.(jpe?g|png|webp|heic|heif|tiff?|gif)$/i.test(item.file.name);
+      const mustCompress = combineMode ? isImage : shouldCompress(item.file);
+      if (!mustCompress) {
         compressed.push(item);
         continue;
       }
@@ -134,17 +143,9 @@ export function UploadForm() {
         console.warn(
           `[upload] compression failed for ${item.file.name}: ${msg}`
         );
-        // Pragmatic fallback: compression is an optimisation, not a
-        // requirement. If the original is small enough to fit in Vercel's
-        // 4.5 MB body limit comfortably, upload it uncompressed and let
-        // the server (which has heic-convert + sharp fallbacks) deal with
-        // it. Only treat it as a real failure for big files where the
-        // upload will definitely be rejected at the edge.
-        if (item.file.size <= 3_500_000) {
-          const next = { ...item, progress: "queued" as const };
-          compressed.push(next);
-          setPending((p) => p.map((f) => (f.id === item.id ? next : f)));
-        } else {
+        if (combineMode) {
+          // In combine mode, a page we can't decode can't be stitched into
+          // the PDF — treat it as a real failure.
           anyFailed = true;
           failuresThisRun.push({ ...item, progress: "failed", error: msg });
           setPending((p) =>
@@ -152,35 +153,41 @@ export function UploadForm() {
               f.id === item.id ? { ...f, progress: "failed", error: msg } : f
             )
           );
+        } else {
+          // Single-file mode: direct-to-Dropbox has no body limit, so an
+          // uncompressed original is fine — upload it and let the server's
+          // sharp / heic-convert fallbacks handle decoding.
+          const next = { ...item, progress: "queued" as const };
+          compressed.push(next);
+          setPending((p) => p.map((f) => (f.id === item.id ? next : f)));
         }
       }
     }
-    // Use the compressed list from here on. Bail early if every file failed
-    // compression — there's nothing left to upload.
+    // Use the compressed list from here on. If every page failed compression
+    // there's nothing to upload — fall through to the end-of-run bookkeeping
+    // so the failures still surface in the "Recent failures" panel.
     const usableFiles = compressed.filter((f) => f.progress !== "failed");
-    if (usableFiles.length === 0) {
-      setSubmitting(false);
-      return;
-    }
 
-    if (combineMode) {
-      // Single POST with all (compressed) files; server stitches into one PDF.
+    if (usableFiles.length > 0 && combineMode) {
+      // Combine mode: stitch the (now-JPEG) pages into ONE PDF in the browser,
+      // then upload that single PDF straight to Dropbox. No page bytes ever
+      // touch our server, so there's no combined-body size limit.
       setPending((p) =>
         p.map((f) =>
           f.progress === "failed" ? f : { ...f, progress: "uploading" as const }
         )
       );
-      const fd = new FormData();
-      fd.append("combine", "1");
-      if (combinedName.trim()) fd.append("combinedName", combinedName.trim());
-      for (const it of usableFiles) fd.append("files", it.file);
-      if (batch) fd.append("batch", batch);
-      if (profileId) fd.append("profile_id", String(profileId));
-      if (tags.length) fd.append("tags", tags.join(","));
       try {
-        const res = await fetch("/api/upload", { method: "POST", body: fd });
-        if (!res.ok) throw new Error(await res.text());
-        const json = await res.json();
+        const pdf = await combineImagesToPdfClient(
+          usableFiles.map((f) => f.file),
+          combinedName.trim() || `combined_${Date.now()}`
+        );
+        const json = await directUpload(pdf, {
+          combine: true,
+          batch: batch || null,
+          profileId: profileId || null,
+          tags,
+        });
         lastDocId = json.data?.id || null;
         if (json.duplicate && lastDocId) {
           // Combined PDF matched an existing doc — surface as duplicate
@@ -214,21 +221,18 @@ export function UploadForm() {
           p.map((f) => ({ ...f, progress: "failed" as const, error: msg }))
         );
       }
-    } else {
+    } else if (usableFiles.length > 0) {
       for (const item of usableFiles) {
         if (item.progress === "done") continue;
         setPending((p) =>
           p.map((f) => (f.id === item.id ? { ...f, progress: "uploading" } : f))
         );
-        const fd = new FormData();
-        fd.append("file", item.file);
-        if (batch) fd.append("batch", batch);
-        if (profileId) fd.append("profile_id", String(profileId));
-        if (tags.length) fd.append("tags", tags.join(","));
         try {
-          const res = await fetch("/api/upload", { method: "POST", body: fd });
-          if (!res.ok) throw new Error(await res.text());
-          const json = await res.json();
+          const json = await directUpload(item.file, {
+            batch: batch || null,
+            profileId: profileId || null,
+            tags,
+          });
           lastDocId = json.data?.id || null;
           if (json.duplicate && lastDocId) {
             // Server saw this exact file before — surface a duplicate

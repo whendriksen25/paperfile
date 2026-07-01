@@ -5,6 +5,8 @@ import {
   downloadFromDropbox,
   getOrCreateShareLink as dbxGetOrCreateShareLink,
   getTemporaryLink as dbxGetTemporaryLink,
+  getTemporaryUploadLink as dbxGetTemporaryUploadLink,
+  getDropboxFileSize,
   buildDestinationPath as dbxBuildDestinationPath,
 } from "@/lib/dropbox/upload";
 import type { StorageAdapter } from "./types";
@@ -23,6 +25,10 @@ export const dropboxAdapter: StorageAdapter = {
   getOrCreateShareLink: (path) => dbxGetOrCreateShareLink(path),
 
   getTemporaryLink: (path) => dbxGetTemporaryLink(path),
+
+  getTemporaryUploadLink: (params) => dbxGetTemporaryUploadLink(params),
+
+  getFileSize: (path) => getDropboxFileSize(path),
 
   buildDestinationPath: (params) => dbxBuildDestinationPath(params),
 };

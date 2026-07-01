@@ -328,6 +328,75 @@ Done when: `npm run build` passes; "where is my insurance policy from
 completion both work end-to-end via chat confirmation; a document can be
 pushed to bookkeeping from the chat.
 
+## Direct-to-Dropbox upload (large / multipage files) — SPEC, pending approval [2026-07-01 16:27:50 CEST]
+
+### Problem
+The upload routes (`/api/upload`, `/api/shortcut/upload`) are Vercel serverless
+functions. The file travels inside the request body, which Vercel caps at ~4.5 MB and
+rejects at the edge (HTTP 413) **before our code runs**. Multipage scans and any file
+over ~4.5 MB fail silently — no `documents` row, no log. (The `bodySizeLimit: "25mb"`
+in `next.config.mjs` only applies to Next.js Server Actions, not these Route Handlers,
+so it does not help here.)
+
+### Goal
+Let large / multipage documents upload successfully by keeping the file bytes **off**
+the Vercel function path. Analysis, filing, action detection and categorisation stay
+exactly as they are today.
+
+### New flow (web / PWA path)
+1. **On device:** compress images (as today); in combine mode stitch the pages into a
+   single PDF **in the browser** (`pdf-lib`, client-side) and compute a SHA-256 hash
+   via `crypto.subtle`.
+2. `POST /api/upload/dropbox-link` (new) — authenticates the user; server asks Dropbox
+   for a one-time upload URL (`filesGetTemporaryUploadLink`) for the
+   `_inbox/{timestamp}_{filename}` path and returns `{ uploadUrl, path }`. The Dropbox
+   token never leaves the server.
+3. **Client PUTs the file bytes directly to `uploadUrl`** — this request goes to
+   Dropbox, not Vercel, so the 4.5 MB limit never applies (temp-link cap is 150 MB per
+   file).
+4. `POST /api/upload/finalize` (new) — authenticates the user; verifies the file exists
+   in Dropbox (reads metadata for the authoritative size); runs the same SHA-256 dedup
+   check; inserts the `documents` row (`status: pending`); triggers `/api/analyze/[id]`
+   and the periodic sanity check — identical to what `/api/upload` does today.
+
+### Processing (unchanged)
+`/api/analyze/[id]` already downloads the file back **from** Dropbox and runs
+OCR / classification / profile match / actions / reconciliation. Nothing about it
+changes. (Claude's own per-request limits — roughly ~32 MB / ~100 pages per PDF —
+remain the practical ceiling for the AI read; the existing `ai_truncated` flag +
+"Retry full" path already handle that.)
+
+### Files
+- **New:** `app/api/upload/dropbox-link/route.ts`, `app/api/upload/finalize/route.ts`,
+  `lib/utils/combine-images-client.ts` (browser-side PDF stitch, JPEG input).
+- **Changed:** `lib/dropbox/upload.ts` + `lib/storage/types.ts` +
+  `lib/storage/dropbox-adapter.ts` — add `getTemporaryUploadLink()`.
+  `components/upload/upload-form.tsx` — `submit()` reworked to
+  link → direct-PUT → finalize (single + combine modes), client-side SHA-256.
+- **Kept intact (backward compatibility):** `app/api/upload/route.ts` — still works for
+  small files and as a fallback; nothing removed.
+
+### Out of scope for this change
+- The iOS Shortcut endpoint (`/api/shortcut/upload`) still routes bytes through Vercel,
+  so it keeps the 4.5 MB limit. Separate follow-up if large Shortcut uploads are needed.
+- Files over 150 MB (would need server-proxied chunked upload sessions). Not needed for
+  documents — largest ever stored is 2.4 MB.
+
+### Rollout & safety
+- Feature branch off `main`; `npm run build` clean; local smoke test at `localhost:3002`.
+- Deploy a Vercel **Preview** (its own URL, separate from production); test a real
+  multipage upload from the phone. **Production stays untouched.**
+- Merge to `main` only after the preview is verified. Rollback = Vercel Deployments →
+  promote the previous deploy (the change is additive and the old `/api/upload` is
+  untouched, so revert is clean).
+
+### Done when
+- `npm run build` passes with no console errors.
+- A >4.5 MB multipage PDF uploads from the phone via the web app on the Preview deploy,
+  lands in Dropbox, gets a `documents` row, and is fully analysed (type, profile,
+  actions) end-to-end.
+- Existing small single-file uploads still work.
+
 ## Out of scope for v1
 
 - Multi-user collaboration, sharing, document-level permissions.
