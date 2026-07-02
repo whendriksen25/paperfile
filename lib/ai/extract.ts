@@ -9,6 +9,12 @@ import {
 } from "./pricing";
 import type { DocumentExtraction } from "@/types/document";
 
+/** Raw-PDF size above which we downsample before sending to Claude.
+ *  MUST match PDF_RAW_LIMIT_BYTES in lib/services/pdf-shrink.ts — kept as
+ *  a local literal so sharp/pdf-lib stay lazily imported (they only load
+ *  when a PDF actually exceeds this). */
+const PDF_RAW_LIMIT_BYTES = 20 * 1024 * 1024;
+
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 function stripCodeFence(s: string): string {
@@ -433,7 +439,36 @@ export async function extractDocument(
       text: `Below is the raw text export of the document (likely CSV from a bank). Extract per the schema above.\n\n---\n${raw}\n---`,
     });
   } else if (mimeType === "application/pdf") {
-    const base64Data = fileBuffer.toString("base64");
+    // Oversized-PDF guard. Claude's API rejects requests over ~32 MB
+    // (base64 inflates the PDF by 4/3), returning 413 request_too_large —
+    // first hit by a 29 MB / 21-page scan. Downsample the embedded scan
+    // images in-memory (original in Dropbox stays untouched) so the WHOLE
+    // document still goes in one request, keeping cross-page context.
+    let pdfBuffer = fileBuffer;
+    if (pdfBuffer.length > PDF_RAW_LIMIT_BYTES) {
+      const { shrinkPdfForClaude, CLAUDE_PDF_PAGE_LIMIT } = await import(
+        "@/lib/services/pdf-shrink"
+      );
+      const shrunk = await shrinkPdfForClaude(pdfBuffer);
+      if (shrunk.pageCount > CLAUDE_PDF_PAGE_LIMIT) {
+        // Downsampling can't fix page count — Claude hard-caps at 100
+        // pages per PDF. Surface a clear, actionable error (lands in
+        // review_notes via the analyze route's catch).
+        throw new Error(
+          `PDF has ${shrunk.pageCount} pages — over Claude's ${CLAUDE_PDF_PAGE_LIMIT}-page analysis limit. The file is stored safely; analysing it needs page-chunking, which isn't built yet.`
+        );
+      }
+      if (!shrunk.fits) {
+        throw new Error(
+          `PDF is too large to analyse even after downsampling (${(shrunk.buffer.length / 1048576).toFixed(1)} MB of ${shrunk.pageCount} pages). The file is stored safely in Dropbox.`
+        );
+      }
+      console.log(
+        `[ai/extract] downsampled oversized PDF ${(fileBuffer.length / 1048576).toFixed(1)}MB → ${(shrunk.buffer.length / 1048576).toFixed(1)}MB before extraction`
+      );
+      pdfBuffer = shrunk.buffer;
+    }
+    const base64Data = pdfBuffer.toString("base64");
     contentBlocks.push({
       type: "document",
       source: {
