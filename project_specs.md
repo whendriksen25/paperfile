@@ -397,6 +397,43 @@ remain the practical ceiling for the AI read; the existing `ai_truncated` flag +
   actions) end-to-end.
 - Existing small single-file uploads still work.
 
+## Oversized-PDF downsampling + long-document deep extraction — approved [2026-07-03]
+
+Two analysis-stage fixes, approved in chat 2026-07-03:
+
+**A. Oversized PDFs (413 request_too_large).** Claude's API caps a request at
+~32 MB; base64 inflates PDFs by 4/3, so scans over ~22 MB raw were rejected
+(first hit: Fluxa.pdf, 29.3 MB / 21 pages). `lib/services/pdf-shrink.ts`
+downsamples the embedded scan JPEGs in-memory (pdf-lib + sharp, progressive
+passes from 2000px/q75 down to 1250px/q50, each restarting from the original
+bytes) until the PDF fits. Hooked into `extractDocument` for PDFs >20 MB.
+Dropbox original untouched. PDFs >100 pages (Claude's hard cap) fail with a
+clear error; page-chunking is a possible later fallback, deliberately NOT
+built now (cross-page context loss + merge complexity).
+
+**B. Long-document deep extraction.** For docs of ~5+ pages the model was
+condensing `ocr_text` with placeholders and missing decision points
+(Fluxa.pdf: `needs_action=false` despite an "open decisions" section).
+Prompt-only changes in `lib/ai/prompts.ts`:
+- `summary` must represent every section for long docs.
+- `ocr_text` may be condensed but must cover every section/table — no
+  "[table omitted]" placeholders.
+- New `extracted_fields.key_points_by_section` (every section title → 1-3
+  sentence digest), `open_decisions[]` ({decision, context, deadline}),
+  `commitments[]`.
+- Non-empty `open_decisions` ⇒ `needs_action=true`, `action_type="respond"`,
+  `action_summary="Decide: …"` — so open decisions land in `/actions`.
+
+**Also fixed on this branch (2026-07-03):**
+- Multitenant RLS invisibility: service-role inserts left `tenant_id` NULL
+  (column default `get_user_tenant_id()` reads `auth.uid()` = NULL for the
+  service role). Migration `021_tenant_id_autofill.sql`: BEFORE INSERT
+  trigger on all 10 tenant tables + backfill. Applied to prod.
+- Password-reset links pointed at localhost: `reset-password/page.tsx` now
+  uses `window.location.origin`; Supabase Auth Site URL corrected to
+  `https://paperfile.nl` + redirect allowlist (paperfile.nl, Vercel
+  previews, localhost:3002).
+
 ## Out of scope for v1
 
 - Multi-user collaboration, sharing, document-level permissions.

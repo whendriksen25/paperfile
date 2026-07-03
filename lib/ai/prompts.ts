@@ -73,16 +73,16 @@ Return STRICT JSON only — no prose, no markdown code fences, no commentary. Th
   "purchase_category": "<one of: food | material | clothing | transport | health | housing | utilities | services | entertainment | education | other — only when the document represents a purchase (receipt, invoice, bill). Null otherwise.>",
 
   "title": "<one-line human-readable title, max 80 chars>",
-  "summary": "<1-2 sentence plain-English summary>",
+  "summary": "<plain-English summary. 1-2 sentences for short documents; for documents of ~5+ pages, one line per section so EVERY section is represented — never skip sections>",
   "tags": ["<3-8 short lowercase tags that describe the document, e.g. 'medical', 'reimbursable', 'urgent'>"],
 
   "extracted_fields": {
     "<key>": "<value>"
   },
 
-  "ocr_text": "<the full transcribed text of the document, preserving approximate line breaks>",
+  "ocr_text": "<the transcribed text of the document, preserving approximate line breaks. For long documents you may condense, but coverage must be COMPLETE: every section, heading, table and list must be represented with its actual content — never replace content with placeholders like '[table omitted]' or '[section about X]'>",
 
-  "needs_action": <true|false — does the recipient need to DO something because of this document? bills due, contracts to sign, appointments to confirm, deadlines to meet, replies expected>,
+  "needs_action": <true|false — does the recipient need to DO something because of this document? bills due, contracts to sign, appointments to confirm, deadlines to meet, replies expected, open decisions or questions the document asks the reader to settle>,
   "action_type": "<one of: pay | respond | sign | file_with_authority | other — required if needs_action is true. Null otherwise.>",
   "due_date": "<YYYY-MM-DD — the deadline implied by this document, or null>",
   "action_summary": "<short imperative description of what to do, e.g. 'Pay €234.50 to Mediq by 15 May'. Required if needs_action is true.>"
@@ -193,11 +193,19 @@ ${buildLineItemCategoryBlock()}
 
 - HANDWRITTEN ANNOTATIONS — capture any other handwritten text (notes, signatures, references, names) in extracted_fields.handwritten_notes as an array of short strings, verbatim. This helps the user see what was added by hand on top of the printed document.
 
+- LONG / MULTI-SECTION DOCUMENTS (reports, blueprints, proposals, plans, meeting minutes — typically ~5+ pages):
+  * READ EVERY PAGE. Nothing may be skipped: summary, key_points_by_section, and open_decisions must jointly account for every section in the document.
+  * extracted_fields.key_points_by_section: an object mapping each section title (verbatim, original language) to a 1-3 sentence digest of that section's ACTUAL content — decisions, numbers, scope, named systems/roles/people. Every section in the document MUST appear as a key.
+  * extracted_fields.open_decisions: an array with one object for EVERY open decision, unanswered question, or choice the document asks the reader to make (sections titled "open decisions" / "open punten" / "te bepalen" / "keuzes", lines like "keuze die jullie moeten vastleggen", TBD markers, explicit questions):
+    [{ "decision": "<what must be decided, short imperative>", "context": "<the options / why it matters, 1 sentence>", "deadline": "<YYYY-MM-DD or null>" }]
+  * extracted_fields.commitments: an array of "<who> — <what they committed to> — <deadline or null>" strings for explicit commitments or next steps named in the document. Omit if none.
+  * If open_decisions is non-empty: set needs_action=true, action_type="respond", and action_summary="Decide: <short comma-separated decision labels>" (max ~200 chars; if there are too many to fit, name the first few and append "+N more").
+
 - ARRAY ELEMENTS MUST BE VALID JSON. This applies to handwritten_notes, tags, line_items, and every other array. Each element is a plain JSON value — a quoted string, a number, an object — with NO inline editorial commentary outside the quotes. WRONG: ["Voldaan" - handwritten across the document]. RIGHT: ["Voldaan"]  or  ["Voldaan (handwritten across document)"]. If you want to describe HOW the note appears (handwritten, stamped, in red ink, etc.), include that description INSIDE the quoted string, never after the closing quote.
 
 - If a field is not present on the document, use null (or omit from extracted_fields). Never invent data.
 - For languages other than English, translate "title", "summary", and "tags" into English but keep "ocr_text" AND line_items descriptions in the original language.
-- "needs_action" should be true ONLY for documents that imply concrete action by the recipient. Routine confirmations, archived statements, and informational letters should be false.
+- "needs_action" should be true ONLY for documents that imply concrete action by the recipient — including deciding on open decisions per the LONG / MULTI-SECTION DOCUMENTS rule. Routine confirmations, archived statements, and informational letters should be false.
 - For "purchase_category": pick the closest match from the list. Use null if the document is not a purchase.
 - "profile_hint" should be the actual name as written on the doc — the server will fuzzy-match it to existing profiles.
 - If the image is unreadable or clearly not a document (blank page, random photo), set document_type to "other", confidence low, and explain in "summary".
