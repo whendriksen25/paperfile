@@ -195,6 +195,7 @@ ${buildLineItemCategoryBlock()}
 
 - LONG / MULTI-SECTION DOCUMENTS (reports, blueprints, proposals, plans, meeting minutes — typically ~5+ pages):
   * READ EVERY PAGE. Nothing may be skipped: summary, key_points_by_section, and open_decisions must jointly account for every section in the document.
+  * ocr_text for long documents: do NOT attempt a full transcript. Emit the document's heading structure (every chapter/section title verbatim) with 2-4 of the most important lines of actual content under each. The COMPLETENESS requirement lives in key_points_by_section — ocr_text is a navigable skeleton, roughly 200 lines maximum. (Full transcripts of 20+ page documents exceed the response budget and get cut off — a bounded skeleton that covers ALL sections beats a perfect transcript of only the first chapters.)
   * extracted_fields.key_points_by_section: an object mapping each section title (verbatim, original language) to a 1-3 sentence digest of that section's ACTUAL content — decisions, numbers, scope, named systems/roles/people. Every section in the document MUST appear as a key.
   * extracted_fields.open_decisions: an array with one object for EVERY open decision, unanswered question, or choice the document asks the reader to make (sections titled "open decisions" / "open punten" / "te bepalen" / "keuzes", lines like "keuze die jullie moeten vastleggen", TBD markers, explicit questions):
     [{ "decision": "<what must be decided, short imperative>", "context": "<the options / why it matters, 1 sentence>", "deadline": "<YYYY-MM-DD or null>" }]
