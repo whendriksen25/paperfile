@@ -19,8 +19,12 @@ export default function ResetPasswordPage() {
     setError(null);
     setInfo(null);
     setLoading(true);
+    // Use the ACTUAL origin the user is on (production, Vercel preview, or
+    // localhost) — NEXT_PUBLIC_APP_URL is baked in at build time and was
+    // sending reset links to localhost:3002 from deployed environments.
+    // The origin must also be allowlisted in Supabase Auth → URL Configuration.
     const { error } = await supabase.auth.resetPasswordForEmail(email, {
-      redirectTo: `${process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3002"}/login`,
+      redirectTo: `${window.location.origin}/login`,
     });
     setLoading(false);
     if (error) {
