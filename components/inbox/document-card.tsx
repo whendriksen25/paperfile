@@ -2,7 +2,12 @@ import Link from "next/link";
 import { Badge } from "@/components/ui/badge";
 import { Spinner } from "@/components/ui/spinner";
 import { ConfirmProfileButton } from "@/components/inbox/confirm-profile-button";
-import { formatDate, formatMoney, titleCase } from "@/lib/utils/format";
+import {
+  formatDate,
+  formatDateTime,
+  formatMoney,
+  titleCase,
+} from "@/lib/utils/format";
 import { storagePathLabel, parseStoragePath } from "@/lib/utils/storage-path";
 import {
   FileText,
@@ -137,6 +142,13 @@ export function DocumentCard({
                         ? ` · ${formatDate(doc.document_date)}`
                         : "")}
               </p>
+              {/* Scan timestamp — when this doc entered the archive.
+                 Distinct from document_date (the date ON the document). */}
+              {!isWorking && !isFailed && doc.created_at && (
+                <p className="text-[11px] text-muted-foreground/70 truncate mt-0.5">
+                  Scanned {formatDateTime(doc.created_at)}
+                </p>
+              )}
 
               {/* Bank-statement summary line — tells the user at a glance
                  what's inside the statement (txn count + flows + reconcile

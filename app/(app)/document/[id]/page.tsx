@@ -3,6 +3,7 @@ import Link from "next/link";
 import { createClient } from "@/lib/supabase/server";
 import {
   formatDate,
+  formatDateTime,
   formatMoney,
   titleCase,
   formatBytes,
@@ -854,6 +855,7 @@ export default async function DocumentDetail({
             <Row label="Type" value={doc.file_type} />
             <Row label="Size" value={formatBytes(doc.file_size_bytes)} />
             <Row label="Storage" value={titleCase(doc.storage_provider)} />
+            <Row label="Scanned" value={formatDateTime(doc.created_at)} />
           </dl>
         </div>
       </div>

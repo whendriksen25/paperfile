@@ -41,6 +41,11 @@ export async function GET(request: NextRequest) {
   const profileId = sp.get("profile_id");
   const after = sp.get("after");
   const triage = sp.get("needs_review") === "1";
+  // Scan-date range filter (created_at = when the doc was scanned/uploaded).
+  // YYYY-MM-DD, inclusive on both ends. scanned_to is bumped by one day and
+  // compared with `lt` so the whole end day is included regardless of time.
+  const scannedFrom = sp.get("scanned_from");
+  const scannedTo = sp.get("scanned_to");
   const limit = Math.min(50, Math.max(1, Number(sp.get("limit")) || INBOX_PAGE_SIZE));
 
   let query = supabase
@@ -62,6 +67,14 @@ export async function GET(request: NextRequest) {
   if (profileId && !triage && !hasSearch) query = query.eq("primary_profile_id", Number(profileId));
   if (triage) {
     query = query.or("primary_profile_id.is.null,needs_review.eq.true");
+  }
+  if (scannedFrom && /^\d{4}-\d{2}-\d{2}$/.test(scannedFrom)) {
+    query = query.gte("created_at", scannedFrom);
+  }
+  if (scannedTo && /^\d{4}-\d{2}-\d{2}$/.test(scannedTo)) {
+    const end = new Date(`${scannedTo}T00:00:00Z`);
+    end.setUTCDate(end.getUTCDate() + 1);
+    query = query.lt("created_at", end.toISOString());
   }
   // Cursor: anything strictly older than `after`. Using `lt` (not `lte`) so
   // we don't return the same boundary row twice across pages.

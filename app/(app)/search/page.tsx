@@ -5,27 +5,40 @@ import { Input } from "@/components/ui/input";
 import { DocumentCard } from "@/components/inbox/document-card";
 import type { DocumentRow } from "@/types/document";
 import { Spinner } from "@/components/ui/spinner";
-import { Search as SearchIcon } from "lucide-react";
+import { Search as SearchIcon, CalendarClock } from "lucide-react";
 
 export default function SearchPage() {
   const [q, setQ] = useState("");
+  // Scan-date range — filters on created_at (when the doc was scanned),
+  // not the date printed on the document. Works with or without text.
+  const [scannedFrom, setScannedFrom] = useState("");
+  const [scannedTo, setScannedTo] = useState("");
   const [results, setResults] = useState<DocumentRow[]>([]);
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
     const t = setTimeout(async () => {
-      if (!q.trim()) {
+      const hasText = !!q.trim();
+      const hasDates = !!scannedFrom || !!scannedTo;
+      if (!hasText && !hasDates) {
         setResults([]);
         return;
       }
       setLoading(true);
-      const res = await fetch(`/api/documents?q=${encodeURIComponent(q)}`);
+      const params = new URLSearchParams();
+      if (hasText) params.set("q", q);
+      if (scannedFrom) params.set("scanned_from", scannedFrom);
+      if (scannedTo) params.set("scanned_to", scannedTo);
+      params.set("limit", "50");
+      const res = await fetch(`/api/documents?${params.toString()}`);
       const json = await res.json();
       setResults(json.data || []);
       setLoading(false);
     }, 250);
     return () => clearTimeout(t);
-  }, [q]);
+  }, [q, scannedFrom, scannedTo]);
+
+  const active = !!q.trim() || !!scannedFrom || !!scannedTo;
 
   return (
     <div className="max-w-3xl mx-auto px-5 py-6 md:py-10">
@@ -40,6 +53,39 @@ export default function SearchPage() {
             className="pl-9"
           />
         </div>
+        <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+          <span className="inline-flex items-center gap-1.5 font-semibold">
+            <CalendarClock className="h-3.5 w-3.5" />
+            Scanned between
+          </span>
+          <Input
+            type="date"
+            value={scannedFrom}
+            onChange={(e) => setScannedFrom(e.target.value)}
+            className="w-auto text-xs"
+            aria-label="Scanned from"
+          />
+          <span>and</span>
+          <Input
+            type="date"
+            value={scannedTo}
+            onChange={(e) => setScannedTo(e.target.value)}
+            className="w-auto text-xs"
+            aria-label="Scanned to"
+          />
+          {(scannedFrom || scannedTo) && (
+            <button
+              type="button"
+              onClick={() => {
+                setScannedFrom("");
+                setScannedTo("");
+              }}
+              className="underline hover:text-foreground"
+            >
+              Clear dates
+            </button>
+          )}
+        </div>
       </header>
 
       {loading && (
@@ -48,9 +94,10 @@ export default function SearchPage() {
         </div>
       )}
 
-      {!loading && q && results.length === 0 && (
+      {!loading && active && results.length === 0 && (
         <div className="surface p-6 text-center text-sm text-muted-foreground">
-          No matches for "{q}".
+          No matches{q.trim() ? ` for "${q}"` : ""}
+          {scannedFrom || scannedTo ? " in that scan-date range" : ""}.
         </div>
       )}
 
