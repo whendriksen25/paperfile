@@ -15,6 +15,7 @@ import {
 } from "@/components/inbox/bank-transactions-table";
 import { RefileWidget } from "@/components/inbox/refile-widget";
 import { RenameFilenameButton } from "@/components/inbox/rename-filename-button";
+import { DeleteDocumentButton } from "@/components/inbox/delete-document-button";
 import { DuplicateBanner } from "@/components/inbox/duplicate-banner";
 import { DocumentPreview } from "@/components/inbox/document-preview";
 import { ReconciliationPanel } from "@/components/inbox/reconciliation-panel";
@@ -624,15 +625,18 @@ export default async function DocumentDetail({
                 {formatBytes(doc.file_size_bytes)}
               </div>
             </div>
-            <a
-              href={`/api/documents/${doc.id}/preview`}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="btn-secondary text-xs !py-2"
-            >
-              <ExternalLink className="h-3.5 w-3.5" />
-              Open full
-            </a>
+            <div className="flex items-center gap-2">
+              <a
+                href={`/api/documents/${doc.id}/preview`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="btn-secondary text-xs !py-2"
+              >
+                <ExternalLink className="h-3.5 w-3.5" />
+                Open full
+              </a>
+              <DeleteDocumentButton documentId={doc.id} />
+            </div>
           </div>
         </div>
 

@@ -21,6 +21,7 @@ import type { DocumentRow, ProfileRow } from "@/types/document";
 export const dynamic = "force-dynamic";
 
 type GroupKey = "none" | "profile" | "type" | "month";
+type SortKey = "added" | "docdate";
 
 export default async function InboxPage({
   searchParams,
@@ -30,6 +31,7 @@ export default async function InboxPage({
     profile_id?: string;
     type?: string;
     group?: string;
+    sort?: string;
     needs_review?: string;
     q?: string;
   }>;
@@ -41,20 +43,31 @@ export default async function InboxPage({
     sp.group === "month"
       ? sp.group
       : "none";
+  // Sort: "added" (default) = newest upload first — "what did I just
+  // scan?". "docdate" = by the date printed ON the document.
+  const sort: SortKey = sp.sort === "docdate" ? "docdate" : "added";
   const supabase = await createClient();
 
   // When grouping is on, we need the full visible set to bucket correctly,
-  // so we fetch a larger batch (200 max). When grouping is off we render
-  // the first INBOX_PAGE_SIZE (10) server-side and let the client stream
-  // more via IntersectionObserver in InboxInfiniteList.
-  const initialLimit = group === "none" ? INBOX_PAGE_SIZE : 200;
+  // so we fetch a larger batch (200 max). Same for document-date sort:
+  // the infinite-scroll cursor is keyed on created_at, so a docdate sort
+  // can't paginate — fetch the batch and render flat. When grouping is
+  // off and sort is default we render the first INBOX_PAGE_SIZE (10)
+  // server-side and let the client stream more via IntersectionObserver.
+  const initialLimit =
+    group === "none" && sort === "added" ? INBOX_PAGE_SIZE : 200;
 
   let q = supabase
     .from("documents")
     .select(INBOX_CARD_FIELDS)
     .neq("status", "deleted")
-    .order("created_at", { ascending: false })
     .limit(initialLimit);
+  q =
+    sort === "docdate"
+      ? q
+          .order("document_date", { ascending: false, nullsFirst: false })
+          .order("created_at", { ascending: false })
+      : q.order("created_at", { ascending: false });
 
   // ?needs_review=1 is the global triage view — it MUST ignore the active
   // profile filter, otherwise an unassigned doc (profile_id=null) is hidden
@@ -105,7 +118,7 @@ export default async function InboxPage({
   // contains all matching docs (or when grouping is on — grouping fetches up
   // to 200 in one go and doesn't paginate).
   const initialNextCursor =
-    group === "none" && docs.length === initialLimit
+    group === "none" && sort === "added" && docs.length === initialLimit
       ? docs[docs.length - 1].created_at
       : null;
   const profilesById = new Map(
@@ -117,7 +130,7 @@ export default async function InboxPage({
 
   // Selection state is cleared whenever the inbox filters change — the
   // resetKey is a stable string derived from the active search params.
-  const resetKey = `${sp.profile_id || "all"}:${sp.type || "all"}:${sp.batch || "all"}:${sp.needs_review || "0"}:${searchQuery || "all"}`;
+  const resetKey = `${sp.profile_id || "all"}:${sp.type || "all"}:${sp.batch || "all"}:${sp.needs_review || "0"}:${searchQuery || "all"}:${sort}`;
   const profilesArray = (profileData || []) as ProfileRow[];
 
   return (
@@ -168,42 +181,81 @@ export default async function InboxPage({
           unassigned scans don't get hidden behind a Father/LLC/Wife filter */}
       <NeedsReviewBanner />
 
-      {/* Group-by selector (preserves the other query params) */}
-      <div className="surface p-4 mb-5">
-        <div className="section-label mb-3">Group documents by</div>
-        <div className="flex flex-wrap gap-2">
-          {(
-            [
-              { key: "none", label: "None (date)" },
-              { key: "profile", label: "Profile" },
-              { key: "type", label: "Document type" },
-              { key: "month", label: "Month" },
-            ] as { key: GroupKey; label: string }[]
-          ).map((opt) => {
-            const params = new URLSearchParams();
-            if (sp.batch) params.set("batch", sp.batch);
-            if (sp.profile_id) params.set("profile_id", sp.profile_id);
-            if (sp.type) params.set("type", sp.type);
-            if (opt.key !== "none") params.set("group", opt.key);
-            const href =
-              params.toString().length > 0
-                ? `/inbox?${params.toString()}`
-                : "/inbox";
-            const active = group === opt.key;
-            return (
-              <Link
-                key={opt.key}
-                href={href}
-                className={`pill border transition-colors ${
-                  active
-                    ? "bg-brand-charcoal text-white border-brand-charcoal"
-                    : "bg-white text-foreground border-border hover:bg-muted"
-                }`}
-              >
-                {opt.label}
-              </Link>
-            );
-          })}
+      {/* Group-by + sort selectors (preserve the other query params) */}
+      <div className="surface p-4 mb-5 space-y-4">
+        <div>
+          <div className="section-label mb-3">Group documents by</div>
+          <div className="flex flex-wrap gap-2">
+            {(
+              [
+                { key: "none", label: "None (date)" },
+                { key: "profile", label: "Profile" },
+                { key: "type", label: "Document type" },
+                { key: "month", label: "Month" },
+              ] as { key: GroupKey; label: string }[]
+            ).map((opt) => {
+              const params = new URLSearchParams();
+              if (sp.batch) params.set("batch", sp.batch);
+              if (sp.profile_id) params.set("profile_id", sp.profile_id);
+              if (sp.type) params.set("type", sp.type);
+              if (sort !== "added") params.set("sort", sort);
+              if (opt.key !== "none") params.set("group", opt.key);
+              const href =
+                params.toString().length > 0
+                  ? `/inbox?${params.toString()}`
+                  : "/inbox";
+              const active = group === opt.key;
+              return (
+                <Link
+                  key={opt.key}
+                  href={href}
+                  className={`pill border transition-colors ${
+                    active
+                      ? "bg-brand-charcoal text-white border-brand-charcoal"
+                      : "bg-white text-foreground border-border hover:bg-muted"
+                  }`}
+                >
+                  {opt.label}
+                </Link>
+              );
+            })}
+          </div>
+        </div>
+        <div>
+          <div className="section-label mb-3">Sort by</div>
+          <div className="flex flex-wrap gap-2">
+            {(
+              [
+                { key: "added", label: "Recently added" },
+                { key: "docdate", label: "Document date" },
+              ] as { key: SortKey; label: string }[]
+            ).map((opt) => {
+              const params = new URLSearchParams();
+              if (sp.batch) params.set("batch", sp.batch);
+              if (sp.profile_id) params.set("profile_id", sp.profile_id);
+              if (sp.type) params.set("type", sp.type);
+              if (group !== "none") params.set("group", group);
+              if (opt.key !== "added") params.set("sort", opt.key);
+              const href =
+                params.toString().length > 0
+                  ? `/inbox?${params.toString()}`
+                  : "/inbox";
+              const active = sort === opt.key;
+              return (
+                <Link
+                  key={opt.key}
+                  href={href}
+                  className={`pill border transition-colors ${
+                    active
+                      ? "bg-brand-charcoal text-white border-brand-charcoal"
+                      : "bg-white text-foreground border-border hover:bg-muted"
+                  }`}
+                >
+                  {opt.label}
+                </Link>
+              );
+            })}
+          </div>
         </div>
       </div>
 
@@ -256,6 +308,22 @@ export default async function InboxPage({
             </a>{" "}
             to add the first one.
           </p>
+        </div>
+      ) : group === "none" && sort === "docdate" ? (
+        // Document-date sort can't use the created_at-keyed infinite
+        // scroll cursor — render the (up to 200) fetched docs flat.
+        <div className="grid gap-3">
+          {docs.map((doc) => (
+            <SelectableCard
+              key={doc.id}
+              doc={doc}
+              profile={
+                doc.primary_profile_id
+                  ? profilesById.get(doc.primary_profile_id) || null
+                  : null
+              }
+            />
+          ))}
         </div>
       ) : group === "none" ? (
         // The `key` forces React to fully remount the infinite-scroll list
@@ -336,16 +404,19 @@ function GroupedDocs({
     buckets.set(key, bucket);
   }
 
-  // Stable order: by group size desc, then label asc — except for the
-  // "Unassigned" / "Unclassified" buckets which always go last.
-  const entries = Array.from(buckets.entries()).sort(([ka, a], [kb, b]) => {
+  // Order: groups holding the NEWEST documents first (buckets were built
+  // by iterating docs in their sorted order, so Map insertion order IS
+  // newest-first — sort() is stable, so returning 0 preserves it). This
+  // keeps whatever the user just scanned at the top instead of burying it
+  // under a big group. "Unassigned" / "Unclassified" / "Undated" always
+  // go last; month grouping stays strictly newest-month-first by key.
+  const entries = Array.from(buckets.entries()).sort(([ka], [kb]) => {
     const aLast = ka === "p_none" || ka === "_none" || ka === "_undated";
     const bLast = kb === "p_none" || kb === "_none" || kb === "_undated";
     if (aLast && !bLast) return 1;
     if (!aLast && bLast) return -1;
     if (group === "month") return kb.localeCompare(ka); // newest month first
-    if (b.docs.length !== a.docs.length) return b.docs.length - a.docs.length;
-    return a.label.localeCompare(b.label);
+    return 0; // preserve insertion order = newest doc first
   });
 
   return (

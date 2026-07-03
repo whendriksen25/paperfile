@@ -434,6 +434,23 @@ Prompt-only changes in `lib/ai/prompts.ts`:
   `https://paperfile.nl` + redirect allowlist (paperfile.nl, Vercel
   previews, localhost:3002).
 
+## Delete from preview pane + library sort — approved [2026-07-03]
+
+**Delete.** `DeleteDocumentButton` (two-step inline confirm) in the Source
+Document panel on `/document/[id]` — reachable for any doc including
+needs-review. Uses the existing soft-delete (`DELETE /api/documents/:id`,
+status='deleted'; Dropbox file untouched). The DELETE route now also
+dismisses the doc's open actions so `/actions` doesn't nag about a
+deleted doc.
+
+**Sort.** New `?sort=` param on the library: "added" (default; newest
+upload first, keeps infinite scroll) or "docdate" (date printed on the
+document; fetches up to 200 and renders flat — the scroll cursor is
+created_at-keyed and can't paginate a docdate order). Sort pills sit
+under the Group pills and preserve all other params. Grouped views now
+order groups by their newest document instead of group size, so the most
+recent scan is always at the top.
+
 ## Out of scope for v1
 
 - Multi-user collaboration, sharing, document-level permissions.

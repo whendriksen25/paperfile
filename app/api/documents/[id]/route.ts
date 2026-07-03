@@ -74,5 +74,17 @@ export async function DELETE(
     .update({ status: "deleted" })
     .eq("id", id);
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  // Dismiss any open actions for the deleted doc so the /actions to-do
+  // list doesn't keep nagging about a document that's gone from the
+  // library. (Soft-symmetric with the doc's soft delete.)
+  const { error: actionErr } = await supabase
+    .from("actions")
+    .update({ status: "dismissed" })
+    .eq("document_id", id)
+    .eq("status", "open");
+  if (actionErr) {
+    console.warn("[api/documents/:id DELETE] action dismiss failed", actionErr);
+  }
+  console.log("[api/documents/:id DELETE soft] done", id);
   return NextResponse.json({ ok: true });
 }
