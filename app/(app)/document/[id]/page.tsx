@@ -618,7 +618,10 @@ export default async function DocumentDetail({
             fileName={displayName}
             fileType={doc.file_type}
           />
-          <div className="mt-3 flex items-center justify-between gap-3">
+          {/* Footer: filename on its own row, actions wrapping below —
+             three buttons no longer fit beside the filename without
+             overlapping it on narrower panes. */}
+          <div className="mt-3 space-y-2.5">
             <div className="text-xs min-w-0">
               <RenameFilenameButton
                 documentId={doc.id}
@@ -628,19 +631,19 @@ export default async function DocumentDetail({
                 {formatBytes(doc.file_size_bytes)}
               </div>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <a
                 href={`/api/documents/${doc.id}/preview`}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="btn-secondary text-xs !py-2"
+                className="btn-secondary text-xs !py-2 shrink-0"
               >
                 <ExternalLink className="h-3.5 w-3.5" />
                 Open full
               </a>
               <a
                 href={`/api/documents/${doc.id}/preview?download=1`}
-                className="btn-secondary text-xs !py-2"
+                className="btn-secondary text-xs !py-2 shrink-0"
               >
                 <Download className="h-3.5 w-3.5" />
                 Download
