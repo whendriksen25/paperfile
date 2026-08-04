@@ -1466,6 +1466,40 @@ export async function POST(
       }
     }
 
+    // Full-transcript hand-off for long PDFs. The main extraction only
+    // stores a bounded section skeleton in ocr_text for 5+ page docs (a
+    // full transcript in one call blows the function budget); the chunked
+    // background transcription fills in the complete verbatim text a few
+    // minutes later. Threshold 6 MUST match TRANSCRIBE_MIN_PAGES in
+    // lib/services/transcribe.ts (kept literal here so pdf-lib/sharp stay
+    // lazily imported).
+    if (!isMultiDocScan && buffer.subarray(0, 5).toString() === "%PDF-") {
+      try {
+        const { PDFDocument } = await import("pdf-lib");
+        const pageCount = (
+          await PDFDocument.load(buffer, {
+            ignoreEncryption: true,
+            updateMetadata: false,
+          })
+        ).getPageCount();
+        if (pageCount >= 6) {
+          const { kickAndForget } = await import("@/lib/utils/kick");
+          await kickAndForget(
+            `${request.nextUrl.origin}/api/transcribe/${id}?chunk=0`,
+            {
+              method: "POST",
+              headers: { cookie: request.headers.get("cookie") || "" },
+            }
+          );
+          console.log(
+            `[api/analyze] kicked full transcription for ${pageCount}-page PDF ${id}`
+          );
+        }
+      } catch (e) {
+        console.warn("[api/analyze] transcription kick failed:", e);
+      }
+    }
+
     console.log(
       "[api/analyze] done",
       id,

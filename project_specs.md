@@ -451,6 +451,29 @@ under the Group pills and preserve all other params. Grouped views now
 order groups by their newest document instead of group size, so the most
 recent scan is always at the top.
 
+## Full transcript for long PDFs — approved [2026-08-04]
+
+For 6+ page PDFs the main extraction stores only a bounded section
+skeleton in ocr_text (a full transcript in one call exceeds the function
+budget — learned the hard way with Fluxa.pdf). The chunked background
+transcription fills in the complete verbatim text afterwards:
+
+- `POST /api/transcribe/[id]?chunk=N` — transcribes 5 pages per call
+  (pdf-lib page-copy → shrink if oversized → plain-text verbatim prompt,
+  no JSON schema), stores parts under `extracted_fields._transcript`,
+  self-chains the next chunk via kickAndForget. Final chunk assembles all
+  parts in page order into `ocr_text` with "===== Pagina X–Y =====" markers
+  and drops the parts.
+- Auto-kicked by /api/analyze for non-multi-doc PDFs of 6+ pages
+  (threshold literal there MUST match TRANSCRIBE_MIN_PAGES).
+- Detail page: OCR panel header shows progress ("X/Y parts"), failure +
+  retry, or a "Transcribe full text" button for PDFs without a transcript
+  (covers older docs like Fluxa). `_transcript` excluded from the raw
+  Fields dump.
+- Structured extraction (key_points_by_section, open_decisions → actions)
+  unchanged; this only upgrades the readable text. Cost: ~1 Claude call
+  per 5 pages.
+
 ## Out of scope for v1
 
 - Multi-user collaboration, sharing, document-level permissions.

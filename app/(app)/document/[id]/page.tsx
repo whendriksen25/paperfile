@@ -17,6 +17,7 @@ import {
 import { RefileWidget } from "@/components/inbox/refile-widget";
 import { RenameFilenameButton } from "@/components/inbox/rename-filename-button";
 import { DeleteDocumentButton } from "@/components/inbox/delete-document-button";
+import { TranscribeButton } from "@/components/inbox/transcribe-button";
 import { DuplicateBanner } from "@/components/inbox/duplicate-banner";
 import { DocumentPreview } from "@/components/inbox/document-preview";
 import { ReconciliationPanel } from "@/components/inbox/reconciliation-panel";
@@ -889,13 +890,19 @@ export default async function DocumentDetail({
 
       {doc.extracted_fields &&
         Object.keys(doc.extracted_fields).filter(
-          (k) => k !== "line_items" && k !== "_profile_match"
+          (k) =>
+            k !== "line_items" && k !== "_profile_match" && k !== "_transcript"
         ).length > 0 && (
           <div className="surface p-5 mb-5">
             <h2 className="section-label mb-3">Fields</h2>
             <dl className="space-y-2 text-sm">
               {Object.entries(doc.extracted_fields)
-                .filter(([k]) => k !== "line_items" && k !== "_profile_match")
+                .filter(
+                  ([k]) =>
+                    k !== "line_items" &&
+                    k !== "_profile_match" &&
+                    k !== "_transcript"
+                )
                 .map(([k, v]) => (
                   <Row
                     key={k}
@@ -911,14 +918,59 @@ export default async function DocumentDetail({
           </div>
         )}
 
-      {doc.ocr_text && (
-        <div className="surface p-5">
-          <h2 className="section-label mb-3">OCR text</h2>
-          <pre className="text-xs whitespace-pre-wrap text-muted-foreground font-sans leading-relaxed">
-            {doc.ocr_text}
-          </pre>
-        </div>
-      )}
+      {(() => {
+        // OCR / transcript panel. For long PDFs the extraction stores a
+        // bounded section skeleton; the chunked background transcription
+        // replaces it with the full verbatim text. The header row shows
+        // where that process stands.
+        const ef = doc.extracted_fields as Record<string, unknown> | null;
+        const transcript = ef?.["_transcript"] as
+          | {
+              status: "in_progress" | "done" | "failed";
+              total_chunks: number;
+              done_chunks: number;
+              total_pages: number;
+              error?: string;
+            }
+          | undefined;
+        const isPdfFile =
+          (doc.file_type || "").toLowerCase().includes("pdf") ||
+          displayName.toLowerCase().endsWith(".pdf");
+        if (!doc.ocr_text && !transcript) return null;
+        return (
+          <div className="surface p-5">
+            <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+              <h2 className="section-label !mb-0">
+                {transcript?.status === "done"
+                  ? "Full transcript"
+                  : "OCR text"}
+              </h2>
+              {transcript?.status === "in_progress" && (
+                <span className="text-[11px] text-brand-purple font-semibold">
+                  Full transcript in progress — {transcript.done_chunks}/
+                  {transcript.total_chunks} parts ({transcript.total_pages}{" "}
+                  pages). Refresh to update.
+                </span>
+              )}
+              {transcript?.status === "failed" && (
+                <div className="flex items-center gap-2">
+                  <span className="text-[11px] text-red-600">
+                    Transcription failed
+                    {transcript.error ? `: ${transcript.error}` : ""}
+                  </span>
+                  <TranscribeButton documentId={doc.id} retry />
+                </div>
+              )}
+              {!transcript && isPdfFile && (
+                <TranscribeButton documentId={doc.id} />
+              )}
+            </div>
+            <pre className="text-xs whitespace-pre-wrap text-muted-foreground font-sans leading-relaxed">
+              {doc.ocr_text}
+            </pre>
+          </div>
+        );
+      })()}
     </div>
   );
 }
