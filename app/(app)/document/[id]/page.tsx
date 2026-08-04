@@ -17,6 +17,7 @@ import {
 import { RefileWidget } from "@/components/inbox/refile-widget";
 import { RenameFilenameButton } from "@/components/inbox/rename-filename-button";
 import { DeleteDocumentButton } from "@/components/inbox/delete-document-button";
+import { DownloadButton } from "@/components/inbox/download-button";
 import { TranscribeButton } from "@/components/inbox/transcribe-button";
 import { DuplicateBanner } from "@/components/inbox/duplicate-banner";
 import { DocumentPreview } from "@/components/inbox/document-preview";
@@ -33,7 +34,6 @@ import { parseStoragePath } from "@/lib/utils/storage-path";
 import type { DocumentRow, ProfileRow, ActionRow } from "@/types/document";
 import {
   ExternalLink,
-  Download,
   Sparkles,
   CircleDot,
   Building2,
@@ -641,13 +641,7 @@ export default async function DocumentDetail({
                 <ExternalLink className="h-3.5 w-3.5" />
                 Open full
               </a>
-              <a
-                href={`/api/documents/${doc.id}/preview?download=1`}
-                className="btn-secondary text-xs !py-2 shrink-0"
-              >
-                <Download className="h-3.5 w-3.5" />
-                Download
-              </a>
+              <DownloadButton documentId={doc.id} filename={displayName} />
               <DeleteDocumentButton documentId={doc.id} />
             </div>
           </div>
