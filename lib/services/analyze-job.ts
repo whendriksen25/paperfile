@@ -387,7 +387,38 @@ export async function prepareAnalyzeJob(
   }
 
   const storage = getStorage(doc.storage_provider);
-  let buffer = await storage.downloadFile(downloadPath);
+  let buffer: Buffer;
+  try {
+    buffer = await storage.downloadFile(downloadPath);
+  } catch (e) {
+    // STALE-PATH FALLBACK: _original_scan_path can go stale when the file
+    // is moved after processing (refile before the sync fix, sanity-check
+    // orphan repoints, manual Dropbox moves). If the original path 404s
+    // but dropbox_path differs, retry with dropbox_path and self-heal the
+    // stored original so the next run doesn't trip again.
+    const msg = e instanceof Error ? e.message : String(e);
+    const looksNotFound = /\b409\b|not_found|conflict/i.test(msg);
+    if (!looksNotFound || downloadPath === doc.dropbox_path) throw e;
+    console.warn(
+      `[analyze-job] original scan path stale (${downloadPath}): ${msg} — falling back to dropbox_path`
+    );
+    downloadPath = doc.dropbox_path;
+    buffer = await storage.downloadFile(downloadPath);
+    try {
+      await admin
+        .from("documents")
+        .update({
+          extracted_fields: {
+            ...ef0,
+            _original_scan_path: doc.dropbox_path,
+          },
+        })
+        .eq("id", documentId);
+      console.log("[analyze-job] self-healed stale _original_scan_path");
+    } catch {
+      /* best effort */
+    }
+  }
 
   // 3. Auto-rotate before sending to Claude. EXIF-stripped phone
   // uploads otherwise reach Sonnet sideways and tank detection.
