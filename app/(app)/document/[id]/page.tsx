@@ -33,6 +33,7 @@ import { parseStoragePath } from "@/lib/utils/storage-path";
 import type { DocumentRow, ProfileRow, ActionRow } from "@/types/document";
 import {
   ExternalLink,
+  Download,
   Sparkles,
   CircleDot,
   Building2,
@@ -636,6 +637,13 @@ export default async function DocumentDetail({
               >
                 <ExternalLink className="h-3.5 w-3.5" />
                 Open full
+              </a>
+              <a
+                href={`/api/documents/${doc.id}/preview?download=1`}
+                className="btn-secondary text-xs !py-2"
+              >
+                <Download className="h-3.5 w-3.5" />
+                Download
               </a>
               <DeleteDocumentButton documentId={doc.id} />
             </div>

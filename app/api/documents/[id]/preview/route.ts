@@ -28,6 +28,11 @@ export async function GET(
   // original multi-receipt scan stored in extracted_fields
   // ._original_scan_path. Falls back to dropbox_path if not set.
   const wantOriginal = request.nextUrl.searchParams.get("original") === "1";
+  // ?download=1 — serve as an attachment (browser saves to the user's
+  // machine) instead of inline, named after the meaningful storage
+  // filename (e.g. 20260106_ekoplaza_dieren.jpg) rather than the
+  // generic upload name (image.jpg).
+  const wantDownload = request.nextUrl.searchParams.get("download") === "1";
 
   const supabase = await createClient();
   const {
@@ -72,14 +77,19 @@ export async function GET(
         ? doc.file_type
         : sniffMime(doc.file_name || "");
 
-    const filename = doc.file_name || "document";
+    // For downloads prefer the logical archive filename from the storage
+    // path — that's the name the user recognises from the library.
+    const storageName = downloadPath.split("/").pop() || "";
+    const filename = wantDownload
+      ? storageName || doc.file_name || "document"
+      : doc.file_name || "document";
 
     return new NextResponse(new Uint8Array(buffer), {
       status: 200,
       headers: {
         "Content-Type": contentType,
         "Content-Length": String(buffer.byteLength),
-        "Content-Disposition": `inline; filename="${escapeFilename(filename)}"`,
+        "Content-Disposition": `${wantDownload ? "attachment" : "inline"}; filename="${escapeFilename(filename)}"`,
         // Brief private cache — file rarely changes once analysed but the URL
         // is per-doc so a new doc-id always re-fetches.
         "Cache-Control": "private, max-age=300",
