@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient, createServiceClient } from "@/lib/supabase/server";
 import { prepareAnalyzeJob } from "@/lib/services/analyze-job";
+import { kickAndForget } from "@/lib/utils/kick";
 
 export const runtime = "nodejs";
 // 60s is plenty for the prepare step: download (~2s) + auto-rotate
@@ -84,14 +85,15 @@ export async function POST(request: NextRequest) {
     // next (see the analyze-step route), so the job runs to completion even
     // with NO UI polling — essential for fresh uploads handed off here. For
     // re-analyse the progress panel also polls, which just races harmlessly.
-    try {
+    // kickAndForget (awaited, ~2.5s max) guarantees the request is actually
+    // DISPATCHED before this function returns and gets frozen — a plain
+    // void-fetch here is routinely lost on Vercel.
+    {
       const origin = request.nextUrl.origin;
-      void fetch(`${origin}/api/analyze-step/${result.jobId}`, {
+      await kickAndForget(`${origin}/api/analyze-step/${result.jobId}`, {
         method: "POST",
         headers: { cookie: request.headers.get("cookie") || "" },
-      }).catch(() => {});
-    } catch {
-      /* best-effort */
+      });
     }
 
     return NextResponse.json({

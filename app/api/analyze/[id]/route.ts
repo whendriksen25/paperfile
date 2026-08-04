@@ -1417,13 +1417,16 @@ export async function POST(
     // Multi-receipt hand-off: the parent is now filed + flagged as a
     // container with _original_scan_path. Kick the per-receipt background
     // job (its own function + budget) to crop each receipt (CV, overlaps
-    // allowed), store each crop, and spawn one child per receipt. We
-    // fire-and-forget so this request returns promptly; the job's steps
-    // self-chain to completion (no UI polling required for fresh uploads).
+    // allowed), store each crop, and spawn one child per receipt.
+    // AWAITED (not void-fetch): a fire-and-forget here evaporates when
+    // Vercel freezes this function after the response — that's how the
+    // 27 Jul scan became a childless container. The start route's prepare
+    // takes ~15s; this route has a 300s budget, so a full await is safe
+    // and lets us surface a real error into review_notes.
     if (isMultiDocScan) {
       try {
         const origin = request.nextUrl.origin;
-        void fetch(`${origin}/api/analyze-job/start`, {
+        const startRes = await fetch(`${origin}/api/analyze-job/start`, {
           method: "POST",
           headers: {
             "content-type": "application/json",
@@ -1434,10 +1437,32 @@ export async function POST(
             fromOriginal: true,
             forceProfile,
           }),
-        }).catch(() => {});
-        console.log(`[api/analyze] handed off multi-doc scan ${id} to per-receipt job`);
+        });
+        if (!startRes.ok) {
+          const errBody = await startRes.text().catch(() => "");
+          throw new Error(
+            `job start returned ${startRes.status}: ${errBody.slice(0, 300)}`
+          );
+        }
+        console.log(
+          `[api/analyze] handed off multi-doc scan ${id} to per-receipt job`
+        );
       } catch (e) {
-        console.warn("[api/analyze] per-receipt job hand-off failed:", e);
+        const msg = e instanceof Error ? e.message : String(e);
+        console.error("[api/analyze] per-receipt job hand-off FAILED:", msg);
+        // Flag the container so the failure is visible in the UI instead
+        // of silently leaving a childless multi-doc scan.
+        try {
+          await admin
+            .from("documents")
+            .update({
+              needs_review: true,
+              review_notes: `Per-receipt job failed to start: ${msg.slice(0, 400)}. Use "Re-analyse full scan" to retry.`,
+            })
+            .eq("id", id);
+        } catch {
+          /* best effort */
+        }
       }
     }
 

@@ -110,6 +110,17 @@ export async function POST(
       }
     }
 
+    // Keep _original_scan_path in sync when it pointed at the file we just
+    // moved (multi-doc containers store their own path there). A stale
+    // original path makes "Re-analyse full scan" / the per-receipt job 409
+    // on Dropbox download — this exact bug orphaned the 27 Jul scan.
+    const ef = (doc.extracted_fields as Record<string, unknown> | null) || {};
+    const originalScanPath = ef["_original_scan_path"] as string | undefined;
+    const efPatch =
+      originalScanPath && originalScanPath === doc.dropbox_path
+        ? { extracted_fields: { ...ef, _original_scan_path: newPath } }
+        : {};
+
     const { error: updateErr } = await admin
       .from("documents")
       .update({
@@ -119,6 +130,7 @@ export async function POST(
         document_type: targetDocType,
         // Mark as user-corrected so we don't accidentally override later.
         needs_review: false,
+        ...efPatch,
       })
       .eq("id", id);
 

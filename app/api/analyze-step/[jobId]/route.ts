@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient, createServiceClient } from "@/lib/supabase/server";
 import { processNextAnalyzeStep } from "@/lib/services/analyze-job";
+import { kickAndForget } from "@/lib/utils/kick";
 
 export const runtime = "nodejs";
 // Per-step budget: one Sonnet extractDocument call on a single-receipt
@@ -123,21 +124,21 @@ export async function POST(
 
     const result = await processNextAnalyzeStep(admin, jobId);
 
-    // Self-chain: if the job still has work, fire-and-forget the next step.
-    // This drives the job to completion even with NO UI polling (fresh
+    // Self-chain: if the job still has work, kick the next step. This
+    // drives the job to completion even with NO UI polling (fresh
     // uploads), and just races harmlessly with the progress panel's poll
     // for re-analyse (the per-step claim handles concurrency). One step per
     // invocation keeps each receipt inside its own 60s budget.
+    // kickAndForget (awaited, ~2.5s max) guarantees the chain link is
+    // actually dispatched before this function is frozen — a plain
+    // void-fetch chain silently breaks mid-job (the 11 Jun scan's job sat
+    // stuck at 'processing' forever this way).
     if (result && !result.done && result.status === "processing") {
-      try {
-        const url = `${request.nextUrl.origin}/api/analyze-step/${jobId}`;
-        void fetch(url, {
-          method: "POST",
-          headers: { cookie: request.headers.get("cookie") || "" },
-        }).catch(() => {});
-      } catch {
-        /* best-effort */
-      }
+      const url = `${request.nextUrl.origin}/api/analyze-step/${jobId}`;
+      await kickAndForget(url, {
+        method: "POST",
+        headers: { cookie: request.headers.get("cookie") || "" },
+      });
     }
     return NextResponse.json(result);
   } catch (e: unknown) {
